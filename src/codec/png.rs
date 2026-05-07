@@ -35,10 +35,11 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
     if crc_end > input.len() {
       break;
     }
-    if chunk_type == b"IHDR" && len == 13 {
-      if let Some(parsed) = PngIhdr::parse(&input[data_start..data_end]) {
-        ihdr = Some(parsed);
-      }
+    if chunk_type == b"IHDR"
+      && len == 13
+      && let Some(parsed) = PngIhdr::parse(&input[data_start..data_end])
+    {
+      ihdr = Some(parsed);
     }
     if chunk_type == b"IDAT" {
       if first_idat_start.is_none() {
@@ -84,7 +85,7 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
     return Ok(None);
   }
   let check = ((cmf as u16) << 8) | (flg as u16);
-  if check % 31 != 0 {
+  if !check.is_multiple_of(31) {
     return Ok(None);
   }
   if (flg & 0x20) != 0 {
@@ -111,23 +112,22 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
   let mut payload_bytes = plain;
   let mut webp_meta = None;
 
-  if config.enable_png_webp {
-    if let Some(ihdr) = ihdr {
-      if ihdr.is_webp_compatible() {
-        let bpp = ihdr.bytes_per_pixel()?;
-        if let Ok((bitmap, filters)) = undo_png_filters(&payload_bytes, ihdr.width, ihdr.height, bpp) {
-          if let Ok(webp_bytes) = encode_webp_lossless(&bitmap, ihdr.width, ihdr.height, ihdr.color_type) {
-            png_payload_kind = 1;
-            payload_bytes = webp_bytes;
-            webp_meta = Some(PngWebpMeta {
-              color_type: ihdr.color_type,
-              width: ihdr.width,
-              height: ihdr.height,
-              filters,
-            });
-          }
-        }
-      }
+  if config.enable_png_webp
+    && let Some(ihdr) = ihdr
+    && ihdr.is_webp_compatible()
+  {
+    let bpp = ihdr.bytes_per_pixel()?;
+    if let Ok((bitmap, filters)) = undo_png_filters(&payload_bytes, ihdr.width, ihdr.height, bpp)
+      && let Ok(webp_bytes) = encode_webp_lossless(&bitmap, ihdr.width, ihdr.height, ihdr.color_type)
+    {
+      png_payload_kind = 1;
+      payload_bytes = webp_bytes;
+      webp_meta = Some(PngWebpMeta {
+        color_type: ihdr.color_type,
+        width: ihdr.width,
+        height: ihdr.height,
+        filters,
+      });
     }
   }
 
@@ -474,7 +474,7 @@ fn encode_webp_lossless(bitmap: &[u8], width: u32, height: u32, color_type: u8) 
   let webp = encoder
     .encode_advanced(&config)
     .map_err(|_| Error::Other("webp encode failed".to_string()))?;
-  Ok((&*webp).to_vec())
+  Ok(webp.to_vec())
 }
 
 fn decode_webp_bitmap(webp_bytes: &[u8], width: u32, height: u32, color_type: u8) -> Result<Vec<u8>> {

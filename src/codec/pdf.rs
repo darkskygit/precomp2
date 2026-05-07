@@ -29,7 +29,7 @@ pub(super) fn encode_pdf(input: &[u8], config: &EncodeConfig, depth: u32, budget
   while let Some(idx) = memmem::find(&input[pos..], b"stream") {
     let stream_pos = pos + idx;
     let mut data_start = stream_pos + 6;
-    if data_start + 1 <= input.len() && input[data_start] == b'\r' && input.get(data_start + 1) == Some(&b'\n') {
+    if data_start < input.len() && input[data_start] == b'\r' && input.get(data_start + 1) == Some(&b'\n') {
       data_start += 2;
     } else if data_start < input.len() && input[data_start] == b'\n' {
       data_start += 1;
@@ -49,11 +49,11 @@ pub(super) fn encode_pdf(input: &[u8], config: &EncodeConfig, depth: u32, budget
 
     let data = &input[data_start..data_end];
     let mut handled = false;
-    if let Some(info) = parse_pdf_stream_info(input, stream_pos) {
-      if let Some(segment) = encode_pdf_flate_stream(data, &info, config, depth, budget)? {
-        segments.push(segment);
-        handled = true;
-      }
+    if let Some(info) = parse_pdf_stream_info(input, stream_pos)
+      && let Some(segment) = encode_pdf_flate_stream(data, &info, config, depth, budget)?
+    {
+      segments.push(segment);
+      handled = true;
     }
     if !handled {
       if let Some(segment) = encode_zlib(data, config, depth, budget)? {
@@ -186,12 +186,13 @@ fn parse_name_nom(input: &[u8]) -> NomResult<'_, String> {
     if is_pdf_ws(b) || is_pdf_delim(b) {
       break;
     }
-    if b == b'#' && idx + 2 < input.len() {
-      if let (Some(h1), Some(h2)) = (hex_value(input[idx + 1]), hex_value(input[idx + 2])) {
-        out.push((h1 << 4) | h2);
-        idx += 3;
-        continue;
-      }
+    if b == b'#'
+      && idx + 2 < input.len()
+      && let (Some(h1), Some(h2)) = (hex_value(input[idx + 1]), hex_value(input[idx + 2]))
+    {
+      out.push((h1 << 4) | h2);
+      idx += 3;
+      continue;
     }
     out.push(b);
     idx += 1;
@@ -478,24 +479,23 @@ fn encode_pdf_flate_stream(
   let mut predictor_meta = None;
   let mut bmp_meta = None;
 
-  if config.enable_pdf_predictor {
-    if let Some(params) = info.decode_parms {
-      if params.predictor == 1 || (10..=14).contains(&params.predictor) {
-        if let Ok(decoded) = decode_pdf_predictor(&transformed, &params) {
-          transform = 1;
-          transformed = decoded;
-          predictor_meta = Some(params);
-        }
-      }
-    }
+  if config.enable_pdf_predictor
+    && let Some(params) = info.decode_parms
+    && (params.predictor == 1 || (10..=14).contains(&params.predictor))
+    && let Ok(decoded) = decode_pdf_predictor(&transformed, &params)
+  {
+    transform = 1;
+    transformed = decoded;
+    predictor_meta = Some(params);
   }
 
-  if transform == 0 && config.enable_pdf_bmp_fallback {
-    if let Some((meta, bmp_bytes)) = pdf_bmp_transform(&transformed, info.width, info.height, info.bpc)? {
-      transform = 2;
-      bmp_meta = Some(meta);
-      transformed = bmp_bytes;
-    }
+  if transform == 0
+    && config.enable_pdf_bmp_fallback
+    && let Some((meta, bmp_bytes)) = pdf_bmp_transform(&transformed, info.width, info.height, info.bpc)?
+  {
+    transform = 2;
+    bmp_meta = Some(meta);
+    transformed = bmp_bytes;
   }
 
   let orig_len = data.len() as u64;
@@ -545,26 +545,25 @@ fn analyze_pdf_flate(data: &[u8]) -> Result<Option<PdfFlateAnalysis>> {
     let flg = data[1];
     if (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 {
       let check = ((cmf as u16) << 8) | (flg as u16);
-      if check % 31 == 0 && (flg & 0x20) == 0 {
+      if check.is_multiple_of(31) && (flg & 0x20) == 0 {
         let header = [cmf, flg];
         let footer = &data[data.len() - 4..];
         let deflate = &data[2..data.len() - 4];
-        if let Ok(preflate) = preflate_analyze(deflate) {
-          if let Ok((deflate_len, corrections, plain)) = parse_preflate_output(&preflate) {
-            if deflate_len == deflate.len() as u64 {
-              let adler = adler32(&plain);
-              let expected = u32::from_be_bytes([footer[0], footer[1], footer[2], footer[3]]);
-              if adler == expected {
-                return Ok(Some(PdfFlateAnalysis {
-                  compression: PdfCompression::Zlib {
-                    header,
-                    footer: [footer[0], footer[1], footer[2], footer[3]],
-                  },
-                  corrections,
-                  plain,
-                }));
-              }
-            }
+        if let Ok(preflate) = preflate_analyze(deflate)
+          && let Ok((deflate_len, corrections, plain)) = parse_preflate_output(&preflate)
+          && deflate_len == deflate.len() as u64
+        {
+          let adler = adler32(&plain);
+          let expected = u32::from_be_bytes([footer[0], footer[1], footer[2], footer[3]]);
+          if adler == expected {
+            return Ok(Some(PdfFlateAnalysis {
+              compression: PdfCompression::Zlib {
+                header,
+                footer: [footer[0], footer[1], footer[2], footer[3]],
+              },
+              corrections,
+              plain,
+            }));
           }
         }
       }
@@ -694,7 +693,7 @@ fn pdf_predictor_bpp(params: &PdfDecodeParms) -> Result<usize> {
   if params.colors == 0 || params.bpc == 0 || params.columns == 0 {
     return Err(Error::InvalidSegment("pdf predictor params"));
   }
-  if params.bpc % 8 != 0 {
+  if !params.bpc.is_multiple_of(8) {
     return Err(Error::InvalidSegment("pdf predictor bpc"));
   }
   let bytes_per_sample = (params.bpc / 8) as usize;
@@ -720,7 +719,7 @@ fn decode_pdf_predictor(data: &[u8], params: &PdfDecodeParms) -> Result<Vec<u8>>
   let filter = params.predictor - 10;
   let bpp = pdf_predictor_bpp(params)?;
   let row_bytes = pdf_predictor_row_bytes(params)?;
-  if row_bytes == 0 || data.len() % row_bytes != 0 {
+  if row_bytes == 0 || !data.len().is_multiple_of(row_bytes) {
     return Err(Error::InvalidSegment("pdf predictor size"));
   }
   let rows = data.len() / row_bytes;
@@ -761,7 +760,7 @@ pub(super) fn encode_pdf_predictor(data: &[u8], params: &PdfDecodeParms) -> Resu
   let filter = params.predictor - 10;
   let bpp = pdf_predictor_bpp(params)?;
   let row_bytes = pdf_predictor_row_bytes(params)?;
-  if row_bytes == 0 || data.len() % row_bytes != 0 {
+  if row_bytes == 0 || !data.len().is_multiple_of(row_bytes) {
     return Err(Error::InvalidSegment("pdf predictor size"));
   }
   let rows = data.len() / row_bytes;
@@ -864,7 +863,7 @@ fn build_pdf_bmp_payload(plain: &[u8], width: u32, height: u32, mode: u8) -> Res
   out.extend_from_slice(&0u32.to_le_bytes());
 
   if mode == 1 {
-    out.extend(std::iter::repeat(0u8).take(1024));
+    out.extend(std::iter::repeat_n(0u8, 1024));
   }
 
   let row_padding = padded_row_bytes - row_bytes;
@@ -873,7 +872,7 @@ fn build_pdf_bmp_payload(plain: &[u8], width: u32, height: u32, mode: u8) -> Res
     out.extend_from_slice(&plain[cursor..cursor + row_bytes]);
     cursor += row_bytes;
     if row_padding > 0 {
-      out.extend(std::iter::repeat(0u8).take(row_padding));
+      out.extend(std::iter::repeat_n(0u8, row_padding));
     }
   }
 
@@ -1002,67 +1001,67 @@ mod tests {
 
   fn pdf_samples() -> Vec<PdfSample> {
     let payload = b"pdf stream payload";
-    let mut samples = Vec::new();
-    samples.push(PdfSample {
-      name: "simple_flate",
-      data: build_pdf("/Filter /FlateDecode", payload),
-      expected: PdfSampleOutcome::Hit,
-    });
-    samples.push(PdfSample {
-      name: "filter_array_single",
-      data: build_pdf("/Filter [/FlateDecode]", payload),
-      expected: PdfSampleOutcome::Hit,
-    });
-    samples.push(PdfSample {
-      name: "filter_array_multi",
-      data: build_pdf("/Filter [/FlateDecode /ASCII85Decode]", payload),
-      expected: PdfSampleOutcome::FilterMismatch,
-    });
-    samples.push(PdfSample {
-      name: "filter_lzw",
-      data: build_pdf("/Filter /LZWDecode", payload),
-      expected: PdfSampleOutcome::FilterMismatch,
-    });
-    samples.push(PdfSample {
-      name: "decode_parms_dict",
-      data: build_pdf(
-        "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 3 /BitsPerComponent 8 /Columns 4 >> /Width 4 /Height 2 \
-         /BitsPerComponent 8",
-        payload,
-      ),
-      expected: PdfSampleOutcome::Hit,
-    });
-    samples.push(PdfSample {
-      name: "decode_parms_array",
-      data: build_pdf("/Filter /FlateDecode /DecodeParms [ << /Predictor 12 /Columns 4 >> ]", payload),
-      expected: PdfSampleOutcome::Hit,
-    });
-    samples.push(PdfSample {
-      name: "escaped_names",
-      data: build_pdf("/F#69lter /Flate#44ecode", payload),
-      expected: PdfSampleOutcome::Hit,
-    });
-    samples.push(PdfSample {
-      name: "string_hex_comment",
-      data: build_pdf(
-        "/Filter /FlateDecode /Title (hello (nested) \\) world) /Foo <4a4b4c> % comment\n /Bar /Baz",
-        payload,
-      ),
-      expected: PdfSampleOutcome::Hit,
-    });
-    samples.push(PdfSample {
-      name: "missing_dict",
-      data: build_pdf_no_dict(payload),
-      expected: PdfSampleOutcome::NoDict,
-    });
     let compressed = zlib_bytes(payload);
     let raw_dict = format!("<< /Length {} /Filter /FlateDecode", compressed.len());
-    samples.push(PdfSample {
-      name: "unterminated_dict",
-      data: build_pdf_with_compressed(Some(&raw_dict), &compressed),
-      expected: PdfSampleOutcome::NoDict,
-    });
-    samples
+    vec![
+      PdfSample {
+        name: "simple_flate",
+        data: build_pdf("/Filter /FlateDecode", payload),
+        expected: PdfSampleOutcome::Hit,
+      },
+      PdfSample {
+        name: "filter_array_single",
+        data: build_pdf("/Filter [/FlateDecode]", payload),
+        expected: PdfSampleOutcome::Hit,
+      },
+      PdfSample {
+        name: "filter_array_multi",
+        data: build_pdf("/Filter [/FlateDecode /ASCII85Decode]", payload),
+        expected: PdfSampleOutcome::FilterMismatch,
+      },
+      PdfSample {
+        name: "filter_lzw",
+        data: build_pdf("/Filter /LZWDecode", payload),
+        expected: PdfSampleOutcome::FilterMismatch,
+      },
+      PdfSample {
+        name: "decode_parms_dict",
+        data: build_pdf(
+          "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 3 /BitsPerComponent 8 /Columns 4 >> /Width 4 /Height 2 \
+           /BitsPerComponent 8",
+          payload,
+        ),
+        expected: PdfSampleOutcome::Hit,
+      },
+      PdfSample {
+        name: "decode_parms_array",
+        data: build_pdf("/Filter /FlateDecode /DecodeParms [ << /Predictor 12 /Columns 4 >> ]", payload),
+        expected: PdfSampleOutcome::Hit,
+      },
+      PdfSample {
+        name: "escaped_names",
+        data: build_pdf("/F#69lter /Flate#44ecode", payload),
+        expected: PdfSampleOutcome::Hit,
+      },
+      PdfSample {
+        name: "string_hex_comment",
+        data: build_pdf(
+          "/Filter /FlateDecode /Title (hello (nested) \\) world) /Foo <4a4b4c> % comment\n /Bar /Baz",
+          payload,
+        ),
+        expected: PdfSampleOutcome::Hit,
+      },
+      PdfSample {
+        name: "missing_dict",
+        data: build_pdf_no_dict(payload),
+        expected: PdfSampleOutcome::NoDict,
+      },
+      PdfSample {
+        name: "unterminated_dict",
+        data: build_pdf_with_compressed(Some(&raw_dict), &compressed),
+        expected: PdfSampleOutcome::NoDict,
+      },
+    ]
   }
 
   #[test]

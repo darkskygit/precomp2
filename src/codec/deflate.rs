@@ -50,7 +50,7 @@ pub(super) fn encode_zlib(input: &[u8], config: &EncodeConfig, depth: u32, budge
     return Ok(None);
   }
   let check = ((cmf as u16) << 8) | (flg as u16);
-  if check % 31 != 0 {
+  if !check.is_multiple_of(31) {
     return Ok(None);
   }
   if (flg & 0x20) != 0 {

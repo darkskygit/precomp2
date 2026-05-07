@@ -192,7 +192,7 @@ pub(super) fn decode_base64_segment(
       break;
     }
     let end = (cursor + len).min(encoded.len());
-    out.extend_from_slice(encoded[cursor..end].as_bytes());
+    out.extend_from_slice(&encoded.as_bytes()[cursor..end]);
     out.extend_from_slice(b"\r\n");
     cursor = end;
   }

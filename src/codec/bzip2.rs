@@ -90,10 +90,10 @@ pub(super) fn decode_bzip2_segment(segment: &Pcf2Segment, config: &DecodeConfig,
   };
 
   let payload = decode_payload(payload_kind, segment.data.clone(), config, depth, budget)?;
-  if let Some(expected) = decoded_len {
-    if expected != payload.len() {
-      return Err(Error::InvalidSegment("bzip2 decoded_len mismatch"));
-    }
+  if let Some(expected) = decoded_len
+    && expected != payload.len()
+  {
+    return Err(Error::InvalidSegment("bzip2 decoded_len mismatch"));
   }
   let level_num = (level - b'0') as u32;
   let mut recompressed = encode_bzip2_raw(&payload, level_num)?;

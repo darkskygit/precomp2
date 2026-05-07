@@ -366,8 +366,10 @@ fn roundtrip_png_segment() {
 fn roundtrip_png_webp_segment() {
   let pixels = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255];
   let png = build_png_rgba(2, 2, &pixels);
-  let mut config = EncodeConfig::default();
-  config.enable_png_webp = true;
+  let config = EncodeConfig {
+    enable_png_webp: true,
+    ..Default::default()
+  };
   let encoded = encode_bytes(&png, &config).expect("encode");
   let segments = decode_segments(&encoded);
   let segment = segments
@@ -385,8 +387,10 @@ fn roundtrip_png_multi_idat_webp_segment() {
   let pixels = [16, 32, 48, 255, 64, 80, 96, 255, 128, 144, 160, 255, 192, 208, 224, 255];
   let png = build_png_rgba(2, 2, &pixels);
   let png_multi = split_png_idat(&png);
-  let mut config = EncodeConfig::default();
-  config.enable_png_webp = true;
+  let config = EncodeConfig {
+    enable_png_webp: true,
+    ..Default::default()
+  };
   let encoded = encode_bytes(&png_multi, &config).expect("encode");
   let segments = decode_segments(&encoded);
   let segment = segments
@@ -520,8 +524,10 @@ fn roundtrip_pdf_segment() {
 #[test]
 fn roundtrip_pdf_predictor_segment() {
   let pdf = build_pdf_predictor_sample();
-  let mut config = EncodeConfig::default();
-  config.enable_pdf_predictor = true;
+  let config = EncodeConfig {
+    enable_pdf_predictor: true,
+    ..Default::default()
+  };
   let encoded = encode_bytes(&pdf, &config).expect("encode");
   let segments = decode_segments(&encoded);
   let segment = segments
@@ -537,8 +543,10 @@ fn roundtrip_pdf_predictor_segment() {
 #[test]
 fn roundtrip_pdf_bmp_segment() {
   let pdf = build_pdf_bmp_sample();
-  let mut config = EncodeConfig::default();
-  config.enable_pdf_bmp_fallback = true;
+  let config = EncodeConfig {
+    enable_pdf_bmp_fallback: true,
+    ..Default::default()
+  };
   let encoded = encode_bytes(&pdf, &config).expect("encode");
   let segments = decode_segments(&encoded);
   let segment = segments

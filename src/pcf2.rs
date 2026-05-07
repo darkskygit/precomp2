@@ -297,7 +297,7 @@ impl<R: Read> Pcf2Decoder<R> {
 
     let mut prefix = Vec::new();
     if kind == SegmentKind::Nested as u8 {
-      if meta_len != 1 || meta.get(0) != Some(&0) {
+      if meta_len != 1 || meta.first() != Some(&0) {
         return Err(Error::InvalidSegment("nested meta_version must be 0"));
       }
       if data_len < PCF2_MAGIC.len() as u64 {
