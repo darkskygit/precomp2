@@ -16,14 +16,14 @@ The project is inspired by [precomp-cpp](https://github.com/schnaader/precomp-cp
 ```rust
 use precomp2::{DecodeConfig, EncodeConfig};
 
-# fn main() -> precomp2::Result<()> {
-let input = b"payload";
-let encoded = precomp2::encode_bytes(input, &EncodeConfig::default())?;
-let decoded = precomp2::decode_bytes(&encoded, &DecodeConfig::default())?;
+fn main() -> precomp2::Result<()> {
+    let input = b"payload";
+    let encoded = precomp2::encode_bytes(input, &EncodeConfig::default())?;
+    let decoded = precomp2::decode_bytes(&encoded, &DecodeConfig::default())?;
 
-assert_eq!(decoded, input);
-# Ok(())
-# }
+    assert_eq!(decoded, input);
+    Ok(())
+}
 ```
 
 ## Status
