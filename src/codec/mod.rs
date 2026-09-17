@@ -39,17 +39,21 @@ use bzip2::{decode_bzip2_segment, encode_bzip2};
 use containers::{encode_swf, encode_zip};
 #[cfg(test)]
 use crc32fast::Hasher;
-use deflate::{decode_deflate_segment, decode_gzip_segment, decode_zlib_segment, encode_deflate, encode_gzip, encode_zlib};
+use deflate::{adler32, decode_deflate_segment, decode_gzip_segment, decode_zlib_segment, encode_deflate, encode_gzip, encode_zlib};
 #[cfg(test)]
 use media::jpeg_has_dht;
 use media::{decode_jpg_segment, encode_jpg};
+use payload::decode_payload;
+pub use pdf::PdfStats;
 #[cfg(test)]
 use pdf::{PdfDecodeParms, encode_pdf_predictor};
-use pdf::{decode_pdf_flate_segment, encode_pdf};
-use png::{decode_png_segment, encode_png};
+use pdf::{decode_pdf_flate_segment, decode_pdf_stream, encode_pdf};
+use png::{decode_png_segment, decode_webp_bitmap, encode_png, encode_webp_lossless};
 #[cfg(test)]
-use preflate::{parse_preflate_output, preflate_analyze, preflate_reencode};
+use preflate::preflate_analyze;
+use preflate::{parse_preflate_data, parse_preflate_output, preflate_analyze_limited, preflate_reencode};
 use stream::read_varint_async;
+use varint::{read_varint_slice, write_varint_vec};
 
 #[derive(Clone, Debug)]
 pub struct EncodeConfig {
@@ -57,8 +61,17 @@ pub struct EncodeConfig {
   pub max_expand_ratio: f64,
   pub max_total_output: u64,
   pub enable_png_webp: bool,
+  /// Undo TIFF 2 and PNG 10–15 predictors. Off by default; the assetpack
+  /// adapter enables this. Reconstruction retains PNG row tags and packed
+  /// sample padding.
   pub enable_pdf_predictor: bool,
-  pub enable_pdf_bmp_fallback: bool,
+  pub enable_pdf_dct: bool,
+  pub enable_pdf_ascii: bool,
+  /// Reencode image samples and separate masks losslessly with WebP. Replaces
+  /// the old BMP fallback encoder; legacy BMP payloads remain decodable.
+  pub enable_pdf_images: bool,
+  /// Maximum PDF filter-chain length, capped at 32 regardless of this value.
+  pub max_pdf_filters: u32,
 }
 
 impl Default for EncodeConfig {
@@ -69,7 +82,10 @@ impl Default for EncodeConfig {
       max_total_output: 1 << 32,
       enable_png_webp: false,
       enable_pdf_predictor: false,
-      enable_pdf_bmp_fallback: false,
+      enable_pdf_dct: true,
+      enable_pdf_ascii: true,
+      enable_pdf_images: true,
+      max_pdf_filters: 16,
     }
   }
 }
@@ -92,12 +108,26 @@ impl Default for DecodeConfig {
 }
 
 pub fn encode_bytes(input: &[u8], config: &EncodeConfig) -> Result<Vec<u8>> {
+  encode_bytes_with_stats(input, config).map(|(bytes, _)| bytes)
+}
+
+/// Returns PDF stream counters for top-level PDFs; other formats report zero
+/// counters.
+///
+/// The intermediate stream may grow, especially after Flate expansion. Compare
+/// candidates after outer compression, not by this output length alone.
+pub fn encode_bytes_with_stats(input: &[u8], config: &EncodeConfig) -> Result<(Vec<u8>, PdfStats)> {
   let mut budget = EncodeBudget::default();
-  let segments = encode_segments(input, config, 0, &mut budget)?;
+  let mut stats = PdfStats::default();
+  let segments = if input.starts_with(b"%PDF") {
+    pdf::encode_pdf_with_stats(input, config, 0, &mut budget, &mut stats)?.unwrap_or_default()
+  } else {
+    encode_segments(input, config, 0, &mut budget)?
+  };
   let file = Pcf2File::from_segments(segments);
   let mut out = Vec::new();
   file.encode(&mut out)?;
-  Ok(out)
+  Ok((out, stats))
 }
 
 pub fn decode_bytes(input: &[u8], config: &DecodeConfig) -> Result<Vec<u8>> {
@@ -127,7 +157,7 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
     header_bytes[16],
     header_bytes[17],
   ]);
-  if version != PCF2_VERSION {
+  if !(1..=PCF2_VERSION).contains(&version) {
     return Err(Error::InvalidHeader("unsupported version"));
   }
   if flags != 0 {
@@ -165,6 +195,9 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
       break;
     }
     let kind = kind_buf[0];
+    if version == 1 && kind == SegmentKind::PdfStream as u8 {
+      return Err(Error::InvalidSegment("pdf stream requires v2"));
+    }
     let mut flags_buf = [0u8; 1];
     reader.read_exact(&mut flags_buf).await?;
     let flags = flags_buf[0];
@@ -180,10 +213,22 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
     }
     remaining -= orig_len;
 
-    let mut meta = vec![0u8; meta_len as usize];
-    reader.read_exact(&mut meta).await?;
-    let mut data = vec![0u8; data_len as usize];
-    reader.read_exact(&mut data).await?;
+    let mut meta = Vec::new();
+    (&mut reader).take(meta_len).read_to_end(&mut meta).await?;
+    if meta.len() as u64 != meta_len {
+      return Err(Error::SizeMismatch {
+        expected: meta_len,
+        actual: meta.len() as u64,
+      });
+    }
+    let mut data = Vec::new();
+    (&mut reader).take(data_len).read_to_end(&mut data).await?;
+    if data.len() as u64 != data_len {
+      return Err(Error::SizeMismatch {
+        expected: data_len,
+        actual: data.len() as u64,
+      });
+    }
 
     let segment = Pcf2Segment {
       kind,
@@ -262,6 +307,7 @@ fn decode_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budg
     k if k == SegmentKind::Base64 as u8 => decode_base64_segment(segment, config, depth, budget),
     k if k == SegmentKind::Bzip2 as u8 => decode_bzip2_segment(segment, config, depth, budget),
     k if k == SegmentKind::PdfFlate as u8 => decode_pdf_flate_segment(segment, config, depth, budget),
+    k if k == SegmentKind::PdfStream as u8 => decode_pdf_stream(segment, config, depth, budget),
     _ => Err(Error::InvalidSegment("unknown segment kind")),
   }
 }

@@ -1,0 +1,6 @@
+pdf-v1-{0,1,2}.pdf and .pcf were generated locally with precomp2 a28c582
+(the unmodified v0.1.0 implementation) on 2026-09-17.
+These tiny synthetic streams contain bytes [1,2,3,4,5,6], not private documents.
+Modes: ordinary Flate, legacy predictor, legacy BMP payload.
+The predictor fixture intentionally uses the legacy no-row-tag representation;
+it tests historical decoding, not PDF predictor conformance.

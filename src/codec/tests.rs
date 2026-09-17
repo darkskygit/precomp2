@@ -163,6 +163,10 @@ fn build_pdf_predictor_sample() -> Vec<u8> {
     columns: width,
   };
   let encoded = encode_pdf_predictor(&raw, &params).expect("predictor encode");
+  let encoded = encoded
+    .chunks_exact(row_bytes)
+    .flat_map(|row| std::iter::once(2).chain(row.iter().copied()))
+    .collect::<Vec<_>>();
   let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
   encoder.write_all(&encoded).expect("pdf predictor zlib");
   let compressed = encoder.finish().expect("pdf predictor finish");
@@ -420,6 +424,21 @@ fn roundtrip_jpg_segment() {
 }
 
 #[test]
+fn jpg_segment_falls_back_when_lepton_output_differs() {
+  // Drop the trailing EOI marker: lepton still encodes this, but its decode
+  // regenerates a canonical EOI, so the transform would not be reversible.
+  let jpeg = JPG_FIXTURE[..JPG_FIXTURE.len() - 2].to_vec();
+  let encoded = encode_bytes(&jpeg, &EncodeConfig::default()).expect("encode");
+  assert!(
+    !decode_segments(&encoded)
+      .iter()
+      .any(|segment| segment.kind == SegmentKind::Jpg as u8)
+  );
+  let decoded = decode_bytes(&encoded, &DecodeConfig::default()).expect("decode");
+  assert_eq!(decoded, jpeg);
+}
+
+#[test]
 fn roundtrip_mjpg_segment() {
   let jpeg = build_standard_jpeg();
   let mjpeg = strip_jpeg_dht(&jpeg);
@@ -516,7 +535,7 @@ fn roundtrip_pdf_segment() {
   let pdf = build_pdf_sample();
   let encoded = encode_bytes(&pdf, &EncodeConfig::default()).expect("encode");
   let segments = decode_segments(&encoded);
-  assert_has_kind(&segments, SegmentKind::PdfFlate);
+  assert_has_kind(&segments, SegmentKind::PdfStream);
   let decoded = decode_bytes(&encoded, &DecodeConfig::default()).expect("decode");
   assert_eq!(decoded, pdf);
 }
@@ -532,29 +551,29 @@ fn roundtrip_pdf_predictor_segment() {
   let segments = decode_segments(&encoded);
   let segment = segments
     .iter()
-    .find(|segment| segment.kind == SegmentKind::PdfFlate as u8)
-    .expect("pdf flate");
+    .find(|segment| segment.kind == SegmentKind::PdfStream as u8)
+    .expect("pdf stream");
   assert_eq!(segment.meta[0], 0);
-  assert_eq!(segment.meta[3], 1);
+  assert_eq!(segment.meta[1], 2);
   let decoded = decode_bytes(&encoded, &DecodeConfig::default()).expect("decode");
   assert_eq!(decoded, pdf);
 }
 
 #[test]
-fn roundtrip_pdf_bmp_segment() {
+fn roundtrip_pdf_small_image_flate_segment() {
   let pdf = build_pdf_bmp_sample();
   let config = EncodeConfig {
-    enable_pdf_bmp_fallback: true,
+    enable_pdf_images: true,
     ..Default::default()
   };
   let encoded = encode_bytes(&pdf, &config).expect("encode");
   let segments = decode_segments(&encoded);
   let segment = segments
     .iter()
-    .find(|segment| segment.kind == SegmentKind::PdfFlate as u8)
-    .expect("pdf flate");
+    .find(|segment| segment.kind == SegmentKind::PdfStream as u8)
+    .expect("pdf stream");
   assert_eq!(segment.meta[0], 0);
-  assert_eq!(segment.meta[3], 2);
+  assert_eq!(segment.meta[1], 1);
   let decoded = decode_bytes(&encoded, &DecodeConfig::default()).expect("decode");
   assert_eq!(decoded, pdf);
 }

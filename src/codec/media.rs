@@ -55,6 +55,15 @@ pub(super) fn encode_jpg(input: &[u8]) -> Result<Option<Pcf2Segment>> {
     Ok(v) => v,
     Err(_) => return Ok(None),
   };
+  // lepton normalizes some non-canonical inputs (e.g. a missing EOI marker), so
+  // only keep the segment when decoding reproduces the stored bytes exactly.
+  let restored = match decode_lepton(&lepton) {
+    Ok(v) => v,
+    Err(_) => return Ok(None),
+  };
+  if restored != jpeg {
+    return Ok(None);
+  }
   let mut meta = Vec::with_capacity(2);
   meta.push(1);
   meta.push(if mjpg_used { 1 } else { 0 });

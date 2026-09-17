@@ -45,9 +45,13 @@ pub(super) fn parse_preflate_data(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 pub(super) fn preflate_analyze(deflate: &[u8]) -> Result<Vec<u8>> {
+  preflate_analyze_limited(deflate, PREFLATE_PLAIN_TEXT_LIMIT)
+}
+
+pub(super) fn preflate_analyze_limited(deflate: &[u8], limit: usize) -> Result<Vec<u8>> {
   let config = preflate_rs::PreflateConfig {
     max_chain_length: 4096,
-    plain_text_limit: PREFLATE_PLAIN_TEXT_LIMIT,
+    plain_text_limit: limit.min(PREFLATE_PLAIN_TEXT_LIMIT),
     verify_compression: false,
   };
   let (analysis, plain_text) =

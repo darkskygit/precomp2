@@ -1,0 +1,11 @@
+Unmodified test PDFs from qpdf, Apache-2.0; license and upstream NOTICE accompany them.
+Repository: https://github.com/qpdf/qpdf
+Revision: 54d6053af283bbeb8b325f4886c0f65cc51f2b80
+Source directory: qpdf/qtest/qpdf/
+Retrieved: 2026-09-17
+
+SHA-256:
+filter-abbreviation.pdf 21176912692cca1f393d97bfff02bd25fe79876810f96af1052f187de50ea9e1
+image-streams-small.pdf 37e3ffe9bfc79b79a954758a885a0dc0e91e5d95674a8b8e77c4e729dd6603c6
+jpeg-qstream.pdf fa6ca002dea3e7104f86952b087cca743dfc0c20a7f5fd8f17a02394c3696888
+image-streams.pdf d84a925580d8d336619d819edc5cdbf0fedcc9a87f64d145bca38411df0c69f1

@@ -7,9 +7,9 @@ The project is inspired by [precomp-cpp](https://github.com/schnaader/precomp-cp
 ## Features
 
 - Lossless encode/decode APIs for byte slices and async decode input.
-- PCF2 segment container with literal, nested, DEFLATE, zlib, gzip, PNG IDAT, JPEG, Base64, bzip2, and PDF Flate segment kinds.
+- PCF2 segment container with literal, nested, DEFLATE, zlib, gzip, PNG IDAT, JPEG, Base64, bzip2, and PDF stream segment kinds.
 - Recursive preprocessing with depth and output budget limits.
-- Optional PNG WebP, PDF predictor, and PDF bitmap fallback transforms behind `EncodeConfig` flags.
+- Configurable PNG and PDF preprocessing through `EncodeConfig`.
 
 ## Usage
 

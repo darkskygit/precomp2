@@ -459,7 +459,7 @@ fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
   }
 }
 
-fn encode_webp_lossless(bitmap: &[u8], width: u32, height: u32, color_type: u8) -> Result<Vec<u8>> {
+pub(super) fn encode_webp_lossless(bitmap: &[u8], width: u32, height: u32, color_type: u8) -> Result<Vec<u8>> {
   let encoder = match color_type {
     2 => webp::Encoder::from_rgb(bitmap, width, height),
     6 => webp::Encoder::from_rgba(bitmap, width, height),
@@ -477,7 +477,11 @@ fn encode_webp_lossless(bitmap: &[u8], width: u32, height: u32, color_type: u8) 
   Ok(webp.to_vec())
 }
 
-fn decode_webp_bitmap(webp_bytes: &[u8], width: u32, height: u32, color_type: u8) -> Result<Vec<u8>> {
+pub(super) fn decode_webp_bitmap(webp_bytes: &[u8], width: u32, height: u32, color_type: u8) -> Result<Vec<u8>> {
+  let features = webp::BitstreamFeatures::new(webp_bytes).ok_or(Error::InvalidSegment("webp header"))?;
+  if features.width() != width || features.height() != height || features.has_animation() {
+    return Err(Error::InvalidSegment("png webp size"));
+  }
   let decoded = webp::Decoder::new(webp_bytes)
     .decode()
     .ok_or_else(|| Error::Other("webp decode failed".to_string()))?;

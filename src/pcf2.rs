@@ -6,7 +6,9 @@ use crate::{
 };
 
 pub const PCF2_MAGIC: &[u8; 4] = b"PCF2";
-pub const PCF2_VERSION: u16 = 1;
+/// Writers emit v2; sync and async readers accept v1 and v2. Framing and tags
+/// through PdfFlate are unchanged; only the new PdfStream tag requires v2.
+pub const PCF2_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -20,7 +22,9 @@ pub enum SegmentKind {
   Nested = 0x06,
   Base64 = 0x07,
   Bzip2 = 0x08,
+  /// Legacy Flate/predictor/BMP payloads; retained for decoding existing files.
   PdfFlate = 0x09,
+  PdfStream = 0x0a,
 }
 
 impl SegmentKind {
@@ -36,6 +40,7 @@ impl SegmentKind {
       0x07 => Some(Self::Base64),
       0x08 => Some(Self::Bzip2),
       0x09 => Some(Self::PdfFlate),
+      0x0a => Some(Self::PdfStream),
       _ => None,
     }
   }
@@ -93,7 +98,7 @@ impl Pcf2Header {
     let ext_len = u16::from_le_bytes(ext_len) as usize;
     let original_size = u64::from_le_bytes(original_size);
 
-    if version != PCF2_VERSION {
+    if !(1..=PCF2_VERSION).contains(&version) {
       return Err(Error::InvalidHeader("unsupported version"));
     }
     if flags != 0 {
@@ -201,6 +206,9 @@ impl Pcf2File {
 
     self.header.encode(&mut writer)?;
     for segment in &self.segments {
+      if self.header.version == 1 && segment.kind == SegmentKind::PdfStream as u8 {
+        return Err(Error::InvalidSegment("pdf stream requires v2"));
+      }
       segment.encode(&mut writer)?;
     }
     Ok(())
@@ -265,6 +273,9 @@ impl<R: Read> Pcf2Decoder<R> {
     }
 
     let kind = kind_buf[0];
+    if self.header.version == 1 && kind == SegmentKind::PdfStream as u8 {
+      return Err(Error::InvalidSegment("pdf stream requires v2"));
+    }
     let mut flags = [0u8; 1];
     self.reader.read_exact(&mut flags)?;
     let flags = flags[0];
@@ -278,8 +289,14 @@ impl<R: Read> Pcf2Decoder<R> {
     }
 
     let meta_len_usize: usize = meta_len.try_into().map_err(|_| Error::LengthOverflow)?;
-    let mut meta = vec![0u8; meta_len_usize];
-    self.reader.read_exact(&mut meta)?;
+    let mut meta = Vec::new();
+    self.reader.by_ref().take(meta_len).read_to_end(&mut meta)?;
+    if meta.len() != meta_len_usize {
+      return Err(Error::SizeMismatch {
+        expected: meta_len,
+        actual: meta.len() as u64,
+      });
+    }
 
     if orig_len > self.remaining_orig {
       return Err(Error::InvalidSegment("orig_len exceeds original_size"));
@@ -338,9 +355,14 @@ impl<'a, R: Read> Pcf2SegmentReader<'a, R> {
   }
 
   pub fn read_data_to_vec(&mut self) -> Result<Vec<u8>> {
-    let data_len: usize = self.data_len.try_into().map_err(|_| Error::LengthOverflow)?;
-    let mut out = vec![0u8; data_len];
-    self.data.read_exact(&mut out)?;
+    let mut out = Vec::new();
+    self.data.read_to_end(&mut out)?;
+    if out.len() as u64 != self.data_len {
+      return Err(Error::SizeMismatch {
+        expected: self.data_len,
+        actual: out.len() as u64,
+      });
+    }
     Ok(out)
   }
 
@@ -496,6 +518,24 @@ mod tests {
     match decoder.next_segment() {
       Ok(_) => panic!("expected error"),
       Err(err) => assert!(matches!(err, Error::InvalidSegment(_))),
+    }
+  }
+
+  #[test]
+  fn oversized_segment_lengths_are_rejected_without_allocation() {
+    let header = Pcf2Header::new(1);
+    let mut buf = Vec::new();
+    header.encode(&mut buf).expect("encode header");
+    buf.push(SegmentKind::Dflt as u8);
+    buf.push(0);
+    write_varint(1, &mut buf).expect("orig_len");
+    write_varint(1 << 40, &mut buf).expect("meta_len");
+    write_varint(1 << 40, &mut buf).expect("data_len");
+
+    let mut decoder = Pcf2Decoder::new(Cursor::new(buf)).expect("header ok");
+    match decoder.next_segment() {
+      Ok(_) => panic!("expected error"),
+      Err(err) => assert!(matches!(err, Error::SizeMismatch { .. })),
     }
   }
 
