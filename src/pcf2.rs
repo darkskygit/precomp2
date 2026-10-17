@@ -7,7 +7,7 @@ use crate::{
 
 pub const PCF2_MAGIC: &[u8; 4] = b"PCF2";
 /// Writers emit v2; sync and async readers accept v1 and v2. Framing and tags
-/// through PdfFlate are unchanged; only the new PdfStream tag requires v2.
+/// through PdfFlate are unchanged; the PdfStream and UnityFs tags require v2.
 pub const PCF2_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +25,9 @@ pub enum SegmentKind {
   /// Legacy Flate/predictor/BMP payloads; retained for decoding existing files.
   PdfFlate = 0x09,
   PdfStream = 0x0a,
+  /// UnityFS storage block decompressed with a byte-exact LZ4HC compressor id
+  /// in meta.
+  UnityFs = 0x0b,
 }
 
 impl SegmentKind {
@@ -41,7 +44,16 @@ impl SegmentKind {
       0x08 => Some(Self::Bzip2),
       0x09 => Some(Self::PdfFlate),
       0x0a => Some(Self::PdfStream),
+      0x0b => Some(Self::UnityFs),
       _ => None,
+    }
+  }
+
+  /// Lowest container version that may carry this segment kind.
+  pub fn min_version(self) -> u16 {
+    match self {
+      Self::PdfStream | Self::UnityFs => 2,
+      _ => 1,
     }
   }
 }
@@ -206,8 +218,8 @@ impl Pcf2File {
 
     self.header.encode(&mut writer)?;
     for segment in &self.segments {
-      if self.header.version == 1 && segment.kind == SegmentKind::PdfStream as u8 {
-        return Err(Error::InvalidSegment("pdf stream requires v2"));
+      if SegmentKind::from_u8(segment.kind).is_some_and(|k| self.header.version < k.min_version()) {
+        return Err(Error::InvalidSegment("segment kind requires v2"));
       }
       segment.encode(&mut writer)?;
     }
@@ -273,8 +285,8 @@ impl<R: Read> Pcf2Decoder<R> {
     }
 
     let kind = kind_buf[0];
-    if self.header.version == 1 && kind == SegmentKind::PdfStream as u8 {
-      return Err(Error::InvalidSegment("pdf stream requires v2"));
+    if SegmentKind::from_u8(kind).is_some_and(|k| self.header.version < k.min_version()) {
+      return Err(Error::InvalidSegment("segment kind requires v2"));
     }
     let mut flags = [0u8; 1];
     self.reader.read_exact(&mut flags)?;

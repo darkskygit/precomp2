@@ -1,0 +1,15 @@
+[package]
+edition = "2024"
+name    = "lz4-matrix"
+publish = false
+version = "0.0.0"
+
+[dependencies]
+lz4_flex = "0.11"
+precomp2 = { path = "../.." }
+
+[[bin]]
+name = "dump-misses"
+path = "src/main.rs"
+
+[workspace]

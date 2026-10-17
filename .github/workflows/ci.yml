@@ -1,0 +1,78 @@
+name: Lint & Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with .clusterfuzzlite/build.sh.
+  nightly: nightly-2026-07-07
+
+jobs:
+  lint:
+    name: format & clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # rustfmt.toml uses unstable options; clippy stays on stable so new
+    # nightly lints do not break the build.
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Setup nightly rustfmt
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.nightly }}
+        components: rustfmt
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: |
+          .
+          fuzz
+          tools/lz4-matrix
+
+    - name: Format check
+      run: |
+        cargo +${{ env.nightly }} fmt --all --check
+        cargo +${{ env.nightly }} fmt --manifest-path fuzz/Cargo.toml --check
+        cargo +${{ env.nightly }} fmt --manifest-path tools/lz4-matrix/Cargo.toml --check
+
+    - name: Clippy
+      run: cargo +stable clippy --all-targets -- -D warnings
+
+    - name: Lint fuzz targets and tools
+      run: |
+        RUSTFLAGS="--cfg fuzzing" cargo +stable clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+        cargo +stable clippy --manifest-path tools/lz4-matrix/Cargo.toml -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      # Debug build keeps overflow checks; widen the seeded C comparison.
+      LZ4_SWEEP_ITERS: "3000"
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Test
+      run: cargo test

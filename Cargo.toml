@@ -8,13 +8,14 @@ license     = "Apache-2.0"
 name        = "precomp2"
 readme      = "README.md"
 repository  = "https://github.com/darkskygit/precomp2"
-version     = "0.2.0"
+version     = "0.3.0"
 
 [dependencies]
 base64      = "0.23"
 bzip2       = "0.6"
 crc32fast   = "1.5"
 lepton_jpeg = "0.5"
+lz4_flex    = "0.11"
 memchr      = "2.8"
 preflate-rs = "0.7"
 thiserror   = "2.0"
@@ -24,6 +25,7 @@ webp        = "0.3"
 [dev-dependencies]
 flate2 = "1.1"
 jpeg-encoder = "0.7"
+lz4-reference = { path = "tests/lz4-reference" }
 tokio = { version = "1.53", features = [
   "io-util",
   "macros",

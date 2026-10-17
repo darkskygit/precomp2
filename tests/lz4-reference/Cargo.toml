@@ -1,0 +1,9 @@
+[package]
+edition = "2024"
+license = "Apache-2.0"
+name    = "lz4-reference"
+publish = false
+version = "0.1.0"
+
+[build-dependencies]
+cc = "1.2"

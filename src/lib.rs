@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod codec;
 pub mod error;
 pub mod pcf2;

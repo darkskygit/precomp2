@@ -1,0 +1,33 @@
+[package]
+edition = "2024"
+name    = "precomp2-fuzz"
+publish = false
+version = "0.0.0"
+
+  [package.metadata]
+  cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lz4-reference = { path = "../tests/lz4-reference" }
+lz4_flex      = "0.11"
+precomp2      = { path = ".." }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+bench = false
+doc   = false
+name  = "lz4_reference"
+path  = "fuzz_targets/lz4_reference.rs"
+test  = false
+
+[[bin]]
+bench = false
+doc   = false
+name  = "unityfs_roundtrip"
+path  = "fuzz_targets/unityfs_roundtrip.rs"
+test  = false
+
+[workspace]

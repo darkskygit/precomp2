@@ -13,12 +13,14 @@ mod budget;
 mod bzip2;
 mod containers;
 mod deflate;
+pub mod lz4;
 mod media;
 mod payload;
 mod pdf;
 mod png;
 mod preflate;
 mod stream;
+mod unityfs;
 mod varint;
 
 #[cfg(test)]
@@ -53,6 +55,8 @@ use png::{decode_png_segment, decode_webp_bitmap, encode_png, encode_webp_lossle
 use preflate::preflate_analyze;
 use preflate::{parse_preflate_data, parse_preflate_output, preflate_analyze_limited, preflate_reencode};
 use stream::read_varint_async;
+pub use unityfs::{Lz4Region, UnityFsReport, analyze as analyze_unityfs};
+use unityfs::{decode_unityfs_segment, encode_unityfs};
 use varint::{read_varint_slice, write_varint_vec};
 
 #[derive(Clone, Debug)]
@@ -195,8 +199,8 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
       break;
     }
     let kind = kind_buf[0];
-    if version == 1 && kind == SegmentKind::PdfStream as u8 {
-      return Err(Error::InvalidSegment("pdf stream requires v2"));
+    if SegmentKind::from_u8(kind).is_some_and(|k| version < k.min_version()) {
+      return Err(Error::InvalidSegment("segment kind requires v2"));
     }
     let mut flags_buf = [0u8; 1];
     reader.read_exact(&mut flags_buf).await?;
@@ -251,6 +255,9 @@ struct PenaltyEntry {
 }
 
 fn encode_segments(input: &[u8], config: &EncodeConfig, depth: u32, budget: &mut EncodeBudget) -> Result<Vec<Pcf2Segment>> {
+  if let Some(segments) = encode_unityfs(input, config, budget)? {
+    return Ok(segments);
+  }
   if let Some(segments) = encode_png(input, config, depth, budget)? {
     return Ok(segments);
   }
@@ -308,6 +315,7 @@ fn decode_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budg
     k if k == SegmentKind::Bzip2 as u8 => decode_bzip2_segment(segment, config, depth, budget),
     k if k == SegmentKind::PdfFlate as u8 => decode_pdf_flate_segment(segment, config, depth, budget),
     k if k == SegmentKind::PdfStream as u8 => decode_pdf_stream(segment, config, depth, budget),
+    k if k == SegmentKind::UnityFs as u8 => decode_unityfs_segment(segment, config, budget),
     _ => Err(Error::InvalidSegment("unknown segment kind")),
   }
 }
