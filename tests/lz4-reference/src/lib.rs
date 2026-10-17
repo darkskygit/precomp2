@@ -89,12 +89,17 @@ pub fn compress_bound(v: CVersion, n: usize) -> usize {
 /// `LZ4_compress_HC(src, dst, srcSize, dstCapacity, level)`; `None` when it
 /// returns 0.
 pub fn compress_hc(v: CVersion, src: &[u8], dst_capacity: usize, level: i32) -> Option<Vec<u8>> {
+  // liblz4 derives limits like `src + srcSize - LASTLITERALS` from the
+  // pointer; an empty slice's dangling pointer makes that wrap (UB that GCC
+  // turns into out-of-bounds reads). Point empty input at real memory.
+  static EMPTY: [u8; 1] = [0];
+  let src_ptr = if src.is_empty() { EMPTY.as_ptr() } else { src.as_ptr() };
   let mut dst = vec![0u8; dst_capacity.max(1)];
   // SAFETY: buffers are valid for the given sizes; the C function writes at
   // most dst_capacity bytes.
   let n = unsafe {
     v.compress_hc_raw(
-      src.as_ptr().cast(),
+      src_ptr.cast(),
       dst.as_mut_ptr().cast(),
       src.len() as c_int,
       dst_capacity as c_int,

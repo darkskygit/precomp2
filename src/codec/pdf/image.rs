@@ -95,9 +95,10 @@ pub(super) fn decode(bytes: &[u8], meta: &[u8], len: usize) -> Result<Vec<u8>> {
   if rgb {
     Ok(pixels)
   } else {
-    if !pixels.chunks_exact(3).all(|p| p[0] == p[1] && p[0] == p[2]) {
+    let (pixels, _) = pixels.as_chunks::<3>();
+    if !pixels.iter().all(|&[r, g, b]| r == g && r == b) {
       return Err(Error::InvalidSegment("pdf gray channels"));
     }
-    Ok(pixels.chunks_exact(3).map(|p| p[0]).collect())
+    Ok(pixels.iter().map(|&[gray, _, _]| gray).collect())
   }
 }

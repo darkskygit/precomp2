@@ -35,10 +35,7 @@ pub(super) fn parse_base64_block(input: &[u8]) -> Option<Base64Block> {
     if input[cursor] == b'-' {
       break;
     }
-    let line_end = match memmem::find(&input[cursor..], b"\r\n") {
-      Some(v) => cursor + v,
-      None => return None,
-    };
+    let line_end = cursor + memmem::find(&input[cursor..], b"\r\n")?;
     let line = &input[cursor..line_end];
     if line.is_empty() {
       return None;

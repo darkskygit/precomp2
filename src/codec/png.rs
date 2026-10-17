@@ -499,17 +499,18 @@ pub(super) fn decode_webp_bitmap(webp_bytes: &[u8], width: u32, height: u32, col
     (webp::PixelLayout::Rgba, webp::PixelLayout::Rgba) => Ok(data.to_vec()),
     (webp::PixelLayout::Rgba, webp::PixelLayout::Rgb) => {
       let mut out = Vec::with_capacity((data.len() / 3) * 4);
-      for chunk in data.chunks_exact(3) {
+      for chunk in data.as_chunks::<3>().0 {
         out.extend_from_slice(chunk);
         out.push(255);
       }
       Ok(out)
     }
     (webp::PixelLayout::Rgb, webp::PixelLayout::Rgba) => {
-      if data.chunks_exact(4).all(|px| px[3] == 255) {
-        let mut out = Vec::with_capacity((data.len() / 4) * 3);
-        for chunk in data.chunks_exact(4) {
-          out.extend_from_slice(&chunk[..3]);
+      let (pixels, _) = data.as_chunks::<4>();
+      if pixels.iter().all(|px| px[3] == 255) {
+        let mut out = Vec::with_capacity(pixels.len() * 3);
+        for px in pixels {
+          out.extend_from_slice(&px[..3]);
         }
         Ok(out)
       } else {
