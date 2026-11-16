@@ -142,6 +142,52 @@ pub fn decode_bytes(input: &[u8], config: &DecodeConfig) -> Result<Vec<u8>> {
   stream::decode_stream(Cursor::new(input), config, 0, &mut budget)
 }
 
+/// Extracts image bytes for a fast preview without reconstructing PNG IDAT.
+/// Transformed PNG returns its WebP carrier, JPEG is restored as JPEG, and
+/// literal images retain their bytes. PNG previews may omit animation,
+/// orientation, color, transparency keys and other display metadata. Valid ICC
+/// profiles are retained when no higher-precedence cICP chunk is present. Use
+/// `decode_bytes` when original bytes or full PNG display semantics are
+/// required. `None` means no supported complete-image representation, including
+/// old PNG preflate segments without a suitable carrier. Containers are not
+/// searched for embedded images. Malformed PCF structure or selected carrier is
+/// an error.
+pub fn decode_image_for_display(input: &[u8], config: &DecodeConfig) -> Result<Option<Vec<u8>>> {
+  let file = Pcf2File::decode(input)?;
+  if file.segments.iter().any(|s| SegmentKind::from_u8(s.kind).is_none()) {
+    return Err(Error::InvalidSegment("unknown segment kind"));
+  }
+  if matches!(file.segments.as_slice(), [prefix, png, suffix]
+      if prefix.kind == SegmentKind::Lit as u8 && png.kind == SegmentKind::PngIdat as u8 && suffix.kind == SegmentKind::Lit as u8)
+  {
+    return png::extract_png_display(&file.segments, config);
+  }
+  let literal_image = file.segments.iter().all(|s| s.kind == SegmentKind::Lit as u8);
+  let jpeg_image = matches!(file.segments.as_slice(), [segment] if segment.kind == SegmentKind::Jpg as u8);
+  if !literal_image && !jpeg_image {
+    return Ok(None);
+  }
+  let mut image = Vec::new();
+  let mut budget = DecodeBudget::default();
+  for segment in &file.segments {
+    let bytes = decode_segment(segment, config, 0, &mut budget)?;
+    if bytes.len() as u64 != segment.orig_len {
+      return Err(Error::InvalidSegment("image original length"));
+    }
+    image.extend_from_slice(&bytes);
+  }
+  if image.starts_with(b"\x89PNG\r\n\x1a\n")
+    || image.starts_with(b"\xff\xd8")
+    || image.starts_with(b"GIF87a")
+    || image.starts_with(b"GIF89a")
+    || (image.starts_with(b"RIFF") && image.get(8..12) == Some(b"WEBP"))
+  {
+    Ok(Some(image))
+  } else {
+    Ok(None)
+  }
+}
+
 pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeConfig) -> Result<Vec<u8>> {
   let mut header_bytes = [0u8; 4 + 2 + 2 + 2 + 8];
   reader.read_exact(&mut header_bytes).await?;

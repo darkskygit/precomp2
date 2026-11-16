@@ -659,3 +659,210 @@ async fn async_decode_roundtrip() {
   let decoded = decode_async(reader, &DecodeConfig::default()).await.expect("decode");
   assert_eq!(decoded, payload);
 }
+
+fn png_with_chunk(png: &[u8], kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+  let mut out = png[..33].to_vec();
+  write_png_chunk(&mut out, kind, data);
+  out.extend_from_slice(&png[33..]);
+  out
+}
+
+fn display_png(png: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+  let pcf = encode_bytes(
+    png,
+    &EncodeConfig {
+      enable_png_webp: true,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  assert_eq!(decode_bytes(&pcf, &DecodeConfig::default()).unwrap(), png);
+  let image = decode_image_for_display(&pcf, &DecodeConfig::default()).unwrap();
+  (pcf, image)
+}
+
+#[test]
+fn display_png_preserves_hidden_rgb_and_original_bytes() {
+  let pixels = [17, 39, 91, 0, 13, 41, 97, 120, 0, 255, 0, 255];
+  let png = build_png_rgba(3, 1, &pixels);
+  let (_, display) = display_png(&png);
+  let webp = display.unwrap();
+  assert_eq!(&webp[8..12], b"WEBP");
+  assert_eq!(decode_webp_bitmap(&webp, 3, 1, 6).unwrap(), pixels);
+  let old = encode_bytes(&png, &EncodeConfig::default()).unwrap();
+  assert!(decode_image_for_display(&old, &DecodeConfig::default()).unwrap().is_none());
+}
+
+#[test]
+fn display_png_color_precedence_and_icc_mux() {
+  let png = build_png_rgba(1, 1, &[23, 45, 67, 0]);
+  let gamma = png_with_chunk(&png, b"gAMA", &45455u32.to_be_bytes());
+  assert_eq!(&display_png(&gamma).1.unwrap()[8..12], b"WEBP");
+  let srgb = png_with_chunk(&gamma, b"sRGB", &[0]);
+  assert_eq!(&display_png(&srgb).1.unwrap()[8..12], b"WEBP");
+  for data in [b"invalid profile".to_vec(), b"profile\0\0invalid zlib".to_vec()] {
+    let input = png_with_chunk(&png, b"iCCP", &data);
+    let webp = display_png(&input).1.unwrap();
+    assert_eq!(&webp[8..12], b"WEBP");
+    assert!(!webp.windows(4).any(|v| v == b"ICCP"));
+  }
+  for profile_len in [132, 133, 4096] {
+    let mut profile = vec![0; profile_len];
+    profile[..4].copy_from_slice(&(profile_len as u32).to_be_bytes());
+    profile[16..20].copy_from_slice(b"RGB ");
+    profile[36..40].copy_from_slice(b"acsp");
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&profile).unwrap();
+    let mut iccp = b"profile\0\0".to_vec();
+    iccp.extend_from_slice(&encoder.finish().unwrap());
+    let icc_png = png_with_chunk(&srgb, b"iCCP", &iccp);
+    let (pcf, image) = display_png(&icc_png);
+    let webp = image.unwrap();
+    assert_eq!(&webp[12..16], b"VP8X");
+    assert_eq!(webp[20] & 0x20, 0x20);
+    assert_eq!(&webp[30..34], b"ICCP");
+    assert_eq!(&webp[38..38 + profile_len], profile.as_slice());
+    assert_eq!(decode_webp_bitmap(&webp, 1, 1, 6).unwrap(), [23, 45, 67, 0]);
+    for limit in [profile.len() - 1, webp.len() - 1, webp.len()] {
+      let config = DecodeConfig {
+        max_total_output: limit as u64,
+        ..Default::default()
+      };
+      let result = decode_image_for_display(&pcf, &config);
+      if limit == webp.len() {
+        assert_eq!(result.unwrap().unwrap(), webp);
+      } else {
+        assert!(result.is_err(), "display output exceeded {limit} bytes");
+      }
+    }
+    let limited_encode = EncodeConfig {
+      enable_png_webp: true,
+      max_total_output: (profile_len - 1) as u64,
+      ..Default::default()
+    };
+    let encoded = encode_bytes(&icc_png, &limited_encode).unwrap();
+    assert_has_kind(&decode_segments(&encoded), SegmentKind::PngIdat);
+    assert_eq!(decode_bytes(&encoded, &DecodeConfig::default()).unwrap(), icc_png);
+    let srgb_cicp = png_with_chunk(&icc_png, b"cICP", &[1, 13, 0, 1]);
+    let webp = display_png(&srgb_cicp).1.unwrap();
+    assert!(!webp.windows(4).any(|v| v == b"ICCP"));
+    let unsupported_cicp = png_with_chunk(&icc_png, b"cICP", &[1, 1, 0, 1]);
+    assert_eq!(&display_png(&unsupported_cicp).1.unwrap()[8..12], b"WEBP");
+  }
+}
+
+#[test]
+fn display_png_metadata_allows_fast_preview() {
+  let png = build_png_rgba(1, 1, &[12, 34, 56, 255]);
+  let mut trailing = png.clone();
+  trailing.extend_from_slice(b"trailing");
+  let mut bad_crc = png.clone();
+  bad_crc[29] ^= 1;
+  for input in [trailing, bad_crc, png[..40].to_vec(), png[..8].to_vec()] {
+    let (pcf, image) = display_png(&input);
+    assert_eq!(image.unwrap(), input);
+    assert_eq!(decode_segments(&pcf), vec![Pcf2Segment::lit(input)]);
+  }
+  for (kind, bytes) in [
+    (*b"acTL", vec![0; 8]),
+    (*b"tRNS", vec![0; 6]),
+    (*b"mDCV", vec![0; 24]),
+    (*b"cLLI", vec![0, 0, 0, 1, 0, 0, 0, 0]),
+    (*b"cHRM", vec![0; 32]),
+    (*b"pHYs", vec![0, 0, 0, 2, 0, 0, 0, 1, 0]),
+    (*b"bKGD", vec![0, 255, 0, 255, 0, 255]),
+    (*b"sRGB", vec![3]),
+  ] {
+    let input = png_with_chunk(&png, &kind, &bytes);
+    let (pcf, image) = display_png(&input);
+    let webp = image.unwrap();
+    assert_eq!(decode_webp_bitmap(&webp, 1, 1, 6).unwrap(), [12, 34, 56, 255]);
+    assert_has_kind(&decode_segments(&pcf), SegmentKind::PngIdat);
+  }
+  let zero_clli = png_with_chunk(&png, b"cLLI", &[0; 8]);
+  assert_eq!(&display_png(&zero_clli).1.unwrap()[8..12], b"WEBP");
+  let mut animated = png[..33].to_vec();
+  write_png_chunk(&mut animated, b"acTL", &[0, 0, 0, 2, 0, 0, 0, 0]);
+  let mut frame = vec![0; 26];
+  frame[7] = 1;
+  frame[11] = 1;
+  frame[21] = 1;
+  frame[23] = 10;
+  write_png_chunk(&mut animated, b"fcTL", &frame);
+  animated.extend_from_slice(&png[33..png.len() - 12]);
+  frame[3] = 1;
+  write_png_chunk(&mut animated, b"fcTL", &frame);
+  let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+  encoder.write_all(&[0, 255, 0, 0, 255]).unwrap();
+  let mut next_frame = vec![0, 0, 0, 2];
+  next_frame.extend_from_slice(&encoder.finish().unwrap());
+  write_png_chunk(&mut animated, b"fdAT", &next_frame);
+  write_png_chunk(&mut animated, b"IEND", &[]);
+  let (pcf, image) = display_png(&animated);
+  assert_has_kind(&decode_segments(&pcf), SegmentKind::PngIdat);
+  assert_eq!(decode_webp_bitmap(&image.unwrap(), 1, 1, 6).unwrap(), [12, 34, 56, 255]);
+  for orientation in 1u16..=8 {
+    let mut exif = b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+    exif.extend_from_slice(&orientation.to_le_bytes());
+    exif.extend_from_slice(&[0; 6]);
+    let input = png_with_chunk(&png, b"eXIf", &exif);
+    let image = display_png(&input).1.unwrap();
+    assert_eq!(&image[8..12], b"WEBP");
+  }
+  let absent = png_with_chunk(&png, b"eXIf", b"II\x2a\0\x08\0\0\0\0\0\0\0\0\0");
+  assert_eq!(&display_png(&absent).1.unwrap()[8..12], b"WEBP");
+  for (depth, color, interlace, samples) in [
+    (8, 0, 0, vec![127]),
+    (8, 3, 0, vec![0]),
+    (16, 6, 0, vec![0, 12, 0, 34, 0, 56, 255, 255]),
+    (8, 6, 1, vec![12, 34, 56, 255]),
+  ] {
+    let mut ihdr = png[16..29].to_vec();
+    ihdr[8] = depth;
+    ihdr[9] = color;
+    ihdr[12] = interlace;
+    let mut input = png[..8].to_vec();
+    write_png_chunk(&mut input, b"IHDR", &ihdr);
+    if color == 3 {
+      write_png_chunk(&mut input, b"PLTE", &[12, 34, 56]);
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&[0]).unwrap();
+    encoder.write_all(&samples).unwrap();
+    write_png_chunk(&mut input, b"IDAT", &encoder.finish().unwrap());
+    write_png_chunk(&mut input, b"IEND", &[]);
+    assert!(display_png(&input).1.is_none());
+  }
+}
+
+#[test]
+fn display_complete_images_and_invalid_containers() {
+  for input in [JPG_FIXTURE, b"GIF89a\x01\0\x01\0\0\0\0;".as_slice()] {
+    let pcf = encode_bytes(input, &EncodeConfig::default()).unwrap();
+    assert_eq!(decode_image_for_display(&pcf, &DecodeConfig::default()).unwrap().unwrap(), input);
+  }
+  for input in [build_zip_sample(), build_pdf_sample(), b"not an image".to_vec()] {
+    let pcf = encode_bytes(&input, &EncodeConfig::default()).unwrap();
+    assert!(decode_image_for_display(&pcf, &DecodeConfig::default()).unwrap().is_none());
+  }
+  let nested_bytes = encode_bytes(JPG_FIXTURE, &EncodeConfig::default()).unwrap();
+  let nested = Pcf2Segment {
+    kind: SegmentKind::Nested as u8,
+    flags: 0,
+    orig_len: JPG_FIXTURE.len() as u64,
+    meta: vec![0],
+    data: nested_bytes,
+  };
+  let mut nested_bytes = Vec::new();
+  Pcf2File::from_segments(vec![nested]).encode(&mut nested_bytes).unwrap();
+  assert!(decode_image_for_display(&nested_bytes, &DecodeConfig::default()).unwrap().is_none());
+  let png = build_png_rgba(1, 1, &[17, 39, 91, 0]);
+  let (pcf, _) = display_png(&png);
+  assert!(decode_image_for_display(&pcf[..pcf.len() - 1], &DecodeConfig::default()).is_err());
+  let mut segments = decode_segments(&pcf);
+  let segment = segments.iter_mut().find(|v| v.kind == SegmentKind::PngIdat as u8).unwrap();
+  segment.meta[2] = 99;
+  let mut corrupt = Vec::new();
+  Pcf2File::from_segments(segments).encode(&mut corrupt).unwrap();
+  assert!(decode_image_for_display(&corrupt, &DecodeConfig::default()).is_err());
+}
