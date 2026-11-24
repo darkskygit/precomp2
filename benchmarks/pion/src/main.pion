@@ -1,0 +1,293 @@
+///| Standalone Pion CLI for precomp2 interop verification and benchmarking.
+
+import "precomp2"
+
+fn usage(world : World) -> Int {
+  io_eprintln(
+    world,
+    "usage:\n  precomp2-bench-pion encode <in> <out> [--png-webp] [--pdf-predictor] [--iters N]\n  precomp2-bench-pion decode <in> <out> [--recover] [--iters N]\n  precomp2-bench-pion display <in> <out> [--iters N]\n  precomp2-bench-pion lz4hc <v1_10_0_l12|v1_9_1_l12|r131_l16> <in> <out> [--iters N]",
+  )
+  2
+}
+
+fn parse_positive_int(s : String) -> Option[Int] {
+  let bs = s.to_bytes()
+  if bs.length() == 0 {
+    return None
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < bs.length() {
+    let c = bs[i].to_int()
+    if c < 48 || c > 57 {
+      return None
+    }
+    acc = acc * 10 + (c - 48)
+    i += 1
+  }
+  if acc <= 0 {
+    None
+  } else {
+    Some(acc)
+  }
+}
+
+fn parse_iters(args : Array[String], start : Int) -> Option[Int] {
+  let mut i = start
+  while i < args.length() {
+    if args[i] == "--iters" {
+      if i + 1 >= args.length() {
+        return None
+      }
+      return parse_positive_int(args[i + 1])
+    }
+    i += 1
+  }
+  Some(1)
+}
+
+fn make_encode_config(
+  enable_png_webp : Bool,
+  enable_pdf_predictor : Bool,
+) -> precomp2::EncodeConfig {
+  let d = precomp2::EncodeConfig::default()
+  precomp2::EncodeConfig::{
+    max_depth: d.max_depth,
+    max_expand_ratio: d.max_expand_ratio,
+    max_total_output: d.max_total_output,
+    enable_png_webp,
+    enable_pdf_predictor,
+    enable_pdf_dct: d.enable_pdf_dct,
+    enable_pdf_ascii: d.enable_pdf_ascii,
+    enable_pdf_images: d.enable_pdf_images,
+    max_pdf_filters: d.max_pdf_filters,
+  }
+}
+
+fn make_decode_config(recover : Bool) -> precomp2::DecodeConfig {
+  let d = precomp2::DecodeConfig::default()
+  precomp2::DecodeConfig::{
+    max_depth: d.max_depth,
+    max_total_output: d.max_total_output,
+    recover,
+  }
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() < 4 {
+    return usage(world)
+  }
+  let cmd = args[1]
+  if cmd == "encode" {
+    let in_path = args[2]
+    let out_path = args[3]
+    let iters = match parse_iters(args, 4) {
+      Some(n) => n
+      None => return usage(world)
+    }
+    let mut enable_png_webp = false
+    let mut enable_pdf_predictor = false
+    let mut fi = 4
+    while fi < args.length() {
+      if args[fi] == "--png-webp" {
+        enable_png_webp = true
+      } else if args[fi] == "--pdf-predictor" {
+        enable_pdf_predictor = true
+      }
+      fi += 1
+    }
+    let cfg = make_encode_config(enable_png_webp, enable_pdf_predictor)
+    let input = match fs_read_bytes(world, in_path) {
+      Ok(b) => b
+      Err(e) => {
+        io_eprintln(world, "read \{in_path}: \{e}")
+        return 1
+      }
+    }
+    let t0 = clock_monotonic_us()
+    let mut out = Bytes::new(0)
+    let mut it = 0
+    while it < iters {
+      out = match precomp2::encode_bytes(input, cfg) {
+        Ok(b) => b
+        Err(e) => {
+          io_eprintln(world, "encode failed: " + e.to_string())
+          return 1
+        }
+      }
+      it += 1
+    }
+    let elapsed_us = clock_monotonic_us() - t0
+    match fs_write_bytes(world, out_path, out) {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "write \{out_path}: \{e}")
+        return 1
+      }
+    }
+    let out_len = out.length()
+    io_println(
+      world,
+      "elapsed_us=\{elapsed_us} iters=\{iters} out_bytes=\{out_len} vmhwm_kib=0",
+    )
+    0
+  } else if cmd == "decode" {
+    let in_path = args[2]
+    let out_path = args[3]
+    let iters = match parse_iters(args, 4) {
+      Some(n) => n
+      None => return usage(world)
+    }
+    let mut recover = false
+    let mut fi = 4
+    while fi < args.length() {
+      if args[fi] == "--recover" {
+        recover = true
+      }
+      fi += 1
+    }
+    let cfg = make_decode_config(recover)
+    let input = match fs_read_bytes(world, in_path) {
+      Ok(b) => b
+      Err(e) => {
+        io_eprintln(world, "read \{in_path}: \{e}")
+        return 1
+      }
+    }
+    let t0 = clock_monotonic_us()
+    let mut out = Bytes::new(0)
+    let mut it = 0
+    while it < iters {
+      out = match precomp2::decode_bytes(input, cfg) {
+        Ok(b) => b
+        Err(e) => {
+          io_eprintln(world, "decode failed: " + e.to_string())
+          return 1
+        }
+      }
+      it += 1
+    }
+    let elapsed_us = clock_monotonic_us() - t0
+    match fs_write_bytes(world, out_path, out) {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "write \{out_path}: \{e}")
+        return 1
+      }
+    }
+    let out_len = out.length()
+    io_println(
+      world,
+      "elapsed_us=\{elapsed_us} iters=\{iters} out_bytes=\{out_len} vmhwm_kib=0",
+    )
+    0
+  } else if cmd == "display" {
+    let in_path = args[2]
+    let out_path = args[3]
+    let iters = match parse_iters(args, 4) {
+      Some(n) => n
+      None => return usage(world)
+    }
+    let cfg = precomp2::DecodeConfig::default()
+    let input = match fs_read_bytes(world, in_path) {
+      Ok(b) => b
+      Err(e) => {
+        io_eprintln(world, "read \{in_path}: \{e}")
+        return 1
+      }
+    }
+    let t0 = clock_monotonic_us()
+    let mut out = Bytes::new(0)
+    let mut it = 0
+    while it < iters {
+      out = match precomp2::decode_image_for_display(input, cfg) {
+        Ok(Some(img)) => img
+        Ok(None) => {
+          io_eprintln(world, "decode_image_for_display returned None")
+          return 1
+        }
+        Err(e) => {
+          io_eprintln(
+            world,
+            "decode_image_for_display failed: " + e.to_string(),
+          )
+          return 1
+        }
+      }
+      it += 1
+    }
+    let elapsed_us = clock_monotonic_us() - t0
+    match fs_write_bytes(world, out_path, out) {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "write \{out_path}: \{e}")
+        return 1
+      }
+    }
+    let out_len = out.length()
+    io_println(
+      world,
+      "elapsed_us=\{elapsed_us} iters=\{iters} out_bytes=\{out_len} vmhwm_kib=0",
+    )
+    0
+  } else if cmd == "lz4hc" {
+    if args.length() < 5 {
+      return usage(world)
+    }
+    let comp = if args[2] == "v1_10_0_l12" {
+      precomp2::Compressor::V1_10_0_L12
+    } else if args[2] == "v1_9_1_l12" {
+      precomp2::Compressor::V1_9_1_L12
+    } else if args[2] == "r131_l16" {
+      precomp2::Compressor::R131_L16
+    } else {
+      return usage(world)
+    }
+    let in_path = args[3]
+    let out_path = args[4]
+    let iters = match parse_iters(args, 5) {
+      Some(n) => n
+      None => return usage(world)
+    }
+    let input = match fs_read_bytes(world, in_path) {
+      Ok(b) => b
+      Err(e) => {
+        io_eprintln(world, "read \{in_path}: \{e}")
+        return 1
+      }
+    }
+    let b0 = precomp2::compress_bound(input.length())
+    let bound = if b0 > 1 { b0 } else { 1 }
+    let t0 = clock_monotonic_us()
+    let mut out = Bytes::new(0)
+    let mut it = 0
+    while it < iters {
+      out = match comp.compress(input, bound) {
+        Some(b) => b
+        None => {
+          io_eprintln(world, "lz4hc compress returned None")
+          return 1
+        }
+      }
+      it += 1
+    }
+    let elapsed_us = clock_monotonic_us() - t0
+    match fs_write_bytes(world, out_path, out) {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "write \{out_path}: \{e}")
+        return 1
+      }
+    }
+    let out_len = out.length()
+    io_println(
+      world,
+      "elapsed_us=\{elapsed_us} iters=\{iters} out_bytes=\{out_len} vmhwm_kib=0",
+    )
+    0
+  } else {
+    usage(world)
+  }
+}

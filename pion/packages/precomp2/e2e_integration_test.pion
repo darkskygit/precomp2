@@ -1,0 +1,1022 @@
+///| End-to-end pure-Pion integration tests exercising all wired codecs through the public `precomp2` API.
+
+import "base64"
+import "bzip2"
+import "flate"
+import "preflate"
+
+let e2e_minimal_jpg : Array[Int] = [
+  255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 1, 2, 0, 0, 1, 0, 1, 0, 0, 255,
+  254, 0, 16, 76, 97, 118, 99, 54, 50, 46, 49, 49, 46, 49, 48, 48, 0, 255, 219,
+  0, 67, 0, 8, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+  6, 6, 7, 7, 7, 8, 8, 8, 7, 7, 7, 6, 6, 7, 7, 8, 8, 8, 8, 9, 9, 9, 8, 8, 8, 8,
+  9, 9, 10, 10, 10, 12, 12, 11, 11, 14, 14, 14, 17, 17, 20, 255, 196, 0, 75, 0,
+  1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 1, 1, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 192, 0, 17,
+  8, 0, 1, 0, 1, 3, 1, 34, 0, 2, 17, 0, 3, 17, 0, 255, 218, 0, 12, 3, 1, 0, 2,
+  17, 3, 17, 0, 63, 0, 191, 128, 15, 255, 217,
+]
+
+let e2e_minimal_png : Array[Int] = [
+  137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0,
+  0, 0, 1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218,
+  99, 252, 255, 31, 0, 3, 3, 2, 0, 238, 254, 209, 228, 0, 0, 0, 0, 73, 69, 78,
+  68, 174, 66, 96, 130,
+]
+
+fn e2e_push_u16_le(out : Array[Byte], v : Int) -> Unit {
+  out.push((v & 0xFF).to_byte())
+  out.push(((v >> 8) & 0xFF).to_byte())
+}
+
+fn e2e_push_u32_le(out : Array[Byte], v : UInt) -> Unit {
+  out.push((v & 0xFFU).to_int().to_byte())
+  out.push(((v >> 8) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 16) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 24) & 0xFFU).to_int().to_byte())
+}
+
+fn e2e_append(out : Array[Byte], data : Bytes) -> Unit {
+  let mut i = 0
+  while i < data.length() {
+    out.push(data[i])
+    i += 1
+  }
+}
+
+fn e2e_make_gzip(plain : Bytes) -> Bytes {
+  let z = flate::zlib_compress_default(plain)
+  let raw_deflate = bytes_slice(z, 2, z.length() - 4)
+  let out : Array[Byte] = [
+    (0x1F).to_byte(),
+    (0x8B).to_byte(),
+    (0x08).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0xFF).to_byte(),
+  ]
+  e2e_append(out, raw_deflate)
+  e2e_push_u32_le(out, flate::crc32(plain))
+  e2e_push_u32_le(out, plain.length().to_uint())
+  arr_to_bytes(out)
+}
+
+fn e2e_make_zip(name : String, plain : Bytes) -> Bytes {
+  let z = flate::zlib_compress_default(plain)
+  let raw_deflate = bytes_slice(z, 2, z.length() - 4)
+  let name_bytes = name.to_bytes()
+  let out : Array[Byte] = [
+    (0x50).to_byte(),
+    (0x4B).to_byte(),
+    (0x03).to_byte(),
+    (0x04).to_byte(),
+  ]
+  e2e_push_u16_le(out, 20) // version needed
+  e2e_push_u16_le(out, 0) // flags (no data descriptor)
+  e2e_push_u16_le(out, 8) // method = DEFLATE
+  e2e_push_u16_le(out, 0) // mod time
+  e2e_push_u16_le(out, 0) // mod date
+  e2e_push_u32_le(out, flate::crc32(plain))
+  e2e_push_u32_le(out, raw_deflate.length().to_uint())
+  e2e_push_u32_le(out, plain.length().to_uint())
+  e2e_push_u16_le(out, name_bytes.length())
+  e2e_push_u16_le(out, 0) // extra len
+  e2e_append(out, name_bytes)
+  e2e_append(out, raw_deflate)
+  // Minimal trailing bytes (end-of-central-dir marker)
+  e2e_append(out, make_test_bytes([0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0]))
+  arr_to_bytes(out)
+}
+
+fn e2e_make_swf(plain : Bytes) -> Bytes {
+  let z = flate::zlib_compress_default(plain)
+  let out : Array[Byte] = []
+  e2e_append(out, "CWS".to_bytes())
+  out.push((10).to_byte()) // version
+  e2e_push_u32_le(out, (plain.length() + 8).to_uint())
+  e2e_append(out, z)
+  arr_to_bytes(out)
+}
+
+fn e2e_build_png(
+  width : Int,
+  height : Int,
+  color_type : Int,
+  pixels : Bytes,
+  extra_chunks : Array[(Bytes, Bytes)],
+) -> Bytes {
+  let bpp = if color_type == 6 { 4 } else { 3 }
+  let row_bytes = width * bpp
+  let filtered : Array[Byte] = []
+  let mut y = 0
+  while y < height {
+    filtered.push((0).to_byte()) // None filter
+    let base = y * row_bytes
+    let mut x = 0
+    while x < row_bytes {
+      filtered.push(pixels[base + x])
+      x += 1
+    }
+    y += 1
+  }
+  let idat = flate::zlib_compress_default(arr_to_bytes(filtered))
+  let ihdr : Array[Byte] = []
+  push_be32(ihdr, width.to_uint())
+  push_be32(ihdr, height.to_uint())
+  ihdr.push((8).to_byte()) // bit depth
+  ihdr.push(color_type.to_byte())
+  ihdr.push((0).to_byte()) // compression
+  ihdr.push((0).to_byte()) // filter
+  ihdr.push((0).to_byte()) // interlace
+  let out : Array[Byte] = []
+  e2e_append(
+    out,
+    make_test_bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+  )
+  write_test_png_chunk(out, "IHDR".to_bytes(), arr_to_bytes(ihdr))
+  let mut ei = 0
+  while ei < extra_chunks.length() {
+    let (ctype, cdata) = extra_chunks[ei]
+    write_test_png_chunk(out, ctype, cdata)
+    ei += 1
+  }
+  write_test_png_chunk(out, "IDAT".to_bytes(), idat)
+  write_test_png_chunk(out, "IEND".to_bytes(), Bytes::new(0))
+  arr_to_bytes(out)
+}
+
+fn e2e_make_valid_iccp_profile() -> Bytes {
+  let profile = Bytes::new(132)
+  profile[3] = (132).to_byte()
+  profile[16] = (0x52).to_byte() // 'R'
+  profile[17] = (0x47).to_byte() // 'G'
+  profile[18] = (0x42).to_byte() // 'B'
+  profile[19] = (0x20).to_byte() // ' '
+  profile[36] = (0x61).to_byte() // 'a'
+  profile[37] = (0x63).to_byte() // 'c'
+  profile[38] = (0x73).to_byte() // 's'
+  profile[39] = (0x70).to_byte() // 'p'
+  profile
+}
+
+fn e2e_make_valid_iccp_chunk() -> Bytes {
+  let profile = e2e_make_valid_iccp_profile()
+  let z = flate::zlib_compress_default(profile)
+  let out : Array[Byte] = []
+  e2e_append(out, "sRGB\u{00}\u{00}".to_bytes())
+  e2e_append(out, z)
+  arr_to_bytes(out)
+}
+
+fn e2e_find_webp_chunk(webp_bytes : Bytes, fourcc : Bytes) -> Option[Bytes] {
+  let n = webp_bytes.length()
+  if n < 12 ||
+  !bytes_starts_with(webp_bytes, "RIFF".to_bytes()) ||
+  !bytes_starts_with_at(webp_bytes, 8, "WEBP".to_bytes()) {
+    return None
+  }
+  let mut off = 12
+  while off + 8 <= n {
+    let clen = read_u32_le(webp_bytes, off + 4).to_int()
+    if off + 8 + clen > n {
+      return None
+    }
+    if bytes_starts_with_at(webp_bytes, off, fourcc) {
+      return Some(bytes_slice(webp_bytes, off + 8, off + 8 + clen))
+    }
+    off = off + 8 + clen + clen % 2
+  }
+  None
+}
+
+fn e2e_pdf_stream_ops(seg : Pcf2Segment) -> Array[Int] {
+  let ops : Array[Int] = []
+  let meta = seg.meta
+  if meta.length() < 2 || meta[0] != (0).to_byte() {
+    return ops
+  }
+  let (count_u, p0) = match read_varint_slice(meta, 1) {
+    Ok(v) => v
+    Err(_) => return ops
+  }
+  let mut pos = p0
+  let mut i = 0
+  let count = count_u.to_int()
+  while i < count && pos < meta.length() {
+    let op = meta[pos].to_int()
+    ops.push(op)
+    pos += 1
+    let (_, p1) = match read_varint_slice(meta, pos) {
+      Ok(v) => v
+      Err(_) => return ops
+    }
+    let (blob_len_u, p2) = match read_varint_slice(meta, p1) {
+      Ok(v) => v
+      Err(_) => return ops
+    }
+    pos = p2 + blob_len_u.to_int()
+    i += 1
+  }
+  ops
+}
+
+fn e2e_array_has_int(arr : Array[Int], target : Int) -> Bool {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == target {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+fn e2e_has_segment_kind(file : Pcf2File, kind : SegmentKind) -> Bool {
+  let target = kind.to_u8()
+  let mut i = 0
+  while i < file.segments.length() {
+    if file.segments[i].kind == target {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+test "e2e_deflate_zlib_gzip_zip_swf_roundtrip" {
+  let plain_buf : Array[Byte] = []
+  let phrase = "The quick brown fox jumps over the lazy dog. 0123456789! ".to_bytes()
+  let mut r = 0
+  while r < 40 {
+    e2e_append(plain_buf, phrase)
+    r += 1
+  }
+  let plain = arr_to_bytes(plain_buf)
+  let zlib_stream = flate::zlib_compress_default(plain)
+  let raw_deflate = bytes_slice(zlib_stream, 2, zlib_stream.length() - 4)
+  let gzip_stream = e2e_make_gzip(plain)
+  let zip_stream = e2e_make_zip("sample.txt", plain)
+  let swf_stream = e2e_make_swf(plain)
+
+  let cases : Array[(String, Bytes, SegmentKind)] = [
+    ("raw_deflate", raw_deflate, SegmentKind::Dflt),
+    ("zlib", zlib_stream, SegmentKind::Zlib),
+    ("gzip", gzip_stream, SegmentKind::Gzip),
+    ("zip", zip_stream, SegmentKind::Dflt),
+    ("swf", swf_stream, SegmentKind::Zlib),
+  ]
+  let mut ci = 0
+  while ci < cases.length() {
+    let (label, input, expected_kind) = cases[ci]
+    let enc = match encode_bytes(input, EncodeConfig::default()) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "\{label} encode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    let pf = match Pcf2File::decode(enc) {
+      Ok(f) => f
+      Err(e) => {
+        debug_assert(false, "\{label} pcf2 decode failed: " + e.to_string())
+        Pcf2File::from_segments([])
+      }
+    }
+    debug_assert(
+      e2e_has_segment_kind(pf, expected_kind),
+      "\{label} missing expected segment kind",
+    )
+    let dec = match decode_bytes(enc, DecodeConfig::default()) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "\{label} decode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    debug_assert(bytes_eq(dec, input), "\{label} roundtrip mismatch")
+    ci += 1
+  }
+}
+
+test "e2e_bzip2_single_block_multiblock_zero_penalty_and_budget" {
+  // Single-block L6
+  let small_plain = "bzip2 payload data".to_bytes()
+  let small_bz2 = match bzip2::compress(small_plain, 6) {
+    Ok(b) => b
+    Err(msg) => {
+      debug_assert(false, "bzip2 L6 compress failed: \{msg}")
+      Bytes::new(0)
+    }
+  }
+  let enc_small = match encode_bytes(small_bz2, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "bzip2 small encode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  let pf_small = match Pcf2File::decode(enc_small) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  debug_assert(
+    pf_small.segments.length() == 1 &&
+    pf_small.segments[0].kind == SegmentKind::Bzip2.to_u8(),
+    "expected single Bzip2 segment",
+  )
+  // meta: [meta_version=0, payload_kind, level='6', penalty_count=0, decoded_len]
+  debug_assert(
+    pf_small.segments[0].meta.length() >= 4 &&
+    pf_small.segments[0].meta[3] == (0).to_byte(),
+    "expected 0 penalty bytes for bzip2 L6",
+  )
+  let dec_small = match decode_bytes(enc_small, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "bzip2 small decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(dec_small, small_bz2), "bzip2 L6 roundtrip mismatch")
+
+  // Multi-block (>100 KiB at L1)
+  let multi_plain = Bytes::new(120000)
+  let mut i = 0
+  while i < multi_plain.length() {
+    multi_plain[i] = ((i * 29 + (i / 251) * 17 + 7) & 0xFF).to_byte()
+    i += 1
+  }
+  let multi_bz2 = match bzip2::compress(multi_plain, 1) {
+    Ok(b) => b
+    Err(msg) => {
+      debug_assert(false, "bzip2 L1 multiblock compress failed: \{msg}")
+      Bytes::new(0)
+    }
+  }
+  let enc_multi = match encode_bytes(multi_bz2, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "bzip2 multiblock encode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  let pf_multi = match Pcf2File::decode(enc_multi) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  debug_assert(
+    pf_multi.segments.length() == 1 &&
+    pf_multi.segments[0].kind == SegmentKind::Bzip2.to_u8() &&
+    pf_multi.segments[0].meta[3] == (0).to_byte(),
+    "expected 0-penalty Bzip2 segment for multiblock L1",
+  )
+  let dec_multi = match decode_bytes(enc_multi, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "bzip2 multiblock decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(dec_multi, multi_bz2), "bzip2 multiblock roundtrip")
+
+  // Budget enforcement rejects oversized bzip2 output cleanly
+  let tight_cfg = DecodeConfig::{
+    max_depth: 4,
+    max_total_output: 1000UL,
+    recover: false,
+  }
+  match decode_bytes(enc_multi, tight_cfg) {
+    Err(Error::Other(_)) => ()
+    _ => debug_assert(false, "expected bzip2 decode budget rejection")
+  }
+}
+
+test "e2e_jpeg_minimal_truncated_and_mjpg_without_dht" {
+  let jpg = make_test_bytes(e2e_minimal_jpg)
+  debug_assert(jpg.length() == 222, "minimal.jpg must be 222 bytes")
+  let enc = match encode_bytes(jpg, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "minimal.jpg encode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  let pf = match Pcf2File::decode(enc) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  debug_assert(
+    pf.segments.length() == 1 &&
+    pf.segments[0].kind == SegmentKind::Jpg.to_u8(),
+    "expected single Jpg segment",
+  )
+  debug_assert(
+    pf.segments[0].data.length() < 222 && enc.length() < 222,
+    "lepton compressed segment and total PCF2 must be smaller than 222 bytes",
+  )
+  let dec = match decode_bytes(enc, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "minimal.jpg decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(dec, jpg), "minimal.jpg roundtrip mismatch")
+  match decode_image_for_display(enc, DecodeConfig::default()) {
+    Ok(Some(disp)) =>
+    debug_assert(bytes_eq(disp, jpg), "minimal.jpg display mismatch")
+    _ => debug_assert(false, "minimal.jpg display should return Some")
+  }
+
+  // Truncated minimal.jpg[..220] (missing EOI) falls back to Lit and roundtrips identically
+  let trunc = bytes_slice(jpg, 0, 220)
+  let enc_trunc = match encode_bytes(trunc, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  let pf_trunc = match Pcf2File::decode(enc_trunc) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  debug_assert(
+    !e2e_has_segment_kind(pf_trunc, SegmentKind::Jpg) &&
+    e2e_has_segment_kind(pf_trunc, SegmentKind::Lit),
+    "truncated jpeg must fall back to Lit",
+  )
+  let dec_trunc = match decode_bytes(enc_trunc, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  debug_assert(bytes_eq(dec_trunc, trunc), "truncated jpeg roundtrip mismatch")
+
+  // MJPG without DHT (uses standard MJPG DHT tables: Y/Cb/Cr 4:4:4 DC=0 + AC EOB = 0x28 0x03)
+  let mjpg_buf : Array[Byte] = []
+  // Copy SOI..DQT (bytes 0..108, omitting DHT at 108..185)
+  let mut k = 0
+  while k < 108 {
+    mjpg_buf.push(jpg[k])
+    k += 1
+  }
+  // SOF0 1x1 3 components, 4:4:4 (sampling factor 0x11 for all 3 components)
+  e2e_append(
+    mjpg_buf,
+    make_test_bytes([
+      0xFF, 0xC0, 0x00, 0x11, 8, 0, 1, 0, 1, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11,
+      0,
+    ]),
+  )
+  // SOS (12 bytes) + 2 entropy bytes (0x28, 0x03) + EOI
+  e2e_append(
+    mjpg_buf,
+    make_test_bytes([
+      0xFF, 0xDA, 0x00, 0x0C, 3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0, 0x28,
+      0x03, 0xFF, 0xD9,
+    ]),
+  )
+  let mjpg = arr_to_bytes(mjpg_buf)
+  debug_assert(!jpeg_has_dht(mjpg), "mjpg fixture must not have DHT")
+  let enc_mjpg = match encode_bytes(mjpg, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "mjpg encode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  let pf_mjpg = match Pcf2File::decode(enc_mjpg) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  debug_assert(
+    pf_mjpg.segments.length() == 1 &&
+    pf_mjpg.segments[0].kind == SegmentKind::Jpg.to_u8() &&
+    pf_mjpg.segments[0].meta.length() == 2 &&
+    pf_mjpg.segments[0].meta[1] == (1).to_byte(),
+    "expected Jpg segment with mjpg_used=1",
+  )
+  let dec_mjpg = match decode_bytes(enc_mjpg, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "mjpg decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(dec_mjpg, mjpg), "mjpg roundtrip mismatch")
+}
+
+test "e2e_png_webp_lossless_rgb_rgba_alpha0_iccp_cicp_and_minimal" {
+  let webp_cfg = EncodeConfig::{
+    max_depth: 4,
+    max_expand_ratio: 16.0,
+    max_total_output: 4294967296UL,
+    enable_png_webp: true,
+    enable_pdf_predictor: false,
+    enable_pdf_dct: true,
+    enable_pdf_ascii: true,
+    enable_pdf_images: true,
+    max_pdf_filters: 16,
+  }
+
+  // 1. Truecolor RGB 8x8
+  let rgb = Bytes::new(8 * 8 * 3)
+  let mut i = 0
+  while i < rgb.length() {
+    rgb[i] = ((i * 53 + 17) & 0xFF).to_byte()
+    i += 1
+  }
+  let png_rgb = e2e_build_png(8, 8, 2, rgb, [])
+
+  // 2. RGBA 8x8 with alpha==0 and non-zero RGB channels
+  let rgba = Bytes::new(8 * 8 * 4)
+  let mut p = 0
+  while p < 64 {
+    let off = p * 4
+    rgba[off] = ((p * 37 + 11) & 0xFF).to_byte()
+    rgba[off + 1] = ((p * 73 + 29) & 0xFF).to_byte()
+    rgba[off + 2] = ((p * 113 + 43) & 0xFF).to_byte()
+    rgba[off + 3] = if p % 3 == 0 { (0).to_byte() } else { ((p * 19 + 80) & 0xFF).to_byte() }
+    p += 1
+  }
+  let png_rgba = e2e_build_png(8, 8, 6, rgba, [])
+
+  // 3. RGBA PNG with iCCP chunk
+  let iccp_chunk = e2e_make_valid_iccp_chunk()
+  let png_iccp = e2e_build_png(8, 8, 6, rgba, [("iCCP".to_bytes(), iccp_chunk)])
+
+  // 4. RGBA PNG with both iCCP and cICP chunks
+  let png_cicp = e2e_build_png(8, 8, 6, rgba, [
+    ("iCCP".to_bytes(), iccp_chunk),
+    ("cICP".to_bytes(), make_test_bytes([1, 13, 0, 1])),
+  ])
+
+  let png_cases : Array[(String, Bytes)] = [
+    ("rgb", png_rgb),
+    ("rgba_alpha0", png_rgba),
+    ("rgba_iccp", png_iccp),
+    ("rgba_cicp", png_cicp),
+  ]
+  let mut pi = 0
+  while pi < png_cases.length() {
+    let (label, png_bytes) = png_cases[pi]
+    let enc = match encode_bytes(png_bytes, webp_cfg) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "png \{label} encode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    let pf = match Pcf2File::decode(enc) {
+      Ok(f) => f
+      Err(_) => Pcf2File::from_segments([])
+    }
+    debug_assert(
+      pf.segments.length() == 3 &&
+      pf.segments[1].kind == SegmentKind::PngIdat.to_u8() &&
+      pf.segments[1].meta.length() >= 3 &&
+      pf.segments[1].meta[2] == (1).to_byte(),
+      "png \{label} expected PngIdat segment with WebP payload",
+    )
+    let dec = match decode_bytes(enc, DecodeConfig::default()) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "png \{label} decode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    debug_assert(bytes_eq(dec, png_bytes), "png \{label} byte-exact roundtrip")
+    match decode_image_for_display(enc, DecodeConfig::default()) {
+      Ok(Some(disp)) => {
+        debug_assert(
+          disp.length() >= 12 &&
+          bytes_starts_with(disp, "RIFF".to_bytes()) &&
+          bytes_starts_with_at(disp, 8, "WEBP".to_bytes()),
+          "png \{label} display must return RIFF/WEBP",
+        )
+        if label == "rgba_iccp" {
+          debug_assert(
+            bytes_starts_with_at(disp, 12, "VP8X".to_bytes()),
+            "png rgba_iccp display should mux VP8X+ICCP",
+          )
+          match e2e_find_webp_chunk(disp, "ICCP".to_bytes()) {
+            Some(icc_payload) =>
+            debug_assert(
+              bytes_eq(icc_payload, e2e_make_valid_iccp_profile()),
+              "png rgba_iccp display ICCP payload must match source profile",
+            )
+            None => debug_assert(false, "png rgba_iccp display missing ICCP chunk")
+          }
+        } else if label == "rgba_cicp" {
+          match e2e_find_webp_chunk(disp, "ICCP".to_bytes()) {
+            None => ()
+            Some(_) => debug_assert(false, "png rgba_cicp display must suppress ICCP chunk")
+          }
+        }
+      }
+      _ => debug_assert(false, "png \{label} display failed")
+    }
+    pi += 1
+  }
+
+  // 5. fixtures/minimal.png (68 B) with enable_png_webp=false and enable_png_webp=true
+  let min_png = make_test_bytes(e2e_minimal_png)
+  debug_assert(min_png.length() == 68, "minimal.png must be 68 bytes")
+  let cfgs : Array[EncodeConfig] = [EncodeConfig::default(), webp_cfg]
+  let mut ci = 0
+  while ci < cfgs.length() {
+    let enc = match encode_bytes(min_png, cfgs[ci]) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "minimal.png encode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    let pf_min = match Pcf2File::decode(enc) {
+      Ok(f) => f
+      Err(_) => Pcf2File::from_segments([])
+    }
+    debug_assert(
+      pf_min.segments.length() == 3 &&
+      pf_min.segments[0].kind == SegmentKind::Lit.to_u8() &&
+      pf_min.segments[1].kind == SegmentKind::PngIdat.to_u8() &&
+      pf_min.segments[2].kind == SegmentKind::Lit.to_u8() &&
+      pf_min.segments[1].meta.length() >= 3 &&
+      pf_min.segments[1].meta[2] == (0).to_byte(),
+      "minimal.png must emit [Lit, PngIdat(scanline), Lit]",
+    )
+    let dec = match decode_bytes(enc, DecodeConfig::default()) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "minimal.png decode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    debug_assert(bytes_eq(dec, min_png), "minimal.png roundtrip mismatch")
+    ci += 1
+  }
+}
+
+test "e2e_pdf_dct_flate_ascii_predictor_and_legacy_pdf_flate" {
+  // 1. Synthetic PDF containing fixtures/minimal.jpg (/DCTDecode)
+  let jpg = make_test_bytes(e2e_minimal_jpg)
+  let pdf_dct_buf : Array[Byte] = []
+  e2e_append(
+    pdf_dct_buf,
+    "%PDF-1.7\n1 0 obj << /Length 222 /Filter /DCTDecode >>\nstream\n".to_bytes(),
+  )
+  e2e_append(pdf_dct_buf, jpg)
+  e2e_append(pdf_dct_buf, "\nendstream\nendobj\n%%EOF\n".to_bytes())
+  let pdf_dct = arr_to_bytes(pdf_dct_buf)
+  let (enc_dct, dct_stats) = match
+  encode_bytes_with_stats(pdf_dct, EncodeConfig::default()) {
+    Ok(v) => v
+    Err(e) => {
+      debug_assert(false, "pdf dct encode failed: " + e.to_string())
+      (Bytes::new(0), PdfStats::default())
+    }
+  }
+  debug_assert(dct_stats.dct == 1, "expected stats.dct == 1")
+  let dec_dct = match decode_bytes(enc_dct, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "pdf dct decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(dec_dct, pdf_dct), "pdf dct roundtrip mismatch")
+
+  // 2. Synthetic PDF with /FlateDecode + /ASCIIHexDecode + PNG predictor (12 = Up)
+  let pred_rows : Array[Byte] = []
+  let mut ry = 0
+  while ry < 8 {
+    pred_rows.push((2).to_byte()) // PNG Up filter
+    let mut rx = 0
+    while rx < 12 {
+      pred_rows.push(((ry * 7 + rx * 3) & 0xFF).to_byte())
+      rx += 1
+    }
+    ry += 1
+  }
+  let flate_stream = flate::zlib_compress_default(arr_to_bytes(pred_rows))
+  // Hex-encode the flate stream with '>' EOD
+  let hex_chars = "0123456789ABCDEF".to_bytes()
+  let hex_stream : Array[Byte] = []
+  let mut hi = 0
+  while hi < flate_stream.length() {
+    let b = flate_stream[hi].to_int()
+    hex_stream.push(hex_chars[(b >> 4) & 0xF])
+    hex_stream.push(hex_chars[b & 0xF])
+    hi += 1
+  }
+  hex_stream.push((0x3E).to_byte()) // '>'
+  let hex_bytes = arr_to_bytes(hex_stream)
+  let pdf_flate_buf : Array[Byte] = []
+  let hdr_str = "%PDF-1.7\n1 0 obj << /Length " +
+  hex_bytes.length().to_string() +
+  " /Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Colors 3 /BitsPerComponent 8 /Columns 4 >>] >>\nstream\n"
+  e2e_append(pdf_flate_buf, hdr_str.to_bytes())
+  e2e_append(pdf_flate_buf, hex_bytes)
+  e2e_append(pdf_flate_buf, "\nendstream\nendobj\n%%EOF\n".to_bytes())
+  let pdf_flate = arr_to_bytes(pdf_flate_buf)
+  let pdf_cfg = EncodeConfig::{
+    max_depth: 4,
+    max_expand_ratio: 16.0,
+    max_total_output: 4294967296UL,
+    enable_png_webp: false,
+    enable_pdf_predictor: true,
+    enable_pdf_dct: true,
+    enable_pdf_ascii: true,
+    enable_pdf_images: true,
+    max_pdf_filters: 16,
+  }
+  let (enc_flate, flate_stats) = match encode_bytes_with_stats(pdf_flate, pdf_cfg) {
+    Ok(v) => v
+    Err(e) => {
+      debug_assert(false, "pdf flate+ascii+pred encode failed: " + e.to_string())
+      (Bytes::new(0), PdfStats::default())
+    }
+  }
+  debug_assert(
+    flate_stats.streams == 1 &&
+    flate_stats.transformed == 1 &&
+    flate_stats.flate == 1 &&
+    flate_stats.ascii == 1,
+    "pdf flate+ascii+pred stats mismatch",
+  )
+  // Verify PdfStream metadata explicitly records predictor op (3) when enabled
+  let pf_pred_on = match Pcf2File::decode(enc_flate) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  let mut found_pred_on = false
+  let mut psi = 0
+  while psi < pf_pred_on.segments.length() {
+    if pf_pred_on.segments[psi].kind == SegmentKind::PdfStream.to_u8() {
+      let ops = e2e_pdf_stream_ops(pf_pred_on.segments[psi])
+      if e2e_array_has_int(ops, 3) {
+        found_pred_on = true
+      }
+    }
+    psi += 1
+  }
+  debug_assert(
+    found_pred_on,
+    "enable_pdf_predictor=true must record predictor op (3) in PdfStream meta",
+  )
+  // Verify predictor op (3) is absent when enable_pdf_predictor=false, ops are exact [ASCIIHex, Flate], and roundtrip matches
+  let (enc_flate_no_pred, no_pred_stats) = match
+  encode_bytes_with_stats(pdf_flate, EncodeConfig::default()) {
+    Ok(v) => v
+    Err(e) => {
+      debug_assert(false, "pdf flate predictor-off encode failed: " + e.to_string())
+      (Bytes::new(0), PdfStats::default())
+    }
+  }
+  debug_assert(
+    no_pred_stats.streams == 1 &&
+    no_pred_stats.transformed == 1 &&
+    no_pred_stats.flate == 1 &&
+    no_pred_stats.ascii == 1,
+    "pdf flate predictor-off stats mismatch",
+  )
+  let pf_pred_off = match Pcf2File::decode(enc_flate_no_pred) {
+    Ok(f) => f
+    Err(e) => {
+      debug_assert(false, "pdf flate predictor-off pcf2 decode failed: " + e.to_string())
+      Pcf2File::from_segments([])
+    }
+  }
+  let mut pdf_stream_off_count = 0
+  psi = 0
+  while psi < pf_pred_off.segments.length() {
+    if pf_pred_off.segments[psi].kind == SegmentKind::PdfStream.to_u8() {
+      pdf_stream_off_count += 1
+      let ops = e2e_pdf_stream_ops(pf_pred_off.segments[psi])
+      debug_assert(
+        ops.length() == 2 && ops[0] == 0 && ops[1] == 2,
+        "enable_pdf_predictor=false must record exact ops [ASCIIHex(0), Flate(2)] without predictor(3)",
+      )
+    }
+    psi += 1
+  }
+  debug_assert(
+    pdf_stream_off_count == 1,
+    "enable_pdf_predictor=false must emit exactly 1 PdfStream segment",
+  )
+  let dec_flate_no_pred = match
+  decode_bytes(enc_flate_no_pred, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "pdf flate predictor-off decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(
+    bytes_eq(dec_flate_no_pred, pdf_flate),
+    "pdf flate predictor-off roundtrip mismatch",
+  )
+  let dec_flate = match decode_bytes(enc_flate, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "pdf flate+ascii+pred decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(dec_flate, pdf_flate), "pdf flate+ascii+pred roundtrip")
+
+  // 3. Synthetic legacy PdfFlate (segment kind 9) container constructed with Pion preflate
+  let leg_plain = "legacy PdfFlate segment payload 1234567890".to_bytes()
+  let leg_zlib = flate::zlib_compress_default(leg_plain)
+  let leg_deflate = bytes_slice(leg_zlib, 2, leg_zlib.length() - 4)
+  let leg_pf = match preflate::analyze_limited(leg_deflate, 100000) {
+    Ok(r) => r
+    Err(msg) => {
+      debug_assert(false, "preflate analyze for legacy PdfFlate failed: \{msg}")
+      preflate::PreflateResult::{
+        compressed_size: 0,
+        corrections: Bytes::new(0),
+        plain: Bytes::new(0),
+      }
+    }
+  }
+  let leg_meta : Array[Byte] = [
+    (0).to_byte(), // meta_version = 0
+    (1).to_byte(), // compression = 1 (zlib)
+    (0).to_byte(), // payload_kind = 0 (raw)
+    (0).to_byte(), // transform = 0 (none)
+    leg_zlib[0],
+    leg_zlib[1],
+    leg_zlib[leg_zlib.length() - 4],
+    leg_zlib[leg_zlib.length() - 3],
+    leg_zlib[leg_zlib.length() - 2],
+    leg_zlib[leg_zlib.length() - 1],
+  ]
+  let leg_seg = Pcf2Segment::{
+    kind: SegmentKind::PdfFlate.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: leg_zlib.length().to_int64().to_uint64(),
+    meta: arr_to_bytes(leg_meta),
+    data: build_preflate_data(leg_pf.corrections, leg_pf.plain),
+  }
+  let leg_pcf = wrap_single_segment_pcf2(leg_seg)
+  let leg_dec = match decode_bytes(leg_pcf, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "legacy PdfFlate decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(leg_dec, leg_zlib), "legacy PdfFlate roundtrip mismatch")
+}
+
+test "e2e_unityfs_v6_and_nested_base64_and_recovery" {
+  // 1. UnityFS v6 with LZ4HC blocks
+  let bundle = build_unityfs_bundle(
+    6U,
+    "2022.3.62f3",
+    0x43U,
+    Compressor::V1_10_0_L12,
+    [3, 2, 0],
+    [
+      structured_payload(0x101UL, 16384),
+      structured_payload(0x202UL, 8192),
+      structured_payload(0x303UL, 1024),
+    ],
+    [false, false, false],
+  )
+  let enc_u = match encode_bytes(bundle, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "unityfs encode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  let pf_u = match Pcf2File::decode(enc_u) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  debug_assert(
+    e2e_has_segment_kind(pf_u, SegmentKind::UnityFs),
+    "expected UnityFs segment",
+  )
+  let dec_u = match decode_bytes(enc_u, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "unityfs decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(dec_u, bundle), "unityfs v6 roundtrip mismatch")
+
+  // 2. MIME-style Base64 wrapping zlib and bzip2 payloads (recursive nested preprocessing)
+  let inner_plain = "Repeated nested payload inside MIME Base64! Repeated nested payload inside MIME Base64! ".to_bytes()
+  let inner_zlib = flate::zlib_compress_default(inner_plain)
+  let inner_bz2 = match bzip2::compress(inner_plain, 6) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  let nested_inputs : Array[(String, Bytes)] = [
+    ("base64_zlib", inner_zlib),
+    ("base64_bzip2", inner_bz2),
+  ]
+  let mut ni = 0
+  while ni < nested_inputs.length() {
+    let (label, inner_bin) = nested_inputs[ni]
+    let b64 = base64::encode(inner_bin).to_bytes()
+    let mime : Array[Byte] = []
+    e2e_append(mime, "Content-Transfer-Encoding: base64\r\n\r\n".to_bytes())
+    let mut pos = 0
+    while pos < b64.length() {
+      let end = if pos + 64 < b64.length() { pos + 64 } else { b64.length() }
+      let mut k = pos
+      while k < end {
+        mime.push(b64[k])
+        k += 1
+      }
+      mime.push((0x0D).to_byte())
+      mime.push((0x0A).to_byte())
+      pos = end
+    }
+    let mime_bytes = arr_to_bytes(mime)
+    let enc_m = match encode_bytes(mime_bytes, EncodeConfig::default()) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "\{label} encode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    let pf_m = match Pcf2File::decode(enc_m) {
+      Ok(f) => f
+      Err(_) => Pcf2File::from_segments([])
+    }
+    debug_assert(
+      pf_m.segments.length() == 1 &&
+      pf_m.segments[0].kind == SegmentKind::Base64.to_u8() &&
+      pf_m.segments[0].meta.length() >= 2 &&
+      pf_m.segments[0].meta[1] == (1).to_byte(),
+      "\{label} expected Base64 segment with nested payload_kind=1",
+    )
+    let inner_pcf = match Pcf2File::decode(pf_m.segments[0].data) {
+      Ok(f) => f
+      Err(_) => Pcf2File::from_segments([])
+    }
+    let expected_inner = if label == "base64_zlib" {
+      SegmentKind::Zlib
+    } else {
+      SegmentKind::Bzip2
+    }
+    debug_assert(
+      e2e_has_segment_kind(inner_pcf, expected_inner),
+      "\{label} inner nested PCF2 missing expected codec segment",
+    )
+    let dec_m = match decode_bytes(enc_m, DecodeConfig::default()) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "\{label} decode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    debug_assert(bytes_eq(dec_m, mime_bytes), "\{label} roundtrip mismatch")
+    ni += 1
+  }
+
+  // 3. Recovery with garbage prefix, separator, and suffix around concatenated PCF2 containers
+  let part1 = "first-recovered-container".to_bytes()
+  let part2 = "second-recovered-container".to_bytes()
+  let pcf1 = match encode_bytes(part1, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  let pcf2 = match encode_bytes(part2, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  let corrupt : Array[Byte] = []
+  e2e_append(corrupt, "JUNK_PREFIX_12345".to_bytes())
+  e2e_append(corrupt, pcf1)
+  e2e_append(corrupt, "MIDDLE_GARBAGE".to_bytes())
+  e2e_append(corrupt, pcf2)
+  e2e_append(corrupt, "TRAILING_JUNK_XYZ".to_bytes())
+  let rec_cfg = DecodeConfig::{
+    max_depth: 4,
+    max_total_output: 4294967296UL,
+    recover: true,
+  }
+  let recovered = match decode_bytes(arr_to_bytes(corrupt), rec_cfg) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "recover decode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  debug_assert(
+    bytes_eq(
+      recovered,
+      "first-recovered-containersecond-recovered-container".to_bytes(),
+    ),
+    "recovered payload mismatch",
+  )
+}

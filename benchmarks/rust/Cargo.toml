@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "precomp2-bench-rust"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+precomp2 = { path = "../../rust" }
+webp = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
