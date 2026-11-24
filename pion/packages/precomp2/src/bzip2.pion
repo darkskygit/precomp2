@@ -40,7 +40,12 @@ fn encode_bzip2(
     return Ok(None)
   }
   let level_num = level_b - 0x30
-  let plain = match bzip2::decompress(input) {
+  let rem_u64 = u64_saturating_sub(
+    config.max_total_output,
+    budget.total_output,
+  )
+  let max_out = if rem_u64 > 2147483647UL { 2147483647 } else { rem_u64.to_int() }
+  let plain = match bzip2::decompress_limited(input, max_out) {
     Ok(v) => v
     Err(_) => return Ok(None)
   }

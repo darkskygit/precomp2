@@ -246,11 +246,26 @@ fn encode_webp_lossless(
   height : UInt,
   color_type : Byte,
 ) -> Result[Bytes, Error] {
-  let _ = bitmap
-  let _ = width
-  let _ = height
-  let _ = color_type
-  Err(Error::Other("webp lossless encoder unavailable"))
+  if width > 16384U || height > 16384U {
+    return Err(Error::InvalidSegment("png webp dimensions"))
+  }
+  let w = width.to_int()
+  let h = height.to_int()
+  let opts = webp::EncodeOptions::exact()
+  let ct = color_type.to_int()
+  if ct == 6 {
+    match webp::encode_lossless_rgba_with_options(bitmap, w, h, opts) {
+      Ok(b) => Ok(b)
+      Err(e) => Err(Error::Other("webp encode failed: \{e.to_string()}"))
+    }
+  } else if ct == 2 {
+    match webp::encode_lossless_rgb_with_options(bitmap, w, h, opts) {
+      Ok(b) => Ok(b)
+      Err(e) => Err(Error::Other("webp encode failed: \{e.to_string()}"))
+    }
+  } else {
+    Err(Error::InvalidSegment("png color_type"))
+  }
 }
 
 ///| Decode a WebP bitstream into an RGB (color_type=2) or RGBA (color_type=6) bitmap.
