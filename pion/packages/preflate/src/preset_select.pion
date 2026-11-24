@@ -1,0 +1,205 @@
+///| Preset, `windowBits` (`9..15`), and `Z_FILTERED` auto-selector for LZ77 prediction.
+
+///| Estimate residual byte cost of `(preset, wbits, filtered)` on up to `sample_limit` tokens.
+fn score_preset_on_block(
+  base_state : PredictorState,
+  plain : Bytes,
+  block_start : Int,
+  block_end : Int,
+  tokens : Array[Int],
+  preset : Int,
+  wbits : Int,
+  filtered : Bool,
+  sample_limit : Int,
+) -> Int {
+  let n_toks = tokens.length()
+  let lim = if n_toks < sample_limit { n_toks } else { sample_limit }
+
+  let st = if !preset_uses_hash(preset) {
+    PredictorState::new()
+  } else {
+    let c = pred_clone(base_state)
+    pred_catch_up(c, plain, block_start, block_end)
+    c
+  }
+
+  let mut pos = block_start
+  let mut cost = 0
+  let mut i = 0
+  while i < lim {
+    let actual = tokens[i]
+    let (pred, nll, nld) = predict_token(st, plain, pos, block_end, preset, wbits, filtered)
+    if actual != pred {
+      if !token_is_match(actual) {
+        cost = cost + 1
+      } else if token_is_alt_258(actual) {
+        cost = cost + 3
+      } else if token_is_match(pred) && token_match_dist(actual) == token_match_dist(pred) {
+        cost = cost + 2
+      } else if token_is_match(pred) && token_match_len(actual) == token_match_len(pred) {
+        cost = cost + 3
+      } else {
+        cost = cost + 4
+      }
+    }
+    let adv = if token_is_match(actual) { token_match_len(actual) } else { 1 }
+    let pass_nll = if actual == pred { nll } else { 0 }
+    let pass_nld = if actual == pred { nld } else { 0 }
+    pred_advance(st, plain, pos, adv, block_end, preset, pass_nll, pass_nld)
+    pos = pos + adv
+    i = i + 1
+  }
+  cost
+}
+
+///| Choose the lowest-residual `(preset, wbits, filtered)` for a Huffman block.
+fn select_block_preset(
+  base_state : PredictorState,
+  plain : Bytes,
+  block_start : Int,
+  block_end : Int,
+  tokens : Array[Int],
+  match_count : Int,
+  all_dist_one : Bool,
+  max_obs_dist : Int,
+  min_obs_len : Int,
+  cached_preset : Int,
+  cached_wbits : Int,
+  cached_filtered : Bool,
+) -> (Int, Int, Bool) {
+  if match_count == 0 {
+    return (preset_literals, cached_wbits, cached_filtered)
+  }
+  if all_dist_one {
+    return (preset_rle, cached_wbits, cached_filtered)
+  }
+  if cached_preset >= 0 {
+    return (cached_preset, cached_wbits, cached_filtered)
+  }
+
+  let sample_limit = 4096
+  let candidates = [
+    preset_zlib_l6,
+    preset_zlib_l9,
+    preset_zlib_l1,
+    preset_zlib_l4,
+    preset_zlib_l5,
+    preset_zlib_l2,
+    preset_zlib_l3,
+    preset_zlib_l7,
+    preset_zlib_l8,
+    preset_flate_greedy,
+    preset_rle,
+    preset_literals,
+  ]
+  let mut best_preset = preset_zlib_l6
+  let mut best_wbits = 15
+  let mut best_filtered = false
+  let mut best_cost = 2147483647
+
+  let mut ci = 0
+  while ci < candidates.length() {
+    let p = candidates[ci]
+    let c = score_preset_on_block(
+      base_state, plain, block_start, block_end, tokens, p, 15, false, sample_limit,
+    )
+    if c < best_cost {
+      best_cost = c
+      best_preset = p
+      if c == 0 {
+        return (best_preset, best_wbits, best_filtered)
+      }
+    }
+    ci = ci + 1
+  }
+
+  // Try `Z_FILTERED` slow presets (libpng default when row filters are enabled).
+  let slow_candidates = [
+    preset_zlib_l6,
+    preset_zlib_l9,
+    preset_zlib_l4,
+    preset_zlib_l5,
+    preset_zlib_l7,
+    preset_zlib_l8,
+  ]
+  if min_obs_len >= 6 {
+    let mut si = 0
+    while si < slow_candidates.length() {
+      let p = slow_candidates[si]
+      let c = score_preset_on_block(
+        base_state, plain, block_start, block_end, tokens, p, 15, true, sample_limit,
+      )
+      if c < best_cost {
+        best_cost = c
+        best_preset = p
+        best_wbits = 15
+        best_filtered = true
+        if c == 0 {
+          return (best_preset, best_wbits, best_filtered)
+        }
+      }
+      si = si + 1
+    }
+  }
+
+  // Try smaller `windowBits` (`9..14`) when all observed match distances fit in a smaller window.
+  let mut min_wb = 9
+  while min_wb <= 14 && zlib_max_dist_for_wbits(min_wb) < max_obs_dist {
+    min_wb = min_wb + 1
+  }
+  if min_wb <= 14 {
+    let zlib_all = [
+      preset_zlib_l6,
+      preset_zlib_l9,
+      preset_zlib_l1,
+      preset_zlib_l4,
+      preset_zlib_l5,
+      preset_zlib_l2,
+      preset_zlib_l3,
+      preset_zlib_l7,
+      preset_zlib_l8,
+    ]
+    let mut wb = min_wb
+    while wb <= 14 {
+      let mut zi = 0
+      while zi < zlib_all.length() {
+        let p = zlib_all[zi]
+        let c = score_preset_on_block(
+          base_state, plain, block_start, block_end, tokens, p, wb, false, sample_limit,
+        )
+        if c < best_cost {
+          best_cost = c
+          best_preset = p
+          best_wbits = wb
+          best_filtered = false
+          if c == 0 {
+            return (best_preset, best_wbits, best_filtered)
+          }
+        }
+        zi = zi + 1
+      }
+      if min_obs_len >= 6 {
+        let mut si = 0
+        while si < slow_candidates.length() {
+          let p = slow_candidates[si]
+          let c = score_preset_on_block(
+            base_state, plain, block_start, block_end, tokens, p, wb, true, sample_limit,
+          )
+          if c < best_cost {
+            best_cost = c
+            best_preset = p
+            best_wbits = wb
+            best_filtered = true
+            if c == 0 {
+              return (best_preset, best_wbits, best_filtered)
+            }
+          }
+          si = si + 1
+        }
+      }
+      wb = wb + 1
+    }
+  }
+
+  (best_preset, best_wbits, best_filtered)
+}

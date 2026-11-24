@@ -1,0 +1,221 @@
+///| Dynamic Huffman header emission for both predicted zlib headers and verbatim headers.
+
+///| Emit a predicted zlib dynamic Huffman header to `bw` and return canonical encoding tables.
+fn emit_predicted_dynamic_header(
+  pred : PredictedDynHeader,
+  bw : BitWriter,
+) -> Result[(FixedArray[Int], FixedArray[Int], FixedArray[Int], FixedArray[Int]), String] {
+  bw_write_bits(bw, pred.hlit - 257, 5)
+  bw_write_bits(bw, pred.hdist - 1, 5)
+  bw_write_bits(bw, pred.hclen - 4, 4)
+
+  let mut ci = 0
+  while ci < pred.hclen {
+    bw_write_bits(bw, pred.cl_lens[cl_order[ci]], 3)
+    ci = ci + 1
+  }
+  let cl_codes = match build_canonical_codes(pred.cl_lens, 19, false) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+
+  let n_rle = pred.rle_syms.length()
+  let mut ri = 0
+  while ri < n_rle {
+    let sym = pred.rle_syms[ri]
+    let ex = pred.rle_extra[ri]
+    bw_write_bits(bw, cl_codes[sym], pred.cl_lens[sym])
+    if sym == 16 {
+      bw_write_bits(bw, ex, 2)
+    } else if sym == 17 {
+      bw_write_bits(bw, ex, 3)
+    } else if sym == 18 {
+      bw_write_bits(bw, ex, 7)
+    }
+    ri = ri + 1
+  }
+
+  let lit_codes = match build_canonical_codes(pred.lit_lens, pred.hlit, false) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  let dist_codes = match build_canonical_codes(pred.dist_lens, pred.hdist, true) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  Ok((lit_codes, pred.lit_lens, dist_codes, pred.dist_lens))
+}
+
+///| Decode a verbatim dynamic Huffman header from `r`, emit its exact bits to `bw`, and return tables.
+fn decode_and_emit_verbatim_header(
+  r : ByteReader,
+  bw : BitWriter,
+) -> Result[(FixedArray[Int], FixedArray[Int], FixedArray[Int], FixedArray[Int]), String] {
+  let hlit_off = match byr_read_u8(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let hdist_off = match byr_read_u8(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let hclen_off = match byr_read_u8(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let hlit = hlit_off + 257
+  let hdist = hdist_off + 1
+  let hclen = hclen_off + 4
+  if hlit > 286 || hdist > 32 || hclen > 19 {
+    return Err("dynamic Huffman header counts out of RFC 1951 bounds")
+  }
+
+  bw_write_bits(bw, hlit_off, 5)
+  bw_write_bits(bw, hdist_off, 5)
+  bw_write_bits(bw, hclen_off, 4)
+
+  let cl_lens : FixedArray[Int] = FixedArray::make(19, 0)
+  let mut acc = 0
+  let mut bits = 0
+  let mut ci = 0
+  while ci < hclen {
+    while bits < 3 {
+      let b = match byr_read_u8(r) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      acc = acc | (b << bits)
+      bits = bits + 8
+    }
+    let lv = acc & 7
+    acc = acc >> 3
+    bits = bits - 3
+    cl_lens[cl_order[ci]] = lv
+    bw_write_bits(bw, lv, 3)
+    ci = ci + 1
+  }
+
+  let cl_codes = match build_canonical_codes(cl_lens, 19, false) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+
+  let rle_cnt = match byr_read_varint(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let total_codes = hlit + hdist
+  if rle_cnt < 0 || rle_cnt > total_codes {
+    return Err("dynamic Huffman RLE count out of bounds")
+  }
+  let code_lens : FixedArray[Int] = FixedArray::make(total_codes, 0)
+  let mut idx = 0
+  let mut ri = 0
+  while ri < rle_cnt {
+    let raw_tok = match byr_read_u8(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if raw_tok < 16 {
+      if idx >= total_codes {
+        return Err("RLE sequence overflows HLIT + HDIST")
+      }
+      let cl = cl_lens[raw_tok]
+      if cl == 0 {
+        return Err("RLE symbol has zero code-length Huffman code")
+      }
+      bw_write_bits(bw, cl_codes[raw_tok], cl)
+      code_lens[idx] = raw_tok
+      idx = idx + 1
+    } else if raw_tok < 20 {
+      if idx == 0 {
+        return Err("RLE code 16 at index 0")
+      }
+      let ex = raw_tok - 16
+      let rep = ex + 3
+      if rep > total_codes - idx {
+        return Err("RLE code 16 overflows HLIT + HDIST")
+      }
+      let cl = cl_lens[16]
+      if cl == 0 {
+        return Err("RLE symbol 16 has zero code-length Huffman code")
+      }
+      bw_write_bits(bw, cl_codes[16], cl)
+      bw_write_bits(bw, ex, 2)
+      let prev = code_lens[idx - 1]
+      let mut k = 0
+      while k < rep {
+        code_lens[idx] = prev
+        idx = idx + 1
+        k = k + 1
+      }
+    } else if raw_tok < 28 {
+      let ex = raw_tok - 20
+      let rep = ex + 3
+      if rep > total_codes - idx {
+        return Err("RLE code 17 overflows HLIT + HDIST")
+      }
+      let cl = cl_lens[17]
+      if cl == 0 {
+        return Err("RLE symbol 17 has zero code-length Huffman code")
+      }
+      bw_write_bits(bw, cl_codes[17], cl)
+      bw_write_bits(bw, ex, 3)
+      let mut k = 0
+      while k < rep {
+        code_lens[idx] = 0
+        idx = idx + 1
+        k = k + 1
+      }
+    } else if raw_tok < 156 {
+      let ex = raw_tok - 28
+      let rep = ex + 11
+      if rep > total_codes - idx {
+        return Err("RLE code 18 overflows HLIT + HDIST")
+      }
+      let cl = cl_lens[18]
+      if cl == 0 {
+        return Err("RLE symbol 18 has zero code-length Huffman code")
+      }
+      bw_write_bits(bw, cl_codes[18], cl)
+      bw_write_bits(bw, ex, 7)
+      let mut k = 0
+      while k < rep {
+        code_lens[idx] = 0
+        idx = idx + 1
+        k = k + 1
+      }
+    } else {
+      return Err("invalid encoded RLE token in corrections")
+    }
+    ri = ri + 1
+  }
+  if idx != total_codes {
+    return Err("RLE sequence did not fill HLIT + HDIST")
+  }
+  if code_lens[256] == 0 {
+    return Err("dynamic Huffman tree missing EOB symbol 256")
+  }
+
+  let lit_lens : FixedArray[Int] = FixedArray::make(288, 0)
+  let dist_lens : FixedArray[Int] = FixedArray::make(32, 0)
+  let mut i = 0
+  while i < hlit {
+    lit_lens[i] = code_lens[i]
+    i = i + 1
+  }
+  i = 0
+  while i < hdist {
+    dist_lens[i] = code_lens[hlit + i]
+    i = i + 1
+  }
+  let lit_codes = match build_canonical_codes(lit_lens, hlit, false) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  let dist_codes = match build_canonical_codes(dist_lens, hdist, true) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  Ok((lit_codes, lit_lens, dist_codes, dist_lens))
+}

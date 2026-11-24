@@ -1,0 +1,432 @@
+///| LSB-first bit reader/writer and LEB128 varint byte reader/writer for RFC 1951 streams.
+
+///| Concatenate an array of `Bytes` chunks using balanced pairwise `Bytes::concat`.
+fn concat_chunks(chunks : Array[Bytes]) -> Bytes {
+  let mut count = chunks.length()
+  if count == 0 {
+    return Bytes::new(0)
+  }
+  if count == 1 {
+    return chunks[0]
+  }
+  if count == 2 {
+    return chunks[0].concat(chunks[1])
+  }
+  let mut cur : Array[Bytes] = chunks
+  while count > 1 {
+    let next : Array[Bytes] = []
+    let mut i = 0
+    while i + 1 < count {
+      next.push(cur[i].concat(cur[i + 1]))
+      i = i + 2
+    }
+    if i < count {
+      next.push(cur[i])
+    }
+    cur = next
+    count = cur.length()
+  }
+  cur[0]
+}
+
+///| 64-bit LSB-first bit reader with exact consumed byte tracking.
+struct BitReader {
+  data : Bytes
+  in_len : Int
+  mut in_pos : Int
+  mut bitbuf : UInt64
+  mut bitcnt : Int
+}
+
+///|
+fn BitReader::new(data : Bytes) -> BitReader {
+  BitReader::{ data, in_len: data.length(), in_pos: 0, bitbuf: 0UL, bitcnt: 0 }
+}
+
+///| Refill `bitbuf` up to at least `min_bits` bits if input bytes remain.
+fn br_refill(br : BitReader, min_bits : Int) -> Unit {
+  while br.bitcnt < min_bits && br.in_pos < br.in_len {
+    br.bitbuf = br.bitbuf | (br.data[br.in_pos].to_int().to_int64().to_uint64() << br.bitcnt)
+    br.in_pos = br.in_pos + 1
+    br.bitcnt = br.bitcnt + 8
+  }
+}
+
+///| Refill `bitbuf` as full as possible (up to 56+ bits) for fast Huffman lookup.
+fn br_refill_max(br : BitReader) -> Unit {
+  while br.bitcnt <= 56 && br.in_pos < br.in_len {
+    br.bitbuf = br.bitbuf | (br.data[br.in_pos].to_int().to_int64().to_uint64() << br.bitcnt)
+    br.in_pos = br.in_pos + 1
+    br.bitcnt = br.bitcnt + 8
+  }
+}
+
+///| Read `nbits` (0..24) LSB-first bits, failing on EOF.
+fn br_read_bits(br : BitReader, nbits : Int) -> Result[Int, String] {
+  if nbits == 0 {
+    return Ok(0)
+  }
+  br_refill(br, nbits)
+  if br.bitcnt < nbits {
+    return Err("unexpected EOF while reading bits")
+  }
+  let mask = (1UL << nbits) - 1UL
+  let bits_val = (br.bitbuf & mask).to_int()
+  br.bitbuf = br.bitbuf >> nbits
+  br.bitcnt = br.bitcnt - nbits
+  Ok(bits_val)
+}
+
+///| Align to the next byte boundary and return the padding bits captured from the current byte.
+fn br_align_byte(br : BitReader) -> Int {
+  let pad_count = br.bitcnt & 7
+  let pad_bits = if pad_count > 0 {
+    let mask = (1UL << pad_count) - 1UL
+    let v = (br.bitbuf & mask).to_int()
+    br.bitbuf = br.bitbuf >> pad_count
+    br.bitcnt = br.bitcnt - pad_count
+    v
+  } else {
+    0
+  }
+  br.in_pos = br.in_pos - (br.bitcnt >> 3)
+  br.bitbuf = 0UL
+  br.bitcnt = 0
+  pad_bits
+}
+
+///| Read a 16-bit little-endian unsigned integer after byte alignment.
+fn br_read_u16_le(br : BitReader) -> Result[Int, String] {
+  if br.in_len - br.in_pos < 2 {
+    return Err("unexpected EOF while reading stored block length")
+  }
+  let lo = br.data[br.in_pos].to_int()
+  let hi = br.data[br.in_pos + 1].to_int()
+  br.in_pos = br.in_pos + 2
+  Ok(lo | (hi << 8))
+}
+
+///| 64-bit LSB-first bit writer backed by chunked `Bytes` buffers.
+struct BitWriter {
+  mut buf : Bytes
+  mut len : Int
+  mut bitbuf : UInt64
+  mut bitcnt : Int
+  chunks : Array[Bytes]
+}
+
+///|
+fn BitWriter::new(init_cap : Int) -> BitWriter {
+  let c = if init_cap < 256 { 256 } else if init_cap > 65536 { 65536 } else { init_cap }
+  BitWriter::{ buf: Bytes::new(c), len: 0, bitbuf: 0UL, bitcnt: 0, chunks: [] }
+}
+
+///|
+fn bw_ensure(bw : BitWriter, extra : Int) -> Unit {
+  if extra <= bw.buf.length() - bw.len {
+    return
+  }
+  if bw.len >= 4096 {
+    bw.chunks.push(bw.buf.slice(0, bw.len))
+    bw.len = 0
+    if extra <= bw.buf.length() {
+      return
+    }
+    let mut new_cap = bw.buf.length() * 2
+    while new_cap < extra {
+      new_cap = new_cap * 2
+    }
+    bw.buf = Bytes::new(new_cap)
+    return
+  }
+  let needed = bw.len + extra
+  let mut new_cap = bw.buf.length() * 2
+  while new_cap < needed {
+    new_cap = new_cap * 2
+  }
+  let pad = Bytes::new(new_cap - bw.len)
+  bw.buf = if bw.len == bw.buf.length() {
+    bw.buf.concat(pad)
+  } else {
+    bw.buf.slice(0, bw.len).concat(pad)
+  }
+}
+
+///| Write `nbits` (0..32) LSB-first bits.
+fn bw_write_bits(bw : BitWriter, bits : Int, nbits : Int) -> Unit {
+  if nbits == 0 {
+    return
+  }
+  bw.bitbuf = bw.bitbuf | ((bits.to_int64().to_uint64() & ((1UL << nbits) - 1UL)) << bw.bitcnt)
+  bw.bitcnt = bw.bitcnt + nbits
+  if bw.bitcnt >= 32 {
+    bw_ensure(bw, 4)
+    let w = bw.bitbuf
+    bw.buf[bw.len] = (w & 0xFFUL).to_int().to_byte()
+    bw.buf[bw.len + 1] = ((w >> 8) & 0xFFUL).to_int().to_byte()
+    bw.buf[bw.len + 2] = ((w >> 16) & 0xFFUL).to_int().to_byte()
+    bw.buf[bw.len + 3] = ((w >> 24) & 0xFFUL).to_int().to_byte()
+    bw.len = bw.len + 4
+    bw.bitbuf = bw.bitbuf >> 32
+    bw.bitcnt = bw.bitcnt - 32
+  }
+}
+
+///| Flush remaining bits to the next byte boundary using exact `pad_bits`.
+fn bw_align_byte_with_pad(bw : BitWriter, pad_bits : Int) -> Result[Unit, String] {
+  let rem = bw.bitcnt & 7
+  let pad_count = if rem == 0 { 0 } else { 8 - rem }
+  if pad_bits < 0 || pad_bits >= (1 << pad_count) {
+    return Err("invalid padding bits for byte alignment")
+  }
+  if pad_count > 0 {
+    bw_write_bits(bw, pad_bits, pad_count)
+  }
+  if bw.bitcnt > 0 {
+    let bytes_out = bw.bitcnt >> 3
+    bw_ensure(bw, bytes_out)
+    let mut k = 0
+    while k < bytes_out {
+      bw.buf[bw.len] = (bw.bitbuf & 0xFFUL).to_int().to_byte()
+      bw.len = bw.len + 1
+      bw.bitbuf = bw.bitbuf >> 8
+      k = k + 1
+    }
+    bw.bitbuf = 0UL
+    bw.bitcnt = 0
+  }
+  Ok(())
+}
+
+///| Write raw bytes directly after byte alignment.
+fn bw_write_raw(bw : BitWriter, data : Bytes, start : Int, count : Int) -> Unit {
+  if count <= 0 {
+    return
+  }
+  if count >= 256 {
+    if bw.len > 0 {
+      bw.chunks.push(bw.buf.slice(0, bw.len))
+      bw.len = 0
+    }
+    bw.chunks.push(data.slice(start, start + count))
+    return
+  }
+  bw_ensure(bw, count)
+  let mut k = 0
+  while k < count {
+    bw.buf[bw.len + k] = data[start + k]
+    k = k + 1
+  }
+  bw.len = bw.len + count
+}
+
+///| Write a 16-bit little-endian integer after byte alignment.
+fn bw_write_u16_le(bw : BitWriter, v : Int) -> Unit {
+  bw_ensure(bw, 2)
+  bw.buf[bw.len] = (v & 0xFF).to_byte()
+  bw.buf[bw.len + 1] = ((v >> 8) & 0xFF).to_byte()
+  bw.len = bw.len + 2
+}
+
+///| Finalize `BitWriter` with exact `trailing_pad_bits` and return contiguous `Bytes`.
+fn bw_finish_with_pad(bw : BitWriter, trailing_pad_bits : Int) -> Result[Bytes, String] {
+  match bw_align_byte_with_pad(bw, trailing_pad_bits) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  if bw.chunks.length() == 0 {
+    return Ok(bw.buf.slice(0, bw.len))
+  }
+  if bw.len > 0 {
+    bw.chunks.push(bw.buf.slice(0, bw.len))
+    bw.len = 0
+  }
+  Ok(concat_chunks(bw.chunks))
+}
+
+///| Growable byte writer with strict `max_bytes` budget for compact corrections serialization.
+struct ByteWriter {
+  mut buf : Bytes
+  mut len : Int
+  mut total : Int
+  max_bytes : Int
+  mut overflow : Bool
+  chunks : Array[Bytes]
+}
+
+///|
+fn ByteWriter::new(init_cap : Int) -> ByteWriter {
+  ByteWriter::new_capped(init_cap, 2147483647)
+}
+
+///|
+fn ByteWriter::new_capped(init_cap : Int, max_bytes : Int) -> ByteWriter {
+  let c = if init_cap < 128 { 128 } else if init_cap > 65536 { 65536 } else { init_cap }
+  let cap = if max_bytes >= 0 && c > max_bytes && max_bytes > 0 { max_bytes } else { c }
+  ByteWriter::{
+    buf: Bytes::new(cap),
+    len: 0,
+    total: 0,
+    max_bytes,
+    overflow: max_bytes < 0,
+    chunks: [],
+  }
+}
+
+///|
+fn byw_ensure(w : ByteWriter, extra : Int) -> Unit {
+  if extra <= w.buf.length() - w.len {
+    return
+  }
+  if w.len >= 4096 {
+    w.chunks.push(w.buf.slice(0, w.len))
+    w.len = 0
+    if extra <= w.buf.length() {
+      return
+    }
+    let mut new_cap = w.buf.length() * 2
+    while new_cap < extra {
+      new_cap = new_cap * 2
+    }
+    w.buf = Bytes::new(new_cap)
+    return
+  }
+  let needed = w.len + extra
+  let mut new_cap = w.buf.length() * 2
+  while new_cap < needed {
+    new_cap = new_cap * 2
+  }
+  let pad = Bytes::new(new_cap - w.len)
+  w.buf = if w.len == w.buf.length() {
+    w.buf.concat(pad)
+  } else {
+    w.buf.slice(0, w.len).concat(pad)
+  }
+}
+
+///|
+fn byw_write_u8(w : ByteWriter, b : Int) -> Unit {
+  if w.overflow || 1 > w.max_bytes - w.total {
+    w.overflow = true
+    return
+  }
+  byw_ensure(w, 1)
+  w.buf[w.len] = (b & 0xFF).to_byte()
+  w.len = w.len + 1
+  w.total = w.total + 1
+}
+
+///|
+fn byw_write_bytes(w : ByteWriter, data : Bytes) -> Unit {
+  let n = data.length()
+  if n == 0 {
+    return
+  }
+  if w.overflow || n > w.max_bytes - w.total {
+    w.overflow = true
+    return
+  }
+  if n >= 256 {
+    if w.len > 0 {
+      w.chunks.push(w.buf.slice(0, w.len))
+      w.len = 0
+    }
+    w.chunks.push(data)
+    w.total = w.total + n
+    return
+  }
+  byw_ensure(w, n)
+  let mut i = 0
+  while i < n {
+    w.buf[w.len + i] = data[i]
+    i = i + 1
+  }
+  w.len = w.len + n
+  w.total = w.total + n
+}
+
+///| Write a non-negative integer as unsigned LEB128 varint.
+fn byw_write_varint(w : ByteWriter, value : Int) -> Unit {
+  let mut v = value
+  while v >= 0x80 {
+    byw_write_u8(w, (v & 0x7F) | 0x80)
+    v = v >> 7
+  }
+  byw_write_u8(w, v & 0x7F)
+}
+
+///| Write a signed delta using zigzag + unsigned LEB128 varint.
+fn byw_write_zigzag(w : ByteWriter, delta : Int) -> Unit {
+  let zz = if delta >= 0 { delta << 1 } else { ((-delta) << 1) - 1 }
+  byw_write_varint(w, zz)
+}
+
+///|
+fn byw_finish(w : ByteWriter) -> Bytes {
+  if w.chunks.length() == 0 {
+    return w.buf.slice(0, w.len)
+  }
+  if w.len > 0 {
+    w.chunks.push(w.buf.slice(0, w.len))
+    w.len = 0
+  }
+  concat_chunks(w.chunks)
+}
+
+///| Byte cursor for parsing corrections payloads.
+struct ByteReader {
+  data : Bytes
+  len : Int
+  mut pos : Int
+}
+
+///|
+fn ByteReader::new(data : Bytes) -> ByteReader {
+  ByteReader::{ data, len: data.length(), pos: 0 }
+}
+
+///|
+fn byr_read_u8(r : ByteReader) -> Result[Int, String] {
+  if r.pos >= r.len {
+    return Err("unexpected EOF in corrections")
+  }
+  let b = r.data[r.pos].to_int()
+  r.pos = r.pos + 1
+  Ok(b)
+}
+
+///| Read a non-negative 31-bit unsigned LEB128 varint.
+fn byr_read_varint(r : ByteReader) -> Result[Int, String] {
+  let mut result = 0
+  let mut shift = 0
+  while true {
+    if r.pos >= r.len {
+      return Err("unexpected EOF in varint")
+    }
+    let b = r.data[r.pos].to_int()
+    r.pos = r.pos + 1
+    if shift >= 28 && (b & 0xF8) != 0 {
+      return Err("varint overflow")
+    }
+    result = result | ((b & 0x7F) << shift)
+    if (b & 0x80) == 0 {
+      return Ok(result)
+    }
+    shift = shift + 7
+  }
+  Err("varint overflow")
+}
+
+///| Read a zigzag-encoded signed integer.
+fn byr_read_zigzag(r : ByteReader) -> Result[Int, String] {
+  match byr_read_varint(r) {
+    Err(e) => Err(e)
+    Ok(zz) => {
+      if (zz & 1) == 0 {
+        Ok(zz >> 1)
+      } else {
+        Ok(-((zz >> 1) + 1))
+      }
+    }
+  }
+}

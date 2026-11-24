@@ -1,0 +1,428 @@
+///| Deterministic zlib-accurate LZ77 match predictor (levels 1..9, `windowBits` 9..15, `Z_FILTERED`, RLE, Huffman-only).
+
+///| Predictor preset IDs stored in 4 bits (`0..11`) of block flags.
+let preset_literals : Int = 0
+
+///|
+let preset_rle : Int = 1
+
+///|
+let preset_zlib_l1 : Int = 2
+
+///|
+let preset_zlib_l2 : Int = 3
+
+///|
+let preset_zlib_l3 : Int = 4
+
+///|
+let preset_zlib_l4 : Int = 5
+
+///|
+let preset_zlib_l5 : Int = 6
+
+///|
+let preset_zlib_l6 : Int = 7
+
+///|
+let preset_zlib_l7 : Int = 8
+
+///|
+let preset_zlib_l8 : Int = 9
+
+///|
+let preset_zlib_l9 : Int = 10
+
+///|
+let preset_flate_greedy : Int = 11
+
+///|
+let preset_max : Int = 11
+
+///|
+let hash_size : Int = 32768
+
+///|
+let hash_mask : Int = 32767
+
+///|
+let win_size : Int = 32768
+
+///|
+let win_mask : Int = 32767
+
+///| Zlib `TOO_FAR`: drop length-3 matches at distance > 4096 in `deflate_slow`.
+let zlib_too_far : Int = 4096
+
+///| Exact zlib `configuration_table` parameters for presets `2..10` (levels 1..9).
+let cfg_good_len : FixedArray[Int] = fixed_from_array([0, 0, 4, 4, 4, 4, 8, 8, 8, 32, 32, 4])
+
+///| `max_insert` for fast presets (2..4) and `max_lazy` for slow presets (5..10).
+let cfg_max_lazy : FixedArray[Int] = fixed_from_array([0, 0, 4, 5, 6, 4, 16, 16, 32, 128, 258, 0])
+
+///|
+let cfg_nice_len : FixedArray[Int] = fixed_from_array([
+  0, 0, 8, 16, 32, 16, 32, 128, 128, 258, 258, 32,
+])
+
+///|
+let cfg_max_chain : FixedArray[Int] = fixed_from_array([
+  0, 0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096, 16,
+])
+
+///|
+fn preset_is_zlib_fast(preset : Int) -> Bool {
+  preset >= preset_zlib_l1 && preset <= preset_zlib_l3
+}
+
+///|
+fn preset_is_zlib_slow(preset : Int) -> Bool {
+  preset >= preset_zlib_l4 && preset <= preset_zlib_l9
+}
+
+///|
+fn preset_uses_hash(preset : Int) -> Bool {
+  preset >= preset_zlib_l1 && preset <= preset_max
+}
+
+///| Compute zlib `MAX_DIST = (1 << wbits) - MIN_LOOKAHEAD (262)` for `wbits` in `9..15`.
+fn zlib_max_dist_for_wbits(wbits : Int) -> Int {
+  (1 << wbits) - 262
+}
+
+///| Sliding-window hash-chain and lazy carry-over state for deterministic LZ77 prediction.
+struct PredictorState {
+  mut initialized : Bool
+  mut head : FixedArray[Int]
+  mut prev : FixedArray[Int]
+  mut indexed_up_to : Int
+  mut lazy_len : Int
+  mut lazy_dist : Int
+}
+
+///|
+fn PredictorState::new() -> PredictorState {
+  let empty : FixedArray[Int] = FixedArray::make(0, 0)
+  PredictorState::{
+    initialized: false,
+    head: empty,
+    prev: empty,
+    indexed_up_to: 0,
+    lazy_len: 0,
+    lazy_dist: 0,
+  }
+}
+
+///|
+fn pred_ensure_tables(s : PredictorState) -> Unit {
+  if !s.initialized {
+    s.head = FixedArray::make(hash_size, -1)
+    s.prev = FixedArray::make(win_size, -1)
+    s.initialized = true
+  }
+}
+
+///|
+fn pred_clone(s : PredictorState) -> PredictorState {
+  if !s.initialized {
+    return PredictorState::{
+      initialized: false,
+      head: FixedArray::make(0, 0),
+      prev: FixedArray::make(0, 0),
+      indexed_up_to: s.indexed_up_to,
+      lazy_len: s.lazy_len,
+      lazy_dist: s.lazy_dist,
+    }
+  }
+  let head_copy : FixedArray[Int] = FixedArray::make(hash_size, -1)
+  let prev_copy : FixedArray[Int] = FixedArray::make(win_size, -1)
+  let mut i = 0
+  while i < hash_size {
+    head_copy[i] = s.head[i]
+    prev_copy[i] = s.prev[i]
+    i = i + 1
+  }
+  PredictorState::{
+    initialized: true,
+    head: head_copy,
+    prev: prev_copy,
+    indexed_up_to: s.indexed_up_to,
+    lazy_len: s.lazy_len,
+    lazy_dist: s.lazy_dist,
+  }
+}
+
+///| 15-bit 3-byte rolling hash matching zlib's `UPDATE_HASH` (`HASH_SHIFT = 5`).
+fn hash3(plain : Bytes, pos : Int) -> Int {
+  let b0 = plain[pos].to_int()
+  let b1 = plain[pos + 1].to_int()
+  let b2 = plain[pos + 2].to_int()
+  ((b0 << 10) ^ (b1 << 5) ^ b2) & hash_mask
+}
+
+///| Insert a single position into the hash chain when at least 3 bytes remain in `limit`.
+fn pred_insert_one(s : PredictorState, plain : Bytes, pos : Int, limit : Int) -> Unit {
+  if limit - pos < 3 {
+    return
+  }
+  let h = hash3(plain, pos)
+  s.prev[pos & win_mask] = s.head[h]
+  s.head[h] = pos
+}
+
+///| Catch up hash table indexing before entering a hash-based block.
+fn pred_catch_up(s : PredictorState, plain : Bytes, pos : Int, block_end : Int) -> Unit {
+  pred_ensure_tables(s)
+  let min_start = if pos > win_size { pos - win_size } else { 0 }
+  let mut i = s.indexed_up_to
+  if i < min_start {
+    i = min_start
+  }
+  if i < 0 {
+    i = 0
+  }
+  let max_ins = if block_end >= 2 { block_end - 2 } else { 0 }
+  let target = if pos < max_ins { pos } else { max_ins }
+  while i < target {
+    pred_insert_one(s, plain, i, block_end)
+    i = i + 1
+  }
+  if s.indexed_up_to < target {
+    s.indexed_up_to = target
+  }
+  s.lazy_len = 0
+  s.lazy_dist = 0
+}
+
+///| Advance predictor state after committing an actual token of `advance` bytes.
+fn pred_advance(
+  s : PredictorState,
+  plain : Bytes,
+  pos : Int,
+  advance : Int,
+  block_end : Int,
+  preset : Int,
+  next_lazy_len : Int,
+  next_lazy_dist : Int,
+) -> Unit {
+  if !preset_uses_hash(preset) {
+    s.lazy_len = 0
+    s.lazy_dist = 0
+    return
+  }
+  if !s.initialized {
+    pred_catch_up(s, plain, pos, block_end)
+  }
+  if advance == 1 {
+    s.lazy_len = next_lazy_len
+    s.lazy_dist = next_lazy_dist
+  } else {
+    s.lazy_len = 0
+    s.lazy_dist = 0
+  }
+
+  let max_ins = if block_end >= 2 { block_end - 2 } else { 0 }
+  if preset_is_zlib_fast(preset) && advance > cfg_max_lazy[preset] {
+    if pos < max_ins {
+      pred_insert_one(s, plain, pos, block_end)
+    }
+    let end = pos + advance
+    let new_idx = if end < max_ins { end } else { max_ins }
+    if s.indexed_up_to < new_idx {
+      s.indexed_up_to = new_idx
+    }
+    return
+  }
+
+  let end = pos + advance
+  let stop = if end < max_ins { end } else { max_ins }
+  let mut i = pos
+  while i < stop {
+    pred_insert_one(s, plain, i, block_end)
+    i = i + 1
+  }
+  if s.indexed_up_to < stop {
+    s.indexed_up_to = stop
+  }
+}
+
+///| Find longest match at `pos` without mutating `s`, matching zlib's `longest_match`.
+fn find_best_match(
+  s : PredictorState,
+  plain : Bytes,
+  pos : Int,
+  block_end : Int,
+  max_chain : Int,
+  good_len : Int,
+  nice_len : Int,
+  init_best_len : Int,
+  prev_len : Int,
+  max_dist : Int,
+  extra_cand : Int,
+) -> (Int, Int) {
+  let rem = block_end - pos
+  if rem < 3 {
+    return (0, 0)
+  }
+  let max_len = if rem > 258 { 258 } else { rem }
+  if init_best_len >= max_len {
+    return (0, 0)
+  }
+  let eff_nice = if nice_len > max_len { max_len } else { nice_len }
+  let min_pos = if pos > max_dist { pos - max_dist } else { 0 }
+
+  let mut best_len = init_best_len
+  let mut best_dist = 0
+  let p0 = plain[pos]
+  let p1 = plain[pos + 1]
+  let p2 = plain[pos + 2]
+
+  // Unindexed candidate (`pos - 1`) during lazy lookahead at `pos + 1`.
+  if extra_cand >= min_pos && extra_cand < pos {
+    if plain[extra_cand + best_len] == plain[pos + best_len] &&
+    plain[extra_cand] == p0 &&
+    plain[extra_cand + 1] == p1 &&
+    plain[extra_cand + 2] == p2 {
+      let mut mlen = 3
+      while mlen < max_len && plain[extra_cand + mlen] == plain[pos + mlen] {
+        mlen = mlen + 1
+      }
+      if mlen > best_len {
+        best_len = mlen
+        best_dist = pos - extra_cand
+        if best_len >= eff_nice {
+          return (best_len, best_dist)
+        }
+      }
+    }
+  }
+
+  let mut chain = if prev_len >= good_len { max_chain >> 2 } else { max_chain }
+  if chain < 1 {
+    chain = 1
+  }
+  let mut cur = s.head[hash3(plain, pos)]
+  while cur >= min_pos && cur < pos && chain > 0 {
+    if plain[cur + best_len] == plain[pos + best_len] &&
+    plain[cur] == p0 &&
+    plain[cur + 1] == p1 &&
+    plain[cur + 2] == p2 {
+      let mut mlen = 3
+      while mlen < max_len && plain[cur + mlen] == plain[pos + mlen] {
+        mlen = mlen + 1
+      }
+      if mlen > best_len {
+        best_len = mlen
+        best_dist = pos - cur
+        if best_len >= eff_nice {
+          break
+        }
+      }
+    }
+    let next = s.prev[cur & win_mask]
+    if next >= cur {
+      break
+    }
+    cur = next
+    chain = chain - 1
+  }
+  if best_len <= init_best_len {
+    return (0, 0)
+  }
+  (best_len, best_dist)
+}
+
+///| Pure deterministic prediction at `pos` for `(preset, wbits, filtered)`.
+///| Returns `(predicted_token, next_lazy_len, next_lazy_dist)`.
+fn predict_token(
+  s : PredictorState,
+  plain : Bytes,
+  pos : Int,
+  block_end : Int,
+  preset : Int,
+  wbits : Int,
+  filtered : Bool,
+) -> (Int, Int, Int) {
+  if preset == preset_literals {
+    return (plain[pos].to_int(), 0, 0)
+  }
+  if preset == preset_rle {
+    if pos > 0 && block_end - pos >= 3 {
+      let prev_b = plain[pos - 1]
+      if plain[pos] == prev_b && plain[pos + 1] == prev_b && plain[pos + 2] == prev_b {
+        let rem = block_end - pos
+        let max_len = if rem > 258 { 258 } else { rem }
+        let mut mlen = 3
+        while mlen < max_len && plain[pos + mlen] == prev_b {
+          mlen = mlen + 1
+        }
+        return (pack_match_token(mlen, 1, false), 0, 0)
+      }
+    }
+    return (plain[pos].to_int(), 0, 0)
+  }
+
+  let good_len = cfg_good_len[preset]
+  let max_lazy = cfg_max_lazy[preset]
+  let nice_len = cfg_nice_len[preset]
+  let max_chain = cfg_max_chain[preset]
+  let max_dist = if preset == preset_flate_greedy {
+    win_size
+  } else {
+    zlib_max_dist_for_wbits(wbits)
+  }
+
+  if !preset_is_zlib_slow(preset) {
+    let (mlen, mdist) = find_best_match(
+      s, plain, pos, block_end, max_chain, good_len, nice_len, 2, 0, max_dist, -1,
+    )
+    if mlen < 3 {
+      return (plain[pos].to_int(), 0, 0)
+    }
+    return (pack_match_token(mlen, mdist, false), 0, 0)
+  }
+
+  // Zlib `deflate_slow`: use carried lazy match if available, otherwise search at `pos`.
+  let (cur_len, cur_dist) = if s.lazy_len >= 3 {
+    (s.lazy_len, s.lazy_dist)
+  } else {
+    let (ml, md) = find_best_match(
+      s, plain, pos, block_end, max_chain, good_len, nice_len, 2, 2, max_dist, -1,
+    )
+    if (filtered && ml <= 5) || (ml == 3 && md > zlib_too_far) {
+      (0, 0)
+    } else {
+      (ml, md)
+    }
+  }
+  if cur_len < 3 {
+    return (plain[pos].to_int(), 0, 0)
+  }
+
+  // Lazy lookahead at `pos + 1` with zlib's `prev_length` carry-over, `Z_FILTERED`, and `TOO_FAR`.
+  if cur_len < max_lazy && block_end - pos >= 4 {
+    let (next_len_raw, next_dist) = find_best_match(
+      s,
+      plain,
+      pos + 1,
+      block_end,
+      max_chain,
+      good_len,
+      nice_len,
+      cur_len,
+      cur_len,
+      max_dist,
+      pos,
+    )
+    let next_len = if (filtered && next_len_raw <= 5) ||
+    (next_len_raw == 3 && next_dist > zlib_too_far) {
+      0
+    } else {
+      next_len_raw
+    }
+    if next_len > cur_len {
+      return (plain[pos].to_int(), next_len, next_dist)
+    }
+  }
+  (pack_match_token(cur_len, cur_dist, false), 0, 0)
+}

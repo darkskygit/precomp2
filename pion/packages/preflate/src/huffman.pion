@@ -1,0 +1,260 @@
+///| Canonical Huffman validation, 2-level decode LUTs, and fixed RFC 1951 tables.
+
+///| Validate code lengths (0..15) and Kraft inequality; populate `count[1..15]` and return symbol count.
+fn validate_and_count_lengths(
+  lengths : FixedArray[Int],
+  num_syms : Int,
+  count : FixedArray[Int],
+  allow_empty : Bool,
+) -> Result[Int, String] {
+  let mut max_len = 0
+  let mut total_syms = 0
+  let mut i = 0
+  while i < num_syms {
+    let l = lengths[i]
+    if l < 0 || l > 15 {
+      return Err("Huffman code length out of 0..15 range")
+    }
+    if l > 0 {
+      count[l] = count[l] + 1
+      if l > max_len {
+        max_len = l
+      }
+      total_syms = total_syms + 1
+    }
+    i = i + 1
+  }
+  if total_syms == 0 {
+    if allow_empty {
+      return Ok(0)
+    }
+    return Err("empty Huffman tree")
+  }
+  let mut left = 1
+  let mut b = 1
+  while b <= 15 {
+    left = (left << 1) - count[b]
+    if left < 0 {
+      return Err("oversubscribed Huffman tree")
+    }
+    b = b + 1
+  }
+  if left > 0 && !(total_syms == 1 && max_len == 1) {
+    return Err("incomplete Huffman tree")
+  }
+  Ok(total_syms)
+}
+
+///| Compute canonical starting codes `next_code[1..15]` from bit-length histogram `count`.
+fn compute_start_codes(count : FixedArray[Int]) -> FixedArray[Int] {
+  let next_code : FixedArray[Int] = FixedArray::make(16, 0)
+  let mut code = 0
+  let mut b = 1
+  while b <= 15 {
+    code = (code + count[b - 1]) << 1
+    next_code[b] = code
+    b = b + 1
+  }
+  next_code
+}
+
+///| Build 2-level Inflate Huffman LUT into `table`.
+///| Entry encoding:
+///|   - `0`: invalid code
+///|   - `(entry & 16) == 0`: direct symbol -> `bits = entry & 15`, `sym = entry >> 5`
+///|   - `(entry & 16) != 0`: subtable -> `sub_bits = entry & 15`, `sub_off = entry >> 5`
+fn build_decode_lut(
+  lengths : FixedArray[Int],
+  num_syms : Int,
+  table : FixedArray[Int],
+  root_bits : Int,
+  allow_empty : Bool,
+) -> Result[Int, String] {
+  let count : FixedArray[Int] = FixedArray::make(16, 0)
+  let total_syms = match validate_and_count_lengths(lengths, num_syms, count, allow_empty) {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+  let root_size = 1 << root_bits
+  let mut i = 0
+  while i < root_size {
+    table[i] = 0
+    i = i + 1
+  }
+  if total_syms == 0 {
+    return Ok(0)
+  }
+
+  let next_code = compute_start_codes(count)
+  let sub_max_bits : FixedArray[Int] = FixedArray::make(root_size, 0)
+  let sym_codes : FixedArray[Int] = FixedArray::make(num_syms, 0)
+  let mut sym = 0
+  while sym < num_syms {
+    let l = lengths[sym]
+    if l > 0 {
+      let c = next_code[l]
+      next_code[l] = c + 1
+      let rev = bit_reverse(c, l)
+      sym_codes[sym] = rev
+      if l <= root_bits {
+        let entry = (sym << 5) | l
+        let step = 1 << l
+        let mut idx = rev
+        while idx < root_size {
+          table[idx] = entry
+          idx = idx + step
+        }
+      } else {
+        let prefix = rev & (root_size - 1)
+        let extra = l - root_bits
+        if extra > sub_max_bits[prefix] {
+          sub_max_bits[prefix] = extra
+        }
+      }
+    }
+    sym = sym + 1
+  }
+
+  let mut next_free = root_size
+  let mut p = 0
+  while p < root_size {
+    let sb = sub_max_bits[p]
+    if sb > 0 {
+      let sub_size = 1 << sb
+      if sub_size > table.length() - next_free {
+        return Err("Huffman subtable overflow")
+      }
+      table[p] = (next_free << 5) | 16 | sb
+      let mut k = 0
+      while k < sub_size {
+        table[next_free + k] = 0
+        k = k + 1
+      }
+      next_free = next_free + sub_size
+    }
+    p = p + 1
+  }
+
+  sym = 0
+  while sym < num_syms {
+    let l = lengths[sym]
+    if l > root_bits {
+      let rev = sym_codes[sym]
+      let prefix = rev & (root_size - 1)
+      let root_entry = table[prefix]
+      let sub_off = root_entry >> 5
+      let sub_bits = root_entry & 15
+      let sub_size = 1 << sub_bits
+      let extra_len = l - root_bits
+      let entry = (sym << 5) | extra_len
+      let step = 1 << extra_len
+      let mut idx = rev >> root_bits
+      while idx < sub_size {
+        table[sub_off + idx] = entry
+        idx = idx + step
+      }
+    }
+    sym = sym + 1
+  }
+  Ok(total_syms)
+}
+
+///| Build bit-reversed canonical Huffman encoding codes from `lengths[0..num_syms]`.
+fn build_canonical_codes(
+  lengths : FixedArray[Int],
+  num_syms : Int,
+  allow_empty : Bool,
+) -> Result[FixedArray[Int], String] {
+  let count : FixedArray[Int] = FixedArray::make(16, 0)
+  let total_syms = match validate_and_count_lengths(lengths, num_syms, count, allow_empty) {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+  let codes : FixedArray[Int] = FixedArray::make(num_syms, 0)
+  if total_syms == 0 {
+    return Ok(codes)
+  }
+  let next_code = compute_start_codes(count)
+  let mut sym = 0
+  while sym < num_syms {
+    let l = lengths[sym]
+    if l > 0 {
+      let c = next_code[l]
+      next_code[l] = c + 1
+      codes[sym] = bit_reverse(c, l)
+    }
+    sym = sym + 1
+  }
+  Ok(codes)
+}
+
+///| Build RFC 1951 fixed literal/length code lengths (288 entries).
+fn build_fixed_litlen_lengths() -> FixedArray[Int] {
+  let l : FixedArray[Int] = FixedArray::make(288, 0)
+  let mut i = 0
+  while i <= 143 {
+    l[i] = 8
+    i = i + 1
+  }
+  while i <= 255 {
+    l[i] = 9
+    i = i + 1
+  }
+  while i <= 279 {
+    l[i] = 7
+    i = i + 1
+  }
+  while i <= 287 {
+    l[i] = 8
+    i = i + 1
+  }
+  l
+}
+
+///|
+let fixed_litlen_lens : FixedArray[Int] = build_fixed_litlen_lengths()
+
+///|
+let fixed_dist_lens : FixedArray[Int] = FixedArray::make(32, 5)
+
+///|
+fn build_fixed_litlen_codes() -> FixedArray[Int] {
+  match build_canonical_codes(fixed_litlen_lens, 288, false) {
+    Ok(c) => c
+    Err(_) => FixedArray::make(288, 0)
+  }
+}
+
+///|
+fn build_fixed_dist_codes() -> FixedArray[Int] {
+  match build_canonical_codes(fixed_dist_lens, 32, false) {
+    Ok(c) => c
+    Err(_) => FixedArray::make(32, 0)
+  }
+}
+
+///|
+let fixed_litlen_codes : FixedArray[Int] = build_fixed_litlen_codes()
+
+///|
+let fixed_dist_codes : FixedArray[Int] = build_fixed_dist_codes()
+
+///|
+fn build_fixed_litlen_lut() -> FixedArray[Int] {
+  let lut : FixedArray[Int] = FixedArray::make(1024, 0)
+  let _ = build_decode_lut(fixed_litlen_lens, 288, lut, litlen_root_bits, false)
+  lut
+}
+
+///|
+fn build_fixed_dist_lut() -> FixedArray[Int] {
+  let lut : FixedArray[Int] = FixedArray::make(512, 0)
+  let _ = build_decode_lut(fixed_dist_lens, 32, lut, dist_root_bits, false)
+  lut
+}
+
+///|
+let fixed_litlen_lut : FixedArray[Int] = build_fixed_litlen_lut()
+
+///|
+let fixed_dist_lut : FixedArray[Int] = build_fixed_dist_lut()

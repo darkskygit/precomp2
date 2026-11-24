@@ -1,0 +1,422 @@
+///| Bit-exact RFC 1951 DEFLATE reconstructor from compact corrections and plain text.
+
+///| Read `(op, streak)` from residual stream with overflow-safe streak addition.
+fn read_residual_tag(r : ByteReader) -> Result[(Int, Int), String] {
+  let tag = match byr_read_u8(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let op = (tag >> 5) & 7
+  let small = tag & 31
+  if small < 31 {
+    return Ok((op, small))
+  }
+  match byr_read_varint(r) {
+    Ok(extra) => {
+      if extra > 2147483647 - 31 {
+        return Err("residual streak overflow")
+      }
+      Ok((op, 31 + extra))
+    }
+    Err(e) => Err(e)
+  }
+}
+
+///| Verify that an overridden match `(dist, mlen)` reproduces `plain[pos..pos+mlen]`.
+fn verify_match_bytes(plain : Bytes, pos : Int, dist : Int, mlen : Int) -> Bool {
+  let src = pos - dist
+  let mut k = 0
+  while k < mlen {
+    if plain[pos + k] != plain[src + k] {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Emit a single literal or match token to `bw` using canonical Huffman tables.
+fn emit_deflate_token(
+  bw : BitWriter,
+  tok : Int,
+  lit_codes : FixedArray[Int],
+  lit_lens : FixedArray[Int],
+  dist_codes : FixedArray[Int],
+  dist_lens : FixedArray[Int],
+) -> Result[Unit, String] {
+  if !token_is_match(tok) {
+    let l = lit_lens[tok]
+    if l == 0 {
+      return Err("literal symbol has zero Huffman code length")
+    }
+    bw_write_bits(bw, lit_codes[tok], l)
+    return Ok(())
+  }
+  let mlen = token_match_len(tok)
+  let dist = token_match_dist(tok)
+  let is_alt = token_is_alt_258(tok)
+
+  if is_alt {
+    let l = lit_lens[284]
+    if l == 0 {
+      return Err("alt-258 symbol 284 has zero Huffman code length")
+    }
+    bw_write_bits(bw, lit_codes[284], l)
+    bw_write_bits(bw, 31, 5)
+  } else {
+    let lcode = len_to_code[mlen]
+    let lsym = 257 + lcode
+    let l = lit_lens[lsym]
+    if l == 0 {
+      return Err("length symbol has zero Huffman code length")
+    }
+    bw_write_bits(bw, lit_codes[lsym], l)
+    let lextra_bits = len_extra[lcode]
+    if lextra_bits > 0 {
+      bw_write_bits(bw, mlen - len_base[lcode], lextra_bits)
+    }
+  }
+
+  let dcode = dist_to_code(dist)
+  let dl = dist_lens[dcode]
+  if dl == 0 {
+    return Err("distance symbol has zero Huffman code length")
+  }
+  bw_write_bits(bw, dist_codes[dcode], dl)
+  let dextra_bits = dist_extra[dcode]
+  if dextra_bits > 0 {
+    bw_write_bits(bw, dist - dist_base[dcode], dextra_bits)
+  }
+  Ok(())
+}
+
+///| Replay predictor and residual stream for a Huffman block, returning the exact token list.
+fn replay_block_tokens(
+  r : ByteReader,
+  pred_state : PredictorState,
+  plain : Bytes,
+  start_pos : Int,
+  block_end : Int,
+  preset : Int,
+  wbits : Int,
+  filtered : Bool,
+) -> Result[Array[Int], String] {
+  if preset_uses_hash(preset) {
+    pred_catch_up(pred_state, plain, start_pos, block_end)
+  }
+  let tokens : Array[Int] = []
+  let mut pos = start_pos
+  let mut done_block = false
+  while !done_block {
+    let (op, streak) = match read_residual_tag(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let mut s = 0
+    while s < streak {
+      if pos >= block_end {
+        return Err("residual match streak exceeds block plain length")
+      }
+      let (tok, nll, nld) = predict_token(pred_state, plain, pos, block_end, preset, wbits, filtered)
+      tokens.push(tok)
+      let adv = if token_is_match(tok) { token_match_len(tok) } else { 1 }
+      pred_advance(pred_state, plain, pos, adv, block_end, preset, nll, nld)
+      pos = pos + adv
+      s = s + 1
+    }
+
+    if op == op_end_block {
+      if pos != block_end {
+        return Err("residual stream ended before block_end")
+      }
+      done_block = true
+      break
+    }
+
+    if pos >= block_end {
+      return Err("residual override past block_end")
+    }
+    let actual = if op == op_literal {
+      plain[pos].to_int()
+    } else if op == op_len_delta {
+      let (pred, _, _) = predict_token(pred_state, plain, pos, block_end, preset, wbits, filtered)
+      if !token_is_match(pred) {
+        return Err("op_len_delta requires predicted match")
+      }
+      let delta = match byr_read_zigzag(r) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let pred_len = token_match_len(pred)
+      if delta < 3 - pred_len || delta > 258 - pred_len {
+        return Err("op_len_delta length out of bounds")
+      }
+      let mlen = pred_len + delta
+      let dist = token_match_dist(pred)
+      if mlen > block_end - pos {
+        return Err("op_len_delta length exceeds block_end")
+      }
+      if !verify_match_bytes(plain, pos, dist, mlen) {
+        return Err("op_len_delta match does not reproduce plain bytes")
+      }
+      pack_match_token(mlen, dist, false)
+    } else if op == op_dist_override {
+      let (pred, _, _) = predict_token(pred_state, plain, pos, block_end, preset, wbits, filtered)
+      if !token_is_match(pred) {
+        return Err("op_dist_override requires predicted match")
+      }
+      let dist_m1 = match byr_read_varint(r) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if dist_m1 < 0 || dist_m1 > 32767 || dist_m1 >= pos {
+        return Err("op_dist_override distance out of bounds")
+      }
+      let dist = dist_m1 + 1
+      let mlen = token_match_len(pred)
+      if !verify_match_bytes(plain, pos, dist, mlen) {
+        return Err("op_dist_override match does not reproduce plain bytes")
+      }
+      pack_match_token(mlen, dist, false)
+    } else if op == op_full_match {
+      let len_m3 = match byr_read_varint(r) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let dist_m1 = match byr_read_varint(r) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if len_m3 < 0 || len_m3 > 255 {
+        return Err("op_full_match length out of bounds")
+      }
+      if dist_m1 < 0 || dist_m1 > 32767 || dist_m1 >= pos {
+        return Err("op_full_match distance out of bounds")
+      }
+      let mlen = len_m3 + 3
+      let dist = dist_m1 + 1
+      if mlen > block_end - pos {
+        return Err("op_full_match length exceeds block_end")
+      }
+      if !verify_match_bytes(plain, pos, dist, mlen) {
+        return Err("op_full_match match does not reproduce plain bytes")
+      }
+      pack_match_token(mlen, dist, false)
+    } else if op == op_alt_258 {
+      let dist_m1 = match byr_read_varint(r) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if dist_m1 < 0 || dist_m1 > 32767 || dist_m1 >= pos || 258 > block_end - pos {
+        return Err("op_alt_258 out of bounds")
+      }
+      let dist = dist_m1 + 1
+      if !verify_match_bytes(plain, pos, dist, 258) {
+        return Err("op_alt_258 match does not reproduce plain bytes")
+      }
+      pack_match_token(258, dist, true)
+    } else {
+      return Err("invalid residual opcode in corrections")
+    }
+
+    tokens.push(actual)
+    let adv = if token_is_match(actual) { token_match_len(actual) } else { 1 }
+    pred_advance(pred_state, plain, pos, adv, block_end, preset, 0, 0)
+    pos = pos + adv
+  }
+  Ok(tokens)
+}
+
+///| Reconstruct the exact raw RFC 1951 DEFLATE bitstream from `corrections` and `plain` with explicit raw cap.
+fn reencode_deflate_with_cap(
+  corrections : Bytes,
+  plain : Bytes,
+  max_corr_raw : Int,
+) -> Result[Bytes, String] {
+  if corrections.length() < 3 {
+    return Err("truncated corrections header")
+  }
+  if corrections[0].to_int() != magic_0 || corrections[1].to_int() != magic_1 {
+    return Err("invalid preflate corrections magic")
+  }
+  let hdr = corrections[2].to_int()
+  if (hdr & 0x0F) != format_version {
+    return Err("unsupported preflate corrections version")
+  }
+  if (hdr & 0xC0) != 0 {
+    return Err("invalid reserved bits in corrections header")
+  }
+
+  let mut body_start = 3
+  let mut wbits = 15
+  let mut filtered = false
+  if (hdr & flag_pred_opts) != 0 {
+    if corrections.length() < 4 {
+      return Err("truncated predictor options byte")
+    }
+    let opts = corrections[3].to_int()
+    if (opts & 0xF0) != 0 {
+      return Err("invalid reserved bits in predictor options")
+    }
+    wbits = (opts & 7) + 9
+    if wbits > 15 {
+      return Err("invalid windowBits in predictor options")
+    }
+    filtered = (opts & 8) != 0
+    body_start = 4
+  }
+
+  let payload = if (hdr & flag_compressed) != 0 {
+    let outer = ByteReader::new(corrections)
+    outer.pos = body_start
+    let raw_len = match byr_read_varint(outer) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if raw_len < 1 || raw_len > max_corr_raw {
+      return Err("compressed corrections raw length out of bounds")
+    }
+    let comp = corrections.slice(outer.pos, corrections.length())
+    match inflate_exact_wrapper(comp, raw_len) {
+      Ok(b) => b
+      Err(e) => return Err(e)
+    }
+  } else {
+    if corrections.length() - body_start > max_corr_raw {
+      return Err("raw corrections payload exceeded maximum size")
+    }
+    corrections.slice(body_start, corrections.length())
+  }
+
+  let r = ByteReader::new(payload)
+  let plain_len = plain.length()
+  let bw = BitWriter::new(plain_len / 2 + 64)
+  let pred_state = PredictorState::new()
+  let lit_freqs : FixedArray[Int] = FixedArray::make(286, 0)
+  let dist_freqs : FixedArray[Int] = FixedArray::make(30, 0)
+
+  let mut pos = 0
+  let mut bfinal = false
+  while !bfinal {
+    let flags = match byr_read_u8(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let btype = flags & 3
+    bfinal = (flags & 4) != 0
+    if btype == 3 {
+      return Err("invalid DEFLATE block type in corrections")
+    }
+
+    let bfin_bit = if bfinal { 1 } else { 0 }
+    bw_write_bits(bw, bfin_bit | (btype << 1), 3)
+
+    if btype == 0 {
+      if (flags & 0xF0) != 0 {
+        return Err("invalid reserved bits in stored block flags")
+      }
+      let stored_pad = if (flags & 8) != 0 {
+        match byr_read_u8(r) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+      } else {
+        0
+      }
+      let slen = match byr_read_varint(r) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if slen < 0 || slen > 65535 {
+        return Err("stored block length out of 0..65535 range")
+      }
+      if slen > plain_len - pos {
+        return Err("stored block exceeds plain length")
+      }
+      match bw_align_byte_with_pad(bw, stored_pad) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      bw_write_u16_le(bw, slen)
+      bw_write_u16_le(bw, slen ^ 0xFFFF)
+      bw_write_raw(bw, plain, pos, slen)
+      pos = pos + slen
+      continue
+    }
+
+    let preset = (flags >> 4) & 15
+    if preset > preset_max {
+      return Err("unsupported predictor preset in corrections")
+    }
+    let huff_predicted = (flags & flag_huff_predicted) != 0
+    if btype == 1 && huff_predicted {
+      return Err("invalid huff_predicted flag on fixed block")
+    }
+    let blk_plain_len = match byr_read_varint(r) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if blk_plain_len < 0 || blk_plain_len > plain_len - pos {
+      return Err("Huffman block plain length out of bounds")
+    }
+    let block_end = pos + blk_plain_len
+
+    let (lit_codes, lit_lens, dist_codes, dist_lens, tokens) = if btype == 1 {
+      let toks = match replay_block_tokens(r, pred_state, plain, pos, block_end, preset, wbits, filtered) {
+        Ok(t) => t
+        Err(e) => return Err(e)
+      }
+      (fixed_litlen_codes, fixed_litlen_lens, fixed_dist_codes, fixed_dist_lens, toks)
+    } else if !huff_predicted {
+      let (lc, ll, dc, dl) = match decode_and_emit_verbatim_header(r, bw) {
+        Ok(t) => t
+        Err(e) => return Err(e)
+      }
+      let toks = match replay_block_tokens(r, pred_state, plain, pos, block_end, preset, wbits, filtered) {
+        Ok(t) => t
+        Err(e) => return Err(e)
+      }
+      (lc, ll, dc, dl, toks)
+    } else {
+      let toks = match replay_block_tokens(r, pred_state, plain, pos, block_end, preset, wbits, filtered) {
+        Ok(t) => t
+        Err(e) => return Err(e)
+      }
+      tally_token_freqs(toks, lit_freqs, dist_freqs)
+      let pred_hdr = predict_zlib_dynamic_header(lit_freqs, dist_freqs)
+      let (lc, ll, dc, dl) = match emit_predicted_dynamic_header(pred_hdr, bw) {
+        Ok(t) => t
+        Err(e) => return Err(e)
+      }
+      (lc, ll, dc, dl, toks)
+    }
+
+    let n_toks = tokens.length()
+    let mut ti = 0
+    while ti < n_toks {
+      match emit_deflate_token(bw, tokens[ti], lit_codes, lit_lens, dist_codes, dist_lens) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      ti = ti + 1
+    }
+    let eob_len = lit_lens[256]
+    if eob_len == 0 {
+      return Err("EOB symbol 256 has zero Huffman code length")
+    }
+    bw_write_bits(bw, lit_codes[256], eob_len)
+    pos = block_end
+  }
+
+  let trailing_pad_bits = match byr_read_u8(r) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if pos != plain_len {
+    return Err("reencode plain length mismatch")
+  }
+  if r.pos != r.len {
+    return Err("trailing bytes in corrections payload")
+  }
+  bw_finish_with_pad(bw, trailing_pad_bits)
+}
