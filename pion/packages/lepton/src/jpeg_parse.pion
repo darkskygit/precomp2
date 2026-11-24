@@ -1,0 +1,409 @@
+///| JPEG marker structure parser and scan metadata classifiers.
+
+let max_total_blocks : Int64 = 1048576L
+let max_jpeg_scans : Int = 1024
+let max_output_bytes : Int = 67108864
+
+///| Frame component descriptor.
+struct ComponentInfo {
+  id : Int
+  h_samp : Int
+  v_samp : Int
+  stride_w : Int
+  stride_h : Int
+  actual_w : Int
+  actual_h : Int
+}
+
+///| Per-component selector inside a `SOS` scan.
+struct ScanComp {
+  comp_idx : Int
+  dc_tbl : Int
+  ac_tbl : Int
+}
+
+///| Parsed `SOS` scan header and snapshot of active Huffman tables.
+struct ScanInfo {
+  ecs_start : Int
+  ecs_end : Int
+  dri : Int
+  ss : Int
+  se : Int
+  ah : Int
+  al : Int
+  comps : Array[ScanComp]
+  dc_tables : Array[HuffTable]
+  ac_tables : Array[HuffTable]
+}
+
+///| Exact bitstream preservation metadata for one scan.
+struct ScanMeta {
+  pad_mode : Int
+  pad_bits : Array[Int]
+  rst_extra_ff_mode : Int
+  rst_extra_ff : Array[Int]
+  seq_trailing_zrls : Array[(Int, Int)]
+  prog_eob_runs : Array[Int]
+  trailing : Bytes
+}
+
+///| Parsed JPEG structure separating verbatim non-ECS chunks from entropy scans.
+struct JpegImage {
+  is_progressive : Bool
+  mcu_w : Int
+  mcu_h : Int
+  components : Array[ComponentInfo]
+  scans : Array[ScanInfo]
+  chunks : Array[Bytes]
+}
+
+///| Scan forward from `ecs_start` to find the start of the next non-RST marker.
+fn find_ecs_end(jpeg : Bytes, ecs_start : Int) -> Result[Int, String] {
+  let len = jpeg.length()
+  let mut pos = ecs_start
+  while pos < len {
+    if jpeg[pos].to_int() != 0xFF {
+      pos = pos + 1
+      continue
+    }
+    let ff_start = pos
+    while pos < len && jpeg[pos].to_int() == 0xFF {
+      pos = pos + 1
+    }
+    if pos >= len {
+      return Err("truncated JPEG after 0xFF in scan")
+    }
+    let marker = jpeg[pos].to_int()
+    if marker == 0x00 {
+      if pos - ff_start == 1 {
+        pos = pos + 1
+        continue
+      }
+      return Err("invalid 0xFF fill before byte stuffing")
+    }
+    if marker >= 0xD0 && marker <= 0xD7 {
+      pos = pos + 1
+      continue
+    }
+    return Ok(ff_start)
+  }
+  Err("missing EOI marker")
+}
+
+///| Parse JPEG markers, headers, DHT tables, and scan boundaries.
+fn parse_jpeg_structure(jpeg : Bytes) -> Result[JpegImage, String] {
+  let len = jpeg.length()
+  if len < 4 || jpeg[0].to_int() != 0xFF || jpeg[1].to_int() != 0xD8 {
+    return Err("missing JPEG SOI marker")
+  }
+  let dc_tables : Array[HuffTable] = [
+    HuffTable::empty(),
+    HuffTable::empty(),
+    HuffTable::empty(),
+    HuffTable::empty(),
+  ]
+  let ac_tables : Array[HuffTable] = [
+    HuffTable::empty(),
+    HuffTable::empty(),
+    HuffTable::empty(),
+    HuffTable::empty(),
+  ]
+
+  let mut has_sof = false
+  let mut is_progressive = false
+  let mut width = 0
+  let mut height = 0
+  let mut max_h = 1
+  let mut max_v = 1
+  let mut mcu_w = 0
+  let mut mcu_h = 0
+  let mut components : Array[ComponentInfo] = []
+  let mut dri = 0
+  let scans : Array[ScanInfo] = []
+  let chunks : Array[Bytes] = []
+  let mut chunk_start = 0
+  let mut found_eoi = false
+
+  let mut pos = 2
+  while pos < len {
+    if jpeg[pos].to_int() != 0xFF {
+      return Err("expected JPEG marker prefix 0xFF")
+    }
+    while pos < len && jpeg[pos].to_int() == 0xFF {
+      pos = pos + 1
+    }
+    if pos >= len {
+      return Err("truncated JPEG marker")
+    }
+    let marker = jpeg[pos].to_int()
+    pos = pos + 1
+
+    if marker == 0xD9 {
+      chunks.push(jpeg.slice(chunk_start, len))
+      found_eoi = true
+      break
+    }
+    if marker == 0x01 || marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7) {
+      continue
+    }
+    if pos + 2 > len {
+      return Err("truncated JPEG marker length")
+    }
+    let seg_len = (jpeg[pos].to_int() << 8) | jpeg[pos + 1].to_int()
+    if seg_len < 2 || pos + seg_len > len {
+      return Err("invalid JPEG marker segment length")
+    }
+    let seg_start = pos + 2
+    let seg_end = pos + seg_len
+
+    if marker == 0xC0 || marker == 0xC1 || marker == 0xC2 {
+      if has_sof {
+        return Err("duplicate SOF marker")
+      }
+      if seg_len < 8 {
+        return Err("truncated SOF segment")
+      }
+      let precision = jpeg[seg_start].to_int()
+      if precision != 8 {
+        return Err("only 8-bit JPEG precision is supported")
+      }
+      height = (jpeg[seg_start + 1].to_int() << 8) | jpeg[seg_start + 2].to_int()
+      width = (jpeg[seg_start + 3].to_int() << 8) | jpeg[seg_start + 4].to_int()
+      let nf = jpeg[seg_start + 5].to_int()
+      if width <= 0 || height <= 0 || nf < 1 || nf > 4 || seg_len != 8 + nf * 3 {
+        return Err("unsupported SOF dimensions or component count")
+      }
+      is_progressive = marker == 0xC2
+      max_h = 1
+      max_v = 1
+      let raw_ids : Array[Int] = []
+      let raw_h : Array[Int] = []
+      let raw_v : Array[Int] = []
+      let mut i = 0
+      while i < nf {
+        let base = seg_start + 6 + i * 3
+        let cid = jpeg[base].to_int()
+        let hv = jpeg[base + 1].to_int()
+        let hs = hv >> 4
+        let vs = hv & 0x0F
+        if hs < 1 || hs > 4 || vs < 1 || vs > 4 {
+          return Err("invalid component sampling factor")
+        }
+        let mut dup = 0
+        while dup < i {
+          if raw_ids[dup] == cid {
+            return Err("duplicate component id in SOF")
+          }
+          dup = dup + 1
+        }
+        raw_ids.push(cid)
+        raw_h.push(hs)
+        raw_v.push(vs)
+        if hs > max_h {
+          max_h = hs
+        }
+        if vs > max_v {
+          max_v = vs
+        }
+        i = i + 1
+      }
+      let w64 = width.to_int64()
+      let h64 = height.to_int64()
+      let mh64 = max_h.to_int64()
+      let mv64 = max_v.to_int64()
+      let mcu_w64 = (w64 + mh64 * 8L - 1L) / (mh64 * 8L)
+      let mcu_h64 = (h64 + mv64 * 8L - 1L) / (mv64 * 8L)
+      let mut total_blocks64 = 0L
+      components = []
+      i = 0
+      while i < nf {
+        let hs = raw_h[i]
+        let vs = raw_v[i]
+        let hs64 = hs.to_int64()
+        let vs64 = vs.to_int64()
+        let stride_w64 = mcu_w64 * hs64
+        let stride_h64 = mcu_h64 * vs64
+        let comp_blocks64 = stride_w64 * stride_h64
+        if comp_blocks64 <= 0L || comp_blocks64 > max_total_blocks - total_blocks64 {
+          return Err("JPEG block count exceeds memory limit")
+        }
+        total_blocks64 = total_blocks64 + comp_blocks64
+        let comp_px_w64 = (w64 * hs64 + mh64 - 1L) / mh64
+        let comp_px_h64 = (h64 * vs64 + mv64 - 1L) / mv64
+        let actual_w64 = (comp_px_w64 + 7L) / 8L
+        let actual_h64 = (comp_px_h64 + 7L) / 8L
+        components.push(ComponentInfo::{
+          id: raw_ids[i],
+          h_samp: hs,
+          v_samp: vs,
+          stride_w: stride_w64.to_int(),
+          stride_h: stride_h64.to_int(),
+          actual_w: actual_w64.to_int(),
+          actual_h: actual_h64.to_int(),
+        })
+        i = i + 1
+      }
+      mcu_w = mcu_w64.to_int()
+      mcu_h = mcu_h64.to_int()
+      has_sof = true
+      pos = seg_end
+    } else if (marker >= 0xC3 && marker <= 0xCF) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
+      return Err("unsupported JPEG SOF mode")
+    } else if marker == 0xC4 {
+      match parse_dht(jpeg, seg_start, seg_end, dc_tables, ac_tables) {
+        Ok(_) => pos = seg_end
+        Err(e) => return Err(e)
+      }
+    } else if marker == 0xDD {
+      if seg_len != 4 {
+        return Err("invalid DRI segment length")
+      }
+      dri = (jpeg[seg_start].to_int() << 8) | jpeg[seg_start + 1].to_int()
+      pos = seg_end
+    } else if marker == 0xDA {
+      if !has_sof {
+        return Err("SOS before SOF")
+      }
+      if scans.length() >= max_jpeg_scans {
+        return Err("JPEG scan count exceeds limit")
+      }
+      if seg_len < 6 {
+        return Err("truncated SOS segment")
+      }
+      let ns = jpeg[seg_start].to_int()
+      if ns < 1 || ns > 4 || seg_len != 6 + ns * 2 {
+        return Err("invalid SOS component count")
+      }
+      let ss = jpeg[seg_start + 1 + ns * 2].to_int()
+      let se = jpeg[seg_start + 2 + ns * 2].to_int()
+      let ahal = jpeg[seg_start + 3 + ns * 2].to_int()
+      let ah = ahal >> 4
+      let al = ahal & 0x0F
+      if !is_progressive {
+        if ss != 0 || se != 63 || ah != 0 || al != 0 {
+          return Err("invalid sequential SOS spectral parameters")
+        }
+      } else {
+        if ss > se || se > 63 || ah > 13 || al > 13 {
+          return Err("invalid progressive SOS spectral parameters")
+        }
+        if ss == 0 && se != 0 {
+          return Err("progressive DC scan must have Se == 0")
+        }
+        if ss > 0 && ns != 1 {
+          return Err("progressive AC scan must have Ns == 1")
+        }
+        if ah != 0 && ah != al + 1 {
+          return Err("invalid progressive successive approximation")
+        }
+      }
+      let scan_comps : Array[ScanComp] = []
+      let mut i = 0
+      while i < ns {
+        let cs = jpeg[seg_start + 1 + i * 2].to_int()
+        let td_ta = jpeg[seg_start + 2 + i * 2].to_int()
+        let td = td_ta >> 4
+        let ta = td_ta & 0x0F
+        if td > 3 || ta > 3 {
+          return Err("invalid SOS Huffman table selector")
+        }
+        let mut comp_idx = -1
+        let mut c = 0
+        while c < components.length() {
+          if components[c].id == cs {
+            comp_idx = c
+            break
+          }
+          c = c + 1
+        }
+        if comp_idx < 0 {
+          return Err("SOS references unknown component id")
+        }
+        if !is_progressive {
+          if !dc_tables[td].valid || !ac_tables[ta].valid {
+            return Err("missing required DHT table")
+          }
+        } else if ss == 0 {
+          if ah == 0 && !dc_tables[td].valid {
+            return Err("missing required DC DHT table")
+          }
+        } else {
+          if !ac_tables[ta].valid {
+            return Err("missing required AC DHT table")
+          }
+        }
+        scan_comps.push(ScanComp::{ comp_idx, dc_tbl: td, ac_tbl: ta })
+        i = i + 1
+      }
+      let ecs_start = seg_end
+      let ecs_end = match find_ecs_end(jpeg, ecs_start) {
+        Ok(e) => e
+        Err(err) => return Err(err)
+      }
+      chunks.push(jpeg.slice(chunk_start, ecs_start))
+      scans.push(ScanInfo::{
+        ecs_start,
+        ecs_end,
+        dri,
+        ss,
+        se,
+        ah,
+        al,
+        comps: scan_comps,
+        dc_tables: clone_huff_tables(dc_tables),
+        ac_tables: clone_huff_tables(ac_tables),
+      })
+      chunk_start = ecs_end
+      pos = ecs_end
+    } else {
+      pos = seg_end
+    }
+  }
+
+  if !found_eoi {
+    return Err("missing EOI marker")
+  }
+  if !has_sof || scans.length() == 0 {
+    return Err("JPEG missing SOF or SOS")
+  }
+  Ok(JpegImage::{ is_progressive, mcu_w, mcu_h, components, scans, chunks })
+}
+
+///| Classify pad bit arrays into compact `pad_mode` (0=all ones, 1=all zeros, 2=explicit).
+fn classify_pad_bits(pad_counts : Array[Int], pad_vals : Array[Int]) -> (Int, Array[Int]) {
+  let mut all_ones = true
+  let mut all_zeros = true
+  let mut i = 0
+  while i < pad_counts.length() {
+    let cnt = pad_counts[i]
+    let coef_val = pad_vals[i]
+    if cnt > 0 {
+      if coef_val != (1 << cnt) - 1 {
+        all_ones = false
+      }
+      if coef_val != 0 {
+        all_zeros = false
+      }
+    }
+    i = i + 1
+  }
+  if all_ones {
+    (0, [])
+  } else if all_zeros {
+    (1, [])
+  } else {
+    (2, pad_vals)
+  }
+}
+
+///| Classify restart extra-0xFF arrays into compact mode (0=all zero, 1=explicit).
+fn classify_rst_ff(extra_ffs : Array[Int]) -> (Int, Array[Int]) {
+  let mut i = 0
+  while i < extra_ffs.length() {
+    if extra_ffs[i] != 0 {
+      return (1, extra_ffs)
+    }
+    i = i + 1
+  }
+  (0, [])
+}

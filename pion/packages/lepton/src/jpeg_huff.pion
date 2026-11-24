@@ -1,0 +1,233 @@
+///| Canonical JPEG Huffman tables, DHT parsing, and symbol coding.
+
+///| Canonical JPEG Huffman table for both decoding and encoding.
+struct HuffTable {
+  valid : Bool
+  fast_sym : FixedArray[Int]
+  fast_len : FixedArray[Int]
+  min_code : FixedArray[Int]
+  max_code : FixedArray[Int]
+  val_ptr : FixedArray[Int]
+  vals : FixedArray[Int]
+  enc_code : FixedArray[Int]
+  enc_len : FixedArray[Int]
+}
+
+///| Create an empty (unloaded) Huffman table.
+fn HuffTable::empty() -> HuffTable {
+  HuffTable::{
+    valid: false,
+    fast_sym: FixedArray::make(256, -1),
+    fast_len: FixedArray::make(256, 0),
+    min_code: FixedArray::make(17, 0),
+    max_code: FixedArray::make(17, -1),
+    val_ptr: FixedArray::make(17, 0),
+    vals: FixedArray::make(256, 0),
+    enc_code: FixedArray::make(256, 0),
+    enc_len: FixedArray::make(256, 0),
+  }
+}
+
+///| Build a canonical JPEG Huffman table from 16 bit-length counts and symbol values.
+fn build_huff_table(counts : FixedArray[Int], sym_vals : FixedArray[Int], total : Int) -> Result[HuffTable, String] {
+  if total > 256 {
+    return Err("invalid DHT symbol count")
+  }
+  let fast_sym = FixedArray::make(256, -1)
+  let fast_len = FixedArray::make(256, 0)
+  let min_code = FixedArray::make(17, 0)
+  let max_code = FixedArray::make(17, -1)
+  let val_ptr = FixedArray::make(17, 0)
+  let vals = FixedArray::make(256, 0)
+  let enc_code = FixedArray::make(256, 0)
+  let enc_len = FixedArray::make(256, 0)
+
+  let mut idx = 0
+  while idx < total {
+    vals[idx] = sym_vals[idx]
+    idx = idx + 1
+  }
+
+  let mut code = 0
+  let mut k = 0
+  let mut bits = 1
+  while bits <= 16 {
+    let cnt = counts[bits]
+    if cnt > 0 {
+      min_code[bits] = code
+      val_ptr[bits] = k
+      let mut j = 0
+      while j < cnt {
+        if code >= (1 << bits) {
+          return Err("invalid DHT canonical codes")
+        }
+        let sym = vals[k]
+        enc_code[sym] = code
+        enc_len[sym] = bits
+        if bits <= 8 {
+          let shift = 8 - bits
+          let base = code << shift
+          let span = 1 << shift
+          let mut p = 0
+          while p < span {
+            fast_sym[base + p] = sym
+            fast_len[base + p] = bits
+            p = p + 1
+          }
+        }
+        code = code + 1
+        k = k + 1
+        j = j + 1
+      }
+      max_code[bits] = code - 1
+    } else {
+      max_code[bits] = -1
+    }
+    code = code << 1
+    bits = bits + 1
+  }
+
+  Ok(HuffTable::{
+    valid: true,
+    fast_sym,
+    fast_len,
+    min_code,
+    max_code,
+    val_ptr,
+    vals,
+    enc_code,
+    enc_len,
+  })
+}
+
+///| Decode one Huffman symbol from `br` using `tbl`.
+fn jbr_decode_huff(br : JpegBitReader, tbl : HuffTable) -> Result[Int, String] {
+  if br.bitcnt < 8 {
+    jbr_fill(br, 16)
+  }
+  if br.bitcnt >= 8 {
+    let peek = (br.bitbuf >> (br.bitcnt - 8)) & 0xFF
+    let flen = tbl.fast_len[peek]
+    if flen > 0 {
+      br.bitcnt = br.bitcnt - flen
+      br.bitbuf = br.bitbuf & ((1 << br.bitcnt) - 1)
+      return Ok(tbl.fast_sym[peek])
+    }
+  }
+  let mut code = 0
+  let mut len = 1
+  while len <= 16 {
+    match jbr_read_bit(br) {
+      Ok(b) => {
+        code = (code << 1) | b
+        let mc = tbl.max_code[len]
+        if mc >= 0 && code <= mc {
+          let idx = tbl.val_ptr[len] + (code - tbl.min_code[len])
+          if idx < 0 || idx >= 256 {
+            return Err("Huffman table index out of bounds")
+          }
+          return Ok(tbl.vals[idx])
+        }
+        len = len + 1
+      }
+      Err(e) => return Err(e)
+    }
+  }
+  Err("invalid Huffman code in JPEG stream")
+}
+
+///| Encode one Huffman symbol into `bw` using `tbl`.
+fn jbw_write_huff(bw : JpegBitWriter, tbl : HuffTable, sym : Int) -> Result[Unit, String] {
+  let len = tbl.enc_len[sym]
+  if len <= 0 {
+    return Err("symbol missing from DHT table")
+  }
+  jbw_write_bits(bw, tbl.enc_code[sym], len)
+  Ok(())
+}
+
+///| Compute the JPEG category (bit length, 0..15) of a signed coefficient.
+fn jpeg_category(v : Int) -> Int {
+  let a = if v < 0 { -v } else { v }
+  let mut cat = 0
+  let mut x = a
+  while x > 0 {
+    cat = cat + 1
+    x = x >> 1
+  }
+  cat
+}
+
+///| Write the signed value bits for JPEG category `cat` (`cat > 0`).
+fn jbw_write_coeff_bits(bw : JpegBitWriter, v : Int, cat : Int) -> Unit {
+  if cat == 0 {
+    return
+  }
+  let bits = if v < 0 { v + ((1 << cat) - 1) } else { v }
+  jbw_write_bits(bw, bits, cat)
+}
+
+///| Snapshot an array of 4 Huffman tables.
+fn clone_huff_tables(src : Array[HuffTable]) -> Array[HuffTable] {
+  let out : Array[HuffTable] = []
+  let mut i = 0
+  while i < src.length() {
+    out.push(src[i])
+    i = i + 1
+  }
+  out
+}
+
+///| Parse a `DHT` marker payload into `dc_tables` and `ac_tables`.
+fn parse_dht(
+  jpeg : Bytes,
+  start : Int,
+  end : Int,
+  dc_tables : Array[HuffTable],
+  ac_tables : Array[HuffTable]
+) -> Result[Unit, String] {
+  let mut pos = start
+  while pos < end {
+    if pos + 17 > end {
+      return Err("truncated DHT segment")
+    }
+    let tc_th = jpeg[pos].to_int()
+    pos = pos + 1
+    let tc = tc_th >> 4
+    let th = tc_th & 0x0F
+    if (tc != 0 && tc != 1) || th > 3 {
+      return Err("invalid DHT table class or id")
+    }
+    let counts = FixedArray::make(17, 0)
+    let mut total = 0
+    let mut i = 1
+    while i <= 16 {
+      let c = jpeg[pos].to_int()
+      counts[i] = c
+      total = total + c
+      pos = pos + 1
+      i = i + 1
+    }
+    if total > 256 || pos + total > end {
+      return Err("truncated DHT symbol list")
+    }
+    let vals = FixedArray::make(256, 0)
+    let mut j = 0
+    while j < total {
+      vals[j] = jpeg[pos].to_int()
+      pos = pos + 1
+      j = j + 1
+    }
+    match build_huff_table(counts, vals, total) {
+      Ok(tbl) => {
+        if tc == 0 {
+          dc_tables[th] = tbl
+        } else {
+          ac_tables[th] = tbl
+        }
+      }
+      Err(e) => return Err(e)
+    }
+  }
+  Ok(())
+}

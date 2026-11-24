@@ -1,0 +1,192 @@
+///| 32-bit carry-safe binary range coder with 12-bit adaptive probabilities.
+
+let prob_bits : Int = 12
+let prob_total : Int = 4096
+let prob_init : Int = 2048
+let prob_shift : Int = 4
+let range_top : UInt64 = 0x01000000UL
+
+///| Binary arithmetic range encoder (LZMA-style 32-bit range with carry propagation).
+struct RangeEncoder {
+  out : ByteWriter
+  mut low : UInt64
+  mut range : UInt64
+  mut cache : Int
+  mut cache_size : Int
+}
+
+///| Create a new `RangeEncoder` writing to `out`.
+fn RangeEncoder::new(out : ByteWriter) -> RangeEncoder {
+  RangeEncoder::{
+    out,
+    low: 0UL,
+    range: 0xFFFFFFFFUL,
+    cache: 0,
+    cache_size: 1,
+  }
+}
+
+///| Shift out top byte(s) with carry propagation.
+fn re_shift_low(re : RangeEncoder) -> Unit {
+  let low_hi = (re.low >> 32).to_int()
+  if re.low < 0xFF000000UL || low_hi != 0 {
+    bw_push_byte(re.out, (re.cache + low_hi) & 0xFF)
+    let mut cs = re.cache_size - 1
+    let fill = (0xFF + low_hi) & 0xFF
+    while cs > 0 {
+      bw_push_byte(re.out, fill)
+      cs = cs - 1
+    }
+    re.cache = ((re.low >> 24) & 0xFFUL).to_int()
+    re.cache_size = 1
+  } else {
+    re.cache_size = re.cache_size + 1
+  }
+  re.low = (re.low & 0x00FFFFFFUL) << 8
+}
+
+///| Encode one binary decision using adaptive probability `probs[ctx]` and update it.
+fn re_encode_bit(re : RangeEncoder, probs : FixedArray[Int], ctx : Int, bit : Int) -> Unit {
+  let p = probs[ctx]
+  let bound = (re.range >> prob_bits) * p.to_int64().to_uint64()
+  if bit == 0 {
+    re.range = bound
+    probs[ctx] = p + ((prob_total - p) >> prob_shift)
+  } else {
+    re.low = re.low + bound
+    re.range = re.range - bound
+    probs[ctx] = p - (p >> prob_shift)
+  }
+  while re.range < range_top {
+    re.range = re.range << 8
+    re_shift_low(re)
+  }
+}
+
+///| Encode one equiprobable (50/50) bit.
+fn re_encode_direct_bit(re : RangeEncoder, bit : Int) -> Unit {
+  let half = re.range >> 1
+  re.range = half
+  if bit != 0 {
+    re.low = re.low + half
+  }
+  while re.range < range_top {
+    re.range = re.range << 8
+    re_shift_low(re)
+  }
+}
+
+///| Encode `nbits` equiprobable bits MSB-first.
+fn re_encode_direct_bits(re : RangeEncoder, v : Int, nbits : Int) -> Unit {
+  let mut i = nbits - 1
+  while i >= 0 {
+    re_encode_direct_bit(re, (v >> i) & 1)
+    i = i - 1
+  }
+}
+
+///| Flush the remaining 5 bytes of range encoder state.
+fn re_finish(re : RangeEncoder) -> Unit {
+  let mut i = 0
+  while i < 5 {
+    re_shift_low(re)
+    i = i + 1
+  }
+}
+
+///| Binary arithmetic range decoder paired with `RangeEncoder`.
+struct RangeDecoder {
+  data : Bytes
+  mut pos : Int
+  end : Int
+  mut range : UInt64
+  mut code : UInt64
+  mut eof_reads : Int
+}
+
+///| Read the next byte from the range-coded stream, tracking any reads past `end`.
+fn rd_next_byte(rd : RangeDecoder) -> UInt64 {
+  if rd.pos < rd.end {
+    let b = rd.data[rd.pos].to_int().to_int64().to_uint64()
+    rd.pos = rd.pos + 1
+    b
+  } else {
+    rd.eof_reads = rd.eof_reads + 1
+    0UL
+  }
+}
+
+///| Initialize a `RangeDecoder` over `[start, end)`.
+fn RangeDecoder::new(data : Bytes, start : Int, end : Int) -> Result[RangeDecoder, String] {
+  if end - start < 5 {
+    return Err("truncated range-coded payload")
+  }
+  let rd = RangeDecoder::{ data, pos: start, end, range: 0xFFFFFFFFUL, code: 0UL, eof_reads: 0 }
+  let _ = rd_next_byte(rd)
+  let mut i = 0
+  while i < 4 {
+    rd.code = (rd.code << 8) | rd_next_byte(rd)
+    i = i + 1
+  }
+  Ok(rd)
+}
+
+///| Verify the range decoder consumed the exact payload without truncation or trailing bytes.
+fn rd_check_eof(rd : RangeDecoder) -> Result[Unit, String] {
+  if rd.eof_reads > 0 {
+    return Err("truncated range-coded payload")
+  }
+  if rd.pos != rd.end {
+    return Err("trailing bytes in range-coded payload")
+  }
+  Ok(())
+}
+
+///| Decode one binary decision using adaptive probability `probs[ctx]` and update it.
+fn rd_decode_bit(rd : RangeDecoder, probs : FixedArray[Int], ctx : Int) -> Int {
+  let p = probs[ctx]
+  let bound = (rd.range >> prob_bits) * p.to_int64().to_uint64()
+  let bit = if rd.code < bound {
+    rd.range = bound
+    probs[ctx] = p + ((prob_total - p) >> prob_shift)
+    0
+  } else {
+    rd.code = rd.code - bound
+    rd.range = rd.range - bound
+    probs[ctx] = p - (p >> prob_shift)
+    1
+  }
+  while rd.range < range_top {
+    rd.range = rd.range << 8
+    rd.code = (rd.code << 8) | rd_next_byte(rd)
+  }
+  bit
+}
+
+///| Decode one equiprobable (50/50) bit.
+fn rd_decode_direct_bit(rd : RangeDecoder) -> Int {
+  let half = rd.range >> 1
+  rd.range = half
+  let bit = if rd.code < half {
+    0
+  } else {
+    rd.code = rd.code - half
+    1
+  }
+  while rd.range < range_top {
+    rd.range = rd.range << 8
+    rd.code = (rd.code << 8) | rd_next_byte(rd)
+  }
+  bit
+}
+
+///| Decode `nbits` equiprobable bits MSB-first.
+fn rd_decode_direct_bits(rd : RangeDecoder, nbits : Int) -> Int {
+  let mut v = 0
+  let mut i = 0
+  while i < nbits {
+    v = (v << 1) | rd_decode_direct_bit(rd)
+    i = i + 1
+  }
+  v
+}
