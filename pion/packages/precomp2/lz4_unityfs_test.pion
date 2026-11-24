@@ -1,0 +1,377 @@
+///| Unit tests for byte-exact LZ4HC compressors, LZ4 block decompression, and UnityFS codec.
+
+fn rng_next(state : UInt64) -> UInt64 {
+  let mut s = state
+  s = s ^ (s << 13)
+  s = s ^ (s >> 7)
+  s = s ^ (s << 17)
+  s
+}
+
+fn structured_payload(seed : UInt64, len : Int) -> Bytes {
+  let mut state = seed
+  let pat = "UnityFS serialized asset data with repeated structure; ".to_bytes()
+  let plen = pat.length()
+  let out = Bytes::new(len)
+  let mut pos = 0
+  while pos < len {
+    state = rng_next(state)
+    if state % 3UL == 0UL {
+      let mut k = 0
+      while k < plen && pos < len {
+        out[pos] = pat[k]
+        pos += 1
+        k += 1
+      }
+    } else {
+      out[pos] = ((state >> 33) & 0xFFUL).to_int().to_byte()
+      pos += 1
+    }
+  }
+  out
+}
+
+fn push_u16_be(out : Array[Byte], v : Int) -> Unit {
+  out.push(((v >> 8) & 0xFF).to_byte())
+  out.push((v & 0xFF).to_byte())
+}
+
+fn push_u32_be(out : Array[Byte], v : UInt) -> Unit {
+  out.push(((v >> 24) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 16) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 8) & 0xFFU).to_int().to_byte())
+  out.push((v & 0xFFU).to_int().to_byte())
+}
+
+fn push_u64_be(out : Array[Byte], v : UInt64) -> Unit {
+  let mut shift = 56
+  while shift >= 0 {
+    out.push(((v >> shift) & 0xFFUL).to_int().to_byte())
+    shift -= 8
+  }
+}
+
+fn pad_to_16(out : Array[Byte]) -> Unit {
+  while out.length() % 16 != 0 {
+    out.push((0).to_byte())
+  }
+}
+
+///| Minimal foreign LZ4 encoder (literals-only) that no HC compressor reproduces on compressible data.
+fn make_foreign_lz4(raw : Bytes) -> Bytes {
+  let n = raw.length()
+  let out : Array[Byte] = []
+  if n >= 15 {
+    out.push((0xF0).to_byte())
+    let mut rem = n - 15
+    while rem >= 255 {
+      out.push((255).to_byte())
+      rem -= 255
+    }
+    out.push(rem.to_byte())
+  } else {
+    out.push((n << 4).to_byte())
+  }
+  let mut i = 0
+  while i < n {
+    out.push(raw[i])
+    i += 1
+  }
+  arr_to_bytes(out)
+}
+
+fn build_unityfs_bundle(
+  archive_version : UInt,
+  unity_version : String,
+  flags : UInt,
+  compressor : Compressor,
+  block_flags : Array[Int],
+  block_payloads : Array[Bytes],
+  block_foreign : Array[Bool],
+) -> Bytes {
+  let stored : Array[Bytes] = []
+  let mut i = 0
+  while i < block_payloads.length() {
+    let raw = block_payloads[i]
+    let st = if block_foreign[i] {
+      make_foreign_lz4(raw)
+    } else if block_flags[i] == 0 {
+      raw
+    } else {
+      match compressor.compress(raw, compress_bound(raw.length())) {
+        Some(c) => c
+        None => raw
+      }
+    }
+    stored.push(st)
+    i += 1
+  }
+  let info_arr : Array[Byte] = []
+  let mut h = 0
+  while h < 16 {
+    info_arr.push((0).to_byte())
+    h += 1
+  }
+  push_u32_be(info_arr, block_payloads.length().to_uint())
+  i = 0
+  while i < block_payloads.length() {
+    push_u32_be(info_arr, block_payloads[i].length().to_uint())
+    push_u32_be(info_arr, stored[i].length().to_uint())
+    push_u16_be(info_arr, block_flags[i])
+    i += 1
+  }
+  push_u32_be(info_arr, 0U)
+  let info = arr_to_bytes(info_arr)
+  let info_bytes = if (flags & 0x3FU) == 0U {
+    info
+  } else {
+    match compressor.compress(info, compress_bound(info.length())) {
+      Some(c) => c
+      None => info
+    }
+  }
+  let file : Array[Byte] = []
+  let magic = "UnityFS".to_bytes()
+  let mut m = 0
+  while m < magic.length() {
+    file.push(magic[m])
+    m += 1
+  }
+  file.push((0).to_byte())
+  push_u32_be(file, archive_version)
+  let v5 = "5.x.x".to_bytes()
+  m = 0
+  while m < v5.length() {
+    file.push(v5[m])
+    m += 1
+  }
+  file.push((0).to_byte())
+  let uvb = unity_version.to_bytes()
+  m = 0
+  while m < uvb.length() {
+    file.push(uvb[m])
+    m += 1
+  }
+  file.push((0).to_byte())
+  let size_offset = file.length()
+  push_u64_be(file, 0UL)
+  push_u32_be(file, info_bytes.length().to_uint())
+  push_u32_be(file, info.length().to_uint())
+  push_u32_be(file, flags)
+  if archive_version >= 7U {
+    pad_to_16(file)
+  }
+  if (flags & 0x80U) == 0U {
+    m = 0
+    while m < info_bytes.length() {
+      file.push(info_bytes[m])
+      m += 1
+    }
+  }
+  if (flags & 0x200U) != 0U {
+    pad_to_16(file)
+  }
+  i = 0
+  while i < stored.length() {
+    let st = stored[i]
+    m = 0
+    while m < st.length() {
+      file.push(st[m])
+      m += 1
+    }
+    i += 1
+  }
+  if (flags & 0x80U) != 0U {
+    m = 0
+    while m < info_bytes.length() {
+      file.push(info_bytes[m])
+      m += 1
+    }
+  }
+  let total_sz = file.length().to_int64().to_uint64()
+  let mut sh = 56
+  let mut so = size_offset
+  while sh >= 0 {
+    file[so] = ((total_sz >> sh) & 0xFFUL).to_int().to_byte()
+    so += 1
+    sh -= 8
+  }
+  arr_to_bytes(file)
+}
+
+test "lz4_compressor_ids_roundtrip_and_limited_capacity" {
+  // Stable wire IDs
+  let id_pairs : Array[(Int, Compressor)] = [
+    (2, Compressor::V1_9_1_L12),
+    (3, Compressor::V1_10_0_L12),
+    (4, Compressor::R131_L16),
+  ]
+  let mut i = 0
+  while i < id_pairs.length() {
+    let (id, c) = id_pairs[i]
+    debug_assert(c.to_u8() == id.to_byte(), "compressor wire id")
+    match Compressor::from_u8(id.to_byte()) {
+      Ok(got) => debug_assert(compressor_eq(got, c), "from_u8 mismatch")
+      Err(_) => debug_assert(false, "from_u8 failed")
+    }
+    i += 1
+  }
+  let bad_ids : Array[Int] = [0, 1, 5, 255]
+  i = 0
+  while i < bad_ids.length() {
+    match Compressor::from_u8(bad_ids[i].to_byte()) {
+      Err(_) => ()
+      Ok(_) => debug_assert(false, "expected invalid compressor id")
+    }
+    i += 1
+  }
+
+  // Roundtrip + limited capacity across all 3 compressors
+  let inputs : Array[Bytes] = [
+    Bytes::new(0),
+    "a".to_bytes(),
+    "hello world".to_bytes(),
+    structured_payload(0x1234UL, 500),
+    structured_payload(0x5678UL, 70000),
+  ]
+  let comps = Compressor::all()
+  let mut ii = 0
+  while ii < inputs.length() {
+    let src = inputs[ii]
+    let bound = compress_bound(src.length())
+    let mut ci = 0
+    while ci < comps.length() {
+      let c = comps[ci]
+      let full = match c.compress(src, bound) {
+        Some(v) => v
+        None => {
+          debug_assert(false, "compress full failed")
+          Bytes::new(0)
+        }
+      }
+      let dec = match lz4_decompress(full, src.length()) {
+        Ok(v) => v
+        Err(_) => {
+          debug_assert(false, "lz4_decompress failed")
+          Bytes::new(0)
+        }
+      }
+      debug_assert(bytes_eq(dec, src), "lz4 roundtrip mismatch")
+      // Tight exact capacity succeeds
+      match c.compress(src, full.length()) {
+        Some(tight) => debug_assert(bytes_eq(tight, full), "tight capacity mismatch")
+        None => debug_assert(false, "exact capacity should succeed")
+      }
+      // Capacity - 1 returns None
+      if full.length() > 0 {
+        match c.compress(src, full.length() - 1) {
+          None => ()
+          Some(_) => debug_assert(false, "capacity - 1 must return None")
+        }
+      }
+      ci += 1
+    }
+    ii += 1
+  }
+}
+
+test "unityfs_all_layouts_foreign_giveup_and_truncated" {
+  let variants : Array[(UInt, String, UInt, Compressor)] = [
+    (6U, "2017.4.39f1", 0x43U, Compressor::R131_L16),
+    (7U, "2021.1.16f1", 0x43U, Compressor::V1_9_1_L12),
+    (8U, "2021.3.35f1", 0x243U, Compressor::V1_9_1_L12),
+    (8U, "2022.3.62f3", 0x243U, Compressor::V1_10_0_L12),
+    (8U, "6000.3.8f1", 0x243U, Compressor::V1_10_0_L12),
+    (6U, "2017.4.39f1", 0U, Compressor::R131_L16),
+    (7U, "2021.3.45f1", 2U, Compressor::V1_9_1_L12),
+    (7U, "6000.0.23f1", 0x283U, Compressor::V1_10_0_L12),
+    (6U, "2017.4.39f1", 0x80U, Compressor::R131_L16),
+  ]
+  let b0 = structured_payload(1UL, 512)
+  let b1 = structured_payload(2UL, 8000)
+  let b2 = structured_payload(3UL, 4000)
+  let mut vi = 0
+  while vi < variants.length() {
+    let (ver, uver, flags, comp) = variants[vi]
+    let bundle = build_unityfs_bundle(
+      ver,
+      uver,
+      flags,
+      comp,
+      [0, 3, 2],
+      [b0, b1, b2],
+      [false, false, false],
+    )
+    let report = match analyze_unityfs(bundle) {
+      Some(r) => r
+      None => {
+        debug_assert(false, "analyze_unityfs returned None")
+        UnityFsReport::{ engine_version: "", lz4_regions: [] }
+      }
+    }
+    let expected_regions = 2 + (if (flags & 0x3FU) != 0U { 1 } else { 0 })
+    debug_assert(report.engine_version == uver, "engine version mismatch")
+    debug_assert(
+      report.lz4_regions.length() == expected_regions,
+      "lz4 region count",
+    )
+    let enc = match encode_bytes(bundle, EncodeConfig::default()) {
+      Ok(b) => b
+      Err(_) => {
+        debug_assert(false, "unityfs encode failed")
+        Bytes::new(0)
+      }
+    }
+    let dec = match decode_bytes(enc, DecodeConfig::default()) {
+      Ok(b) => b
+      Err(_) => {
+        debug_assert(false, "unityfs decode failed")
+        Bytes::new(0)
+      }
+    }
+    debug_assert(bytes_eq(dec, bundle), "unityfs roundtrip mismatch")
+    vi += 1
+  }
+
+  // Foreign block fallback + give-up after 4 misses
+  let foreign_bundle = build_unityfs_bundle(
+    7U,
+    "2019.4.40f1",
+    0x40U,
+    Compressor::V1_10_0_L12,
+    [3, 3, 3, 3, 3],
+    [
+      structured_payload(10UL, 4000),
+      structured_payload(11UL, 4000),
+      structured_payload(12UL, 4000),
+      structured_payload(13UL, 4000),
+      structured_payload(14UL, 4000),
+    ],
+    [true, true, true, true, false],
+  )
+  let rep2 = match analyze_unityfs(foreign_bundle) {
+    Some(r) => r
+    None => {
+      debug_assert(false, "foreign bundle should still parse")
+      UnityFsReport::{ engine_version: "", lz4_regions: [] }
+    }
+  }
+  debug_assert(rep2.lz4_regions.length() == 5, "5 regions")
+  let mut hits = 0
+  let mut ri = 0
+  while ri < rep2.lz4_regions.length() {
+    match rep2.lz4_regions[ri].compressor {
+      Some(_) => hits += 1
+      None => ()
+    }
+    ri += 1
+  }
+  debug_assert(hits == 0, "expected give-up after 4 misses")
+
+  // Truncated bundle falls back cleanly to literal
+  let trunc = bytes_slice(foreign_bundle, 0, foreign_bundle.length() - 1)
+  match analyze_unityfs(trunc) {
+    None => ()
+    Some(_) => debug_assert(false, "truncated bundle must return None")
+  }
+}

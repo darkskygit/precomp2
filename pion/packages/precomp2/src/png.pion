@@ -1,0 +1,413 @@
+///| PNG IDAT container codec with preflate and optional lossless WebP pixel carrier.
+
+import "flate"
+
+struct ParsedPngMeta {
+  payload_kind : Byte
+  png_payload_kind : Byte
+  zlib_h0 : Byte
+  zlib_h1 : Byte
+  zlib_footer : Bytes
+  idat_lengths : Array[Int]
+  crc_present : Byte
+  idat_crcs : Array[UInt]
+  webp_meta : Option[PngWebpMeta]
+}
+
+fn encode_png(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Array[Pcf2Segment]], Error] {
+  let ilen = input.length()
+  if ilen < 8 || !bytes_starts_with(input, png_signature) {
+    return Ok(None)
+  }
+  let metadata = if config.enable_png_webp {
+    match parse_png_metadata(input) {
+      Ok(plan) => plan
+      Err(_) => return Ok(Some([Pcf2Segment::lit(input)]))
+    }
+  } else {
+    None
+  }
+  let mut offset = 8
+  let idat_chunks : Array[Byte] = []
+  let idat_lengths : Array[UInt64] = []
+  let idat_crcs : Array[UInt] = []
+  let mut first_idat_start : Option[Int] = None
+  let mut last_idat_end : Option[Int] = None
+  while offset + 12 <= ilen {
+    let clen_u = read_u32_be(input, offset)
+    if clen_u > 0x7FFFFFFFU {
+      break
+    }
+    let clen = clen_u.to_int()
+    let data_start = offset + 8
+    let data_end = match int_checked_add(data_start, clen) {
+      Some(v) => v
+      None => break
+    }
+    let crc_end = match int_checked_add(data_end, 4) {
+      Some(v) => v
+      None => break
+    }
+    if crc_end > ilen {
+      break
+    }
+    if bytes_starts_with_at(input, offset + 4, chunk_idat) {
+      match first_idat_start {
+        None => first_idat_start = Some(offset)
+        Some(_) => ()
+      }
+      last_idat_end = Some(crc_end)
+      idat_lengths.push(clen.to_int64().to_uint64())
+      idat_crcs.push(read_u32_be(input, data_end))
+      append_bytes_slice(idat_chunks, input, data_start, data_end)
+    } else {
+      match last_idat_end {
+        Some(_) => break
+        None => ()
+      }
+    }
+    offset = crc_end
+    if bytes_starts_with_at(input, offset - clen - 8, chunk_iend) {
+      break
+    }
+  }
+  let idat_start = match first_idat_start {
+    Some(v) => v
+    None => return Ok(None)
+  }
+  let idat_end = match last_idat_end {
+    Some(v) => v
+    None => return Ok(None)
+  }
+  let idat_bytes = bytes_from_array(idat_chunks)
+  let zlen = idat_bytes.length()
+  if zlen < 6 {
+    return Ok(None)
+  }
+  let cmf = idat_bytes[0].to_int()
+  let flg = idat_bytes[1].to_int()
+  if (cmf & 0x0F) != 8 || (cmf >> 4) > 7 {
+    return Ok(None)
+  }
+  let check = (cmf << 8) | flg
+  if check % 31 != 0 || (flg & 0x20) != 0 {
+    return Ok(None)
+  }
+  let deflate = bytes_slice(idat_bytes, 2, zlen - 4)
+  let pf = match preflate_analyze(deflate) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  let (deflate_len, corrections, plain) = match parse_preflate_output(pf) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  if deflate_len != deflate.length().to_int64().to_uint64() {
+    return Ok(None)
+  }
+  if adler32(plain) != read_u32_be(idat_bytes, zlen - 4) {
+    return Ok(None)
+  }
+  let mut png_payload_kind = (0).to_byte()
+  let mut payload_bytes = plain
+  let mut webp_meta : Option[PngWebpMeta] = None
+  match metadata {
+    Some(plan) => {
+      let ihdr = plan.ihdr
+      let bpp = match ihdr.bytes_per_pixel() {
+        Ok(b) => b
+        Err(e) => return Err(e)
+      }
+      match undo_png_filters(payload_bytes, ihdr.width, ihdr.height, bpp) {
+        Ok((bitmap, filters)) =>
+        match
+        encode_webp_lossless(bitmap, ihdr.width, ihdr.height, ihdr.color_type) {
+          Ok(webp_bytes) => {
+            png_payload_kind = (1).to_byte()
+            payload_bytes = webp_bytes
+            webp_meta = Some(PngWebpMeta::{
+              color_type: ihdr.color_type,
+              width: ihdr.width,
+              height: ihdr.height,
+              filters,
+            })
+          }
+          Err(_) => ()
+        }
+        Err(_) => ()
+      }
+    }
+    None => ()
+  }
+  let (payload_kind, payload) = match
+  choose_payload(payload_bytes, zlen, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let meta : Array[Byte] = []
+  meta.push((1).to_byte())
+  meta.push(payload_kind)
+  meta.push(png_payload_kind)
+  meta.push(idat_bytes[0])
+  meta.push(idat_bytes[1])
+  append_bytes_slice(meta, idat_bytes, zlen - 4, zlen)
+  write_varint(idat_lengths.length().to_int64().to_uint64(), meta)
+  let mut li = 0
+  while li < idat_lengths.length() {
+    write_varint(idat_lengths[li], meta)
+    li += 1
+  }
+  meta.push((1).to_byte())
+  let mut ci = 0
+  while ci < idat_crcs.length() {
+    write_u32_le(idat_crcs[ci], meta)
+    ci += 1
+  }
+  match webp_meta {
+    Some(wm) => {
+      meta.push(wm.color_type)
+      write_varint(wm.width.to_uint64(), meta)
+      write_varint(wm.height.to_uint64(), meta)
+      append_bytes(meta, wm.filters)
+    }
+    None => ()
+  }
+  let data = build_preflate_data(corrections, payload)
+  let segments : Array[Pcf2Segment] = []
+  if idat_start > 0 {
+    segments.push(Pcf2Segment::lit(bytes_slice(input, 0, idat_start)))
+  }
+  segments.push(Pcf2Segment::{
+    kind: SegmentKind::PngIdat.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: (idat_end - idat_start).to_int64().to_uint64(),
+    meta: bytes_from_array(meta),
+    data,
+  })
+  if idat_end < ilen {
+    segments.push(Pcf2Segment::lit(bytes_slice(input, idat_end, ilen)))
+  }
+  Ok(Some(segments))
+}
+
+fn parse_png_meta(segment : Pcf2Segment) -> Result[ParsedPngMeta, Error] {
+  let mlen = segment.meta.length()
+  if mlen < 3 {
+    return Err(Error::InvalidSegment("png meta"))
+  }
+  let meta_version = segment.meta[0]
+  let payload_kind = segment.meta[1]
+  let png_payload_kind = segment.meta[2]
+  if meta_version != (1).to_byte() {
+    return Err(Error::InvalidSegment("png meta_version"))
+  }
+  let rest = bytes_slice(segment.meta, 3, mlen)
+  let rlen = rest.length()
+  if rlen < 6 {
+    return Err(Error::InvalidSegment("png meta truncated"))
+  }
+  let zlib_h0 = rest[0]
+  let zlib_h1 = rest[1]
+  let zlib_footer = bytes_slice(rest, 2, 6)
+  let mut offset = 6
+  let (idat_count_u, p1) = match read_varint_slice(rest, offset) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let idat_count = match u64_to_int_checked(idat_count_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  offset = p1
+  if idat_count == 0 || idat_count > rlen - offset {
+    return Err(Error::InvalidSegment("png idat count"))
+  }
+  let idat_lengths : Array[Int] = []
+  let mut i = 0
+  while i < idat_count {
+    let (lv_u, np) = match read_varint_slice(rest, offset) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let lv = match u64_to_int_checked(lv_u) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    idat_lengths.push(lv)
+    offset = np
+    i += 1
+  }
+  if offset >= rlen {
+    return Err(Error::InvalidSegment("png meta truncated"))
+  }
+  let crc_present = rest[offset]
+  offset += 1
+  if crc_present.to_int() > 1 {
+    return Err(Error::InvalidSegment("png crc flag"))
+  }
+  let idat_crcs : Array[UInt] = []
+  if crc_present == (1).to_byte() {
+    let crc_bytes = match int_checked_mul(idat_count, 4) {
+      Some(v) => v
+      None => return Err(Error::LengthOverflow)
+    }
+    if crc_bytes > rlen - offset {
+      return Err(Error::InvalidSegment("png crc bounds"))
+    }
+    let mut ci = 0
+    while ci < idat_count {
+      idat_crcs.push(read_u32_le(rest, offset))
+      offset += 4
+      ci += 1
+    }
+  }
+  let mut webp_meta : Option[PngWebpMeta] = None
+  if png_payload_kind == (1).to_byte() {
+    if offset >= rlen {
+      return Err(Error::InvalidSegment("png webp meta"))
+    }
+    let color_type = rest[offset]
+    offset += 1
+    let (w_u, pw) = match read_varint_slice(rest, offset) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let (h_u, ph) = match read_varint_slice(rest, pw) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if w_u > 0xFFFFFFFFUL || h_u > 0xFFFFFFFFUL {
+      return Err(Error::LengthOverflow)
+    }
+    let h_int = match u64_to_int_checked(h_u) {
+      Ok(v) => v
+      Err(_) => return Err(Error::InvalidSegment("png webp height"))
+    }
+    offset = ph
+    if h_int > rlen - offset {
+      return Err(Error::InvalidSegment("png webp filters"))
+    }
+    let filters = bytes_slice(rest, offset, offset + h_int)
+    offset += h_int
+    webp_meta = Some(PngWebpMeta::{
+      color_type,
+      width: w_u.to_uint(),
+      height: h_u.to_uint(),
+      filters,
+    })
+  } else if png_payload_kind != (0).to_byte() {
+    return Err(Error::InvalidSegment("png payload_kind"))
+  }
+  if offset != rlen {
+    return Err(Error::InvalidSegment("png meta trailing"))
+  }
+  Ok(ParsedPngMeta::{
+    payload_kind,
+    png_payload_kind,
+    zlib_h0,
+    zlib_h1,
+    zlib_footer,
+    idat_lengths,
+    crc_present,
+    idat_crcs,
+    webp_meta,
+  })
+}
+
+fn decode_png_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  let meta = match parse_png_meta(segment) {
+    Ok(m) => m
+    Err(e) => return Err(e)
+  }
+  let (corrections, raw_payload) = match parse_preflate_data(segment.data) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let mut total_len = 0
+  let mut li = 0
+  while li < meta.idat_lengths.length() {
+    total_len = match int_checked_add(total_len, meta.idat_lengths[li]) {
+      Some(v) => v
+      None => return Err(Error::LengthOverflow)
+    }
+    li += 1
+  }
+  let payload = match
+  decode_payload(meta.payload_kind, raw_payload, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let plain = if meta.png_payload_kind == (0).to_byte() {
+    payload
+  } else {
+    let wm = match meta.webp_meta {
+      Some(m) => m
+      None => return Err(Error::InvalidSegment("png webp meta"))
+    }
+    let bitmap = match
+    decode_webp_bitmap(payload, wm.width, wm.height, wm.color_type) {
+      Ok(b) => b
+      Err(e) => return Err(e)
+    }
+    let bpp = match png_bytes_per_pixel(wm.color_type) {
+      Ok(b) => b
+      Err(e) => return Err(e)
+    }
+    match
+    apply_png_filters_with_types(bitmap, wm.width, wm.height, bpp, wm.filters) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+  }
+  let idat_data = match preflate_reencode(corrections, plain) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let full_buf : Array[Byte] = []
+  full_buf.push(meta.zlib_h0)
+  full_buf.push(meta.zlib_h1)
+  append_bytes(full_buf, idat_data)
+  append_bytes(full_buf, meta.zlib_footer)
+  let full_idat = bytes_from_array(full_buf)
+  if total_len != full_idat.length() {
+    return Err(Error::InvalidSegment("png idat length mismatch"))
+  }
+  let out : Array[Byte] = []
+  let mut cursor = 0
+  let mut idx = 0
+  while idx < meta.idat_lengths.length() {
+    let clen = meta.idat_lengths[idx]
+    write_u32_be(clen.to_uint(), out)
+    append_bytes(out, chunk_idat)
+    append_bytes_slice(out, full_idat, cursor, cursor + clen)
+    let crc = if meta.crc_present == (1).to_byte() {
+      if idx < meta.idat_crcs.length() {
+        meta.idat_crcs[idx]
+      } else {
+        0U
+      }
+    } else {
+      let c0 = flate::crc32(chunk_idat)
+      flate::crc32_update_slice(c0, full_idat, cursor, cursor + clen)
+    }
+    cursor += clen
+    write_u32_be(crc, out)
+    idx += 1
+  }
+  let result = bytes_from_array(out)
+  match budget.consume(result.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(result)
+}

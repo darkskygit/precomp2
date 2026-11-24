@@ -1,0 +1,183 @@
+///| Bzip2 codec with byte-level penalty patching for lossless reconstruction.
+
+import "bzip2"
+
+struct PenaltyEntry {
+  pos : UInt
+  value : Byte
+}
+
+let bzh_magic : Bytes = "BZh".to_bytes()
+
+fn compute_penalty(original : Bytes, recompressed : Bytes) -> Array[PenaltyEntry] {
+  let out : Array[PenaltyEntry] = []
+  let len = if original.length() < recompressed.length() {
+    original.length()
+  } else {
+    recompressed.length()
+  }
+  let mut i = 0
+  while i < len {
+    if original[i] != recompressed[i] {
+      out.push(PenaltyEntry::{ pos: i.to_uint(), value: original[i] })
+    }
+    i += 1
+  }
+  out
+}
+
+fn encode_bzip2(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Pcf2Segment], Error] {
+  if input.length() < 4 || !bytes_starts_with(input, bzh_magic) {
+    return Ok(None)
+  }
+  let level_b = input[3].to_int()
+  if level_b < 0x31 || level_b > 0x39 {
+    return Ok(None)
+  }
+  let level_num = level_b - 0x30
+  let rem_u64 = u64_saturating_sub(
+    config.max_total_output,
+    budget.total_output,
+  )
+  let max_out = if rem_u64 > 2147483647UL { 2147483647 } else { rem_u64.to_int() }
+  let plain = match bzip2::decompress_limited(input, max_out) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  let (payload_kind, payload) = match
+  choose_payload(plain, input.length(), config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let recompressed = match bzip2::compress(plain, level_num) {
+    Ok(v) => v
+    Err(msg) => return Err(Error::Other("bzip2 compress failed: \{msg}"))
+  }
+  if recompressed.length() != input.length() {
+    return Ok(None)
+  }
+  let penalty = compute_penalty(input, recompressed)
+  let meta : Array[Byte] = []
+  meta.push((0).to_byte())
+  meta.push(payload_kind)
+  meta.push(input[3])
+  write_varint(penalty.length().to_int64().to_uint64(), meta)
+  let mut i = 0
+  while i < penalty.length() {
+    write_u32_be(penalty[i].pos, meta)
+    meta.push(penalty[i].value)
+    i += 1
+  }
+  write_varint(plain.length().to_int64().to_uint64(), meta)
+  Ok(
+    Some(Pcf2Segment::{
+      kind: SegmentKind::Bzip2.to_u8(),
+      flags: (0).to_byte(),
+      orig_len: input.length().to_int64().to_uint64(),
+      meta: bytes_from_array(meta),
+      data: payload,
+    }),
+  )
+}
+
+fn decode_bzip2_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  let mlen = segment.meta.length()
+  if mlen < 3 {
+    return Err(Error::InvalidSegment("bzip2 meta"))
+  }
+  let meta_version = segment.meta[0]
+  let payload_kind = segment.meta[1]
+  let level_b = segment.meta[2].to_int()
+  if meta_version != (0).to_byte() {
+    return Err(Error::InvalidSegment("bzip2 meta_version"))
+  }
+  if level_b < 0x31 || level_b > 0x39 {
+    return Err(Error::InvalidSegment("bzip2 level"))
+  }
+  let (penalty_count_u, p1) = match read_varint_slice(segment.meta, 3) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let penalty_count = match u64_to_int_checked(penalty_count_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let mut offset = p1
+  if penalty_count > (mlen - offset) / 5 {
+    return Err(Error::InvalidSegment("bzip2 penalty bounds"))
+  }
+  let penalty : Array[PenaltyEntry] = []
+  let mut i = 0
+  while i < penalty_count {
+    if 5 > mlen - offset {
+      return Err(Error::InvalidSegment("bzip2 penalty bounds"))
+    }
+    let pos = read_u32_be(segment.meta, offset)
+    let value = segment.meta[offset + 4]
+    offset += 5
+    penalty.push(PenaltyEntry::{ pos, value })
+    i += 1
+  }
+  let decoded_len = if offset < mlen {
+    let (dl_u, _) = match read_varint_slice(segment.meta, offset) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let dl = match u64_to_int_checked(dl_u) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    Some(dl)
+  } else {
+    None
+  }
+  let payload = match
+  decode_payload(payload_kind, segment.data, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match decoded_len {
+    Some(expected) =>
+    if expected != payload.length() {
+      return Err(Error::InvalidSegment("bzip2 decoded_len mismatch"))
+    }
+    None => ()
+  }
+  let level_num = level_b - 0x30
+  let recompressed = match bzip2::compress(payload, level_num) {
+    Ok(v) => v
+    Err(msg) => return Err(Error::Other("bzip2 compress failed: \{msg}"))
+  }
+  let rlen = recompressed.length()
+  let patched : FixedArray[Byte] = FixedArray::make(rlen, (0).to_byte())
+  let mut k = 0
+  while k < rlen {
+    patched[k] = recompressed[k]
+    k += 1
+  }
+  let mut pi = 0
+  while pi < penalty.length() {
+    let pos_u = penalty[pi].pos
+    if pos_u >= rlen.to_uint() {
+      return Err(Error::InvalidSegment("bzip2 penalty out of range"))
+    }
+    patched[pos_u.to_int()] = penalty[pi].value
+    pi += 1
+  }
+  let result = bytes_from_fixed_array(patched)
+  match budget.consume(result.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(result)
+}

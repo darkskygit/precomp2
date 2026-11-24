@@ -1,0 +1,13 @@
+[package]
+name = "precomp2"
+version = "0.3.2"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "base64-v0.1.0", subdir = "packages/base64" }
+bzip2 = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "bzip2-v0.1.0", subdir = "packages/bzip2" }
+# lepton and preflate depend on ../flate; share one pion-packages tag so flate resolves to a single path.
+flate = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "preflate-v0.1.0", subdir = "packages/flate" }
+lepton = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "preflate-v0.1.0", subdir = "packages/lepton" }
+preflate = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "preflate-v0.1.0", subdir = "packages/preflate" }
+webp = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "webp-v0.2.0", subdir = "packages/webp" }

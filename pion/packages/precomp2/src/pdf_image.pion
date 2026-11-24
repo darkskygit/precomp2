@@ -1,0 +1,185 @@
+///| Lossless WebP image carrier encoding and decoding for PDF image streams.
+
+fn pdf_image_encode(
+  bytes : Bytes,
+  dict : PdfValue,
+) -> Result[Option[(Bytes, Bytes)], Error] {
+  match dict.get("Subtype".to_bytes()) {
+    Some(PdfValue::Name(n)) =>
+    if !bytes_eq(n, "Image".to_bytes()) {
+      return Ok(None)
+    }
+    _ => return Ok(None)
+  }
+  let width = match dict.get("Width".to_bytes()) {
+    Some(PdfValue::Int(n)) => if n <= 2147483647UL { n.to_int() } else { 0 }
+    _ => 0
+  }
+  let height = match dict.get("Height".to_bytes()) {
+    Some(PdfValue::Int(n)) => if n <= 2147483647UL { n.to_int() } else { 0 }
+    _ => 0
+  }
+  let mask = match dict.get("ImageMask".to_bytes()) {
+    Some(PdfValue::Bool(true)) => true
+    _ => false
+  }
+  let bits_u = match dict.get("BitsPerComponent".to_bytes()) {
+    Some(PdfValue::Int(n)) => n
+    _ => if mask { 1UL } else { 8UL }
+  }
+  let colors = if mask {
+    1
+  } else {
+    match dict.get("ColorSpace".to_bytes()) {
+      Some(PdfValue::Name(n)) =>
+      if bytes_eq(n, "DeviceGray".to_bytes()) || bytes_eq(n, "G".to_bytes()) {
+        1
+      } else if bytes_eq(n, "DeviceRGB".to_bytes()) ||
+      bytes_eq(n, "RGB".to_bytes()) {
+        3
+      } else if bytes_eq(n, "DeviceCMYK".to_bytes()) ||
+      bytes_eq(n, "CMYK".to_bytes()) {
+        4
+      } else {
+        return Ok(None)
+      }
+      Some(PdfValue::Array(items)) =>
+      if items.length() > 0 {
+        match items[0].name() {
+          Some(n) =>
+          if bytes_eq(n, "Indexed".to_bytes()) {
+            1
+          } else {
+            return Ok(None)
+          }
+          None => return Ok(None)
+        }
+      } else {
+        return Ok(None)
+      }
+      _ => return Ok(None)
+    }
+  }
+  if width <= 0 ||
+  height <= 0 ||
+  !(bits_u == 1UL ||
+    bits_u == 2UL ||
+    bits_u == 4UL ||
+    bits_u == 8UL ||
+    bits_u == 16UL) {
+    return Ok(None)
+  }
+  let bits = bits_u.to_int()
+  let p1 = match int_checked_mul(width, colors) {
+    Some(v) => v
+    None => return Err(Error::LengthOverflow)
+  }
+  let p2 = match int_checked_mul(p1, bits) {
+    Some(v) => v
+    None => return Err(Error::LengthOverflow)
+  }
+  let row = match int_checked_add(p2, 7) {
+    Some(v) => v / 8
+    None => return Err(Error::LengthOverflow)
+  }
+  match int_checked_mul(row, height) {
+    Some(expected) => if expected != bytes.length() { return Ok(None) }
+    None => return Ok(None)
+  }
+  let rgb = colors == 3 && bits == 8
+  let encoded_width = if rgb { width } else { row }
+  if encoded_width > 16383 || height > 16383 {
+    return Ok(None)
+  }
+  let pixels = if rgb {
+    bytes
+  } else {
+    let blen = bytes.length()
+    let expanded : FixedArray[Byte] = FixedArray::make(blen * 3, (0).to_byte())
+    let mut i = 0
+    while i < blen {
+      let b = bytes[i]
+      let d = i * 3
+      expanded[d] = b
+      expanded[d + 1] = b
+      expanded[d + 2] = b
+      i += 1
+    }
+    bytes_from_fixed_array(expanded)
+  }
+  let encoded = match
+  encode_webp_lossless(
+    pixels,
+    encoded_width.to_uint(),
+    height.to_uint(),
+    (2).to_byte(),
+  ) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let meta : Array[Byte] = []
+  meta.push(if rgb { (1).to_byte() } else { (0).to_byte() })
+  pdf_write_num(encoded_width, meta)
+  pdf_write_num(height, meta)
+  Ok(Some((encoded, bytes_from_array(meta))))
+}
+
+fn pdf_image_decode(
+  bytes : Bytes,
+  meta : Bytes,
+  len : Int,
+) -> Result[Bytes, Error] {
+  if meta.length() == 0 {
+    return Err(Error::InvalidSegment("pdf image mode"))
+  }
+  let rgb = match meta[0].to_int() {
+    0 => false
+    1 => true
+    _ => return Err(Error::InvalidSegment("pdf image mode"))
+  }
+  let (width, p1) = match pdf_read_num(meta, 1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (height, p2) = match pdf_read_num(meta, p1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let expected_opt = match int_checked_mul(width, height) {
+    Some(wh) => int_checked_mul(wh, if rgb { 3 } else { 1 })
+    None => None
+  }
+  let dims_ok = match expected_opt {
+    Some(e) => e == len
+    None => false
+  }
+  if p2 != meta.length() ||
+  width == 0 ||
+  height == 0 ||
+  width > 16383 ||
+  height > 16383 ||
+  !dims_ok {
+    return Err(Error::InvalidSegment("pdf image dimensions"))
+  }
+  let pixels = match
+  decode_webp_bitmap(bytes, width.to_uint(), height.to_uint(), (2).to_byte()) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if rgb {
+    return Ok(pixels)
+  }
+  let n = pixels.length() / 3
+  let out : FixedArray[Byte] = FixedArray::make(n, (0).to_byte())
+  let mut i = 0
+  while i < n {
+    let s = i * 3
+    let r = pixels[s]
+    if pixels[s + 1] != r || pixels[s + 2] != r {
+      return Err(Error::InvalidSegment("pdf gray channels"))
+    }
+    out[i] = r
+    i += 1
+  }
+  Ok(bytes_from_fixed_array(out))
+}

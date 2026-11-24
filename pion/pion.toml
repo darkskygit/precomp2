@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "packages/precomp2",
+]
+
+[workspace.dependencies]
+precomp2 = { path = "packages/precomp2" }
+
+[registry]
+url = "https://github.com/AFK-surf/pion-packages.git"

@@ -1,0 +1,405 @@
+///| Byte-exact LZ4HC optimal parser and match finder (liblz4 1.8.2–1.10.0, level 12).
+
+let lz4_opt_max_distance : UInt = 65535U
+
+let lz4_opt_base : UInt = 65536U
+
+let lz4_opt_num : Int = 4096
+
+let lz4_trailing_literals : Int = 3
+
+let lz4_level12_attempts : Int = 16384
+
+struct Lz4MatchFinder {
+  src : Bytes
+  head : FixedArray[UInt]
+  prev : FixedArray[Int]
+  mut next_to_update : UInt
+  accelerated_chain_swap : Bool
+  repeat_candidate_in_window : Bool
+}
+
+fn Lz4MatchFinder::new(
+  src : Bytes,
+  accelerated_chain_swap : Bool,
+  repeat_candidate_in_window : Bool,
+) -> Lz4MatchFinder {
+  Lz4MatchFinder::{
+    src,
+    head: FixedArray::make(32768, 0U),
+    prev: FixedArray::make(65536, 65535),
+    next_to_update: lz4_opt_base,
+    accelerated_chain_swap,
+    repeat_candidate_in_window,
+  }
+}
+
+fn Lz4MatchFinder::delta(self : Lz4MatchFinder, idx : UInt) -> UInt {
+  self.prev[(idx & 0xFFFFU).to_int()].to_int().to_uint()
+}
+
+fn Lz4MatchFinder::insert_up_to(self : Lz4MatchFinder, pos : Int) -> Unit {
+  let target = pos.to_uint() + lz4_opt_base
+  let mut idx = self.next_to_update
+  let src = self.src
+  let head = self.head
+  let prev = self.prev
+  while idx < target {
+    let h = lz4_hash(read_u32_le(src, (idx - lz4_opt_base).to_int()))
+    let diff = idx - head[h]
+    let d = if diff < lz4_opt_max_distance { diff.to_int() } else { 65535 }
+    prev[(idx & 0xFFFFU).to_int()] = d
+    head[h] = idx
+    idx = idx + 1U
+  }
+  self.next_to_update = target
+}
+
+///| Chain swap: among `idx..=idx+longest-4`, find the position whose predecessor is farthest (> 1).
+fn Lz4MatchFinder::farthest_chain(
+  self : Lz4MatchFinder,
+  idx : UInt,
+  longest : Int,
+) -> Option[(UInt, UInt)] {
+  let span = (longest - lz4_min_match + 1).to_uint()
+  let mut found = false
+  let mut best_dist = 1U
+  let mut best_pos = 0U
+  let mut pos = 0U
+  let mut misses = 0U
+  let accel = self.accelerated_chain_swap
+  let prev = self.prev
+  while pos < span {
+    let step = if accel { (16U + misses) >> 4 } else { 1U }
+    let dist = prev[((idx + pos) & 0xFFFFU).to_int()].to_int().to_uint()
+    if dist > best_dist {
+      best_dist = dist
+      best_pos = pos
+      found = true
+      misses = 0U
+    } else {
+      misses = misses + 1U
+    }
+    pos = pos + step
+  }
+  if found {
+    Some((best_dist, best_pos))
+  } else {
+    None
+  }
+}
+
+///| `LZ4HC_FindLongerMatch`: longest match at `ip` strictly longer than `longest_in`.
+fn Lz4MatchFinder::longer_match(
+  self : Lz4MatchFinder,
+  ip : Int,
+  limit : Int,
+  longest_in : Int,
+  attempts_in : Int,
+) -> Option[Lz4Match] {
+  self.insert_up_to(ip)
+  let s = self.src
+  let ip_idx = ip.to_uint() + lz4_opt_base
+  let lowest = if ip_idx > lz4_opt_max_distance + lz4_opt_base {
+    ip_idx - lz4_opt_max_distance
+  } else {
+    lz4_opt_base
+  }
+  let pattern = read_u32_le(s, ip)
+  let mut longest = longest_in
+  let mut attempts = attempts_in
+  // run_state: 0 = untested, 1 = not a 4-byte repeat, 2 = repeat with length `src_run_len`
+  let mut run_state = 0
+  let mut src_run_len = 0
+  let mut chain_shift = 0U
+  let mut best_found = false
+  let mut best_source = 0
+  let mut best_len = 0
+  let mut idx = self.head[lz4_hash(pattern)]
+  let lowest_pos = (lowest - lz4_opt_base).to_int()
+  let window_floor = if self.repeat_candidate_in_window {
+    lowest
+  } else {
+    lz4_opt_base
+  }
+  while idx >= lowest && attempts > 0 {
+    attempts -= 1
+    let cand = (idx - lz4_opt_base).to_int()
+    let mut len = 0
+    if read_u16_le(s, ip + longest - 1) == read_u16_le(s, cand + longest - 1) &&
+    read_u32_le(s, cand) == pattern {
+      len = lz4_min_match +
+      lz4_common_prefix(s, ip + lz4_min_match, cand + lz4_min_match, limit)
+      if len > longest {
+        longest = len
+        best_found = true
+        best_source = cand
+        best_len = len
+      }
+    }
+    if len == longest && idx + longest.to_uint() <= ip_idx {
+      match self.farthest_chain(idx, longest) {
+        Some((dist, shift)) => {
+          chain_shift = shift
+          idx = idx - dist
+          continue
+        }
+        None => ()
+      }
+    }
+    if chain_shift == 0U && self.delta(idx) == 1U {
+      if run_state == 0 {
+        let b = (pattern & 0xFFU).to_int().to_byte()
+        if pattern == lz4_splat32(b) {
+          run_state = 2
+          src_run_len = lz4_min_match +
+          lz4_run_forward(s, ip + lz4_min_match, limit, b)
+        } else {
+          run_state = 1
+        }
+      }
+      let cand_idx = idx - 1U
+      if run_state == 2 && cand_idx >= window_floor {
+        let rcand = (cand_idx - lz4_opt_base).to_int()
+        if read_u32_le(s, rcand) == pattern {
+          let byte = (pattern & 0xFFU).to_int().to_byte()
+          let fwd = lz4_min_match +
+          lz4_run_forward(s, rcand + lz4_min_match, limit, byte)
+          let back = lz4_run_backward(s, rcand, lowest_pos, byte)
+          let segment = back + fwd
+          if segment >= src_run_len && fwd <= src_run_len {
+            idx = cand_idx + fwd.to_uint() - src_run_len.to_uint()
+          } else {
+            idx = cand_idx - back.to_uint()
+            let ml = if segment < src_run_len { segment } else { src_run_len }
+            if longest < ml {
+              if ip_idx - idx > lz4_opt_max_distance {
+                break
+              }
+              longest = ml
+              best_found = true
+              best_source = (idx - lz4_opt_base).to_int()
+              best_len = ml
+            }
+            idx = idx - self.delta(idx)
+          }
+          continue
+        }
+      }
+    }
+    idx = idx - self.delta(idx + chain_shift)
+  }
+  if best_found {
+    Some(Lz4Match::{ start: ip, source: best_source, len: best_len })
+  } else {
+    None
+  }
+}
+
+fn lz4_literals_price(litlen : Int) -> Int {
+  let extra = if litlen >= 15 { 1 + (litlen - 15) / 255 } else { 0 }
+  litlen + extra
+}
+
+fn lz4_sequence_price(litlen : Int, mlen : Int) -> Int {
+  let ml_extra = if mlen >= 15 + lz4_min_match {
+    1 + (mlen - 15 - lz4_min_match) / 255
+  } else {
+    0
+  }
+  3 + lz4_literals_price(litlen) + ml_extra
+}
+
+fn lz4_optimal_compress(
+  src : Bytes,
+  limit : Option[Int],
+  accelerated_chain_swap : Bool,
+  repeat_candidate_in_window : Bool,
+) -> Option[Bytes] {
+  let finder = Lz4MatchFinder::new(
+    src, accelerated_chain_swap, repeat_candidate_in_window,
+  )
+  let out = Lz4SequenceWriter::new(src, limit, true)
+  let len = src.length()
+  if len < lz4_mf_limit {
+    return out.finish()
+  }
+  let mf_limit = len - lz4_mf_limit
+  let match_limit = len - lz4_last_literals
+  let sufficient_len = lz4_opt_num - 1
+  let attempts = lz4_level12_attempts
+  let opt_size = lz4_opt_num + lz4_trailing_literals
+  let opt_price : FixedArray[Int] = FixedArray::make(opt_size, 0)
+  let opt_mlen : FixedArray[Int] = FixedArray::make(opt_size, 0)
+  let opt_off : FixedArray[Int] = FixedArray::make(opt_size, 0)
+  let opt_litlen : FixedArray[Int] = FixedArray::make(opt_size, 0)
+  let path_mlen : FixedArray[Int] = FixedArray::make(opt_size + 1, 0)
+  let path_off : FixedArray[Int] = FixedArray::make(opt_size + 1, 0)
+
+  let mut ip = 0
+  while ip <= mf_limit {
+    let first = match
+    finder.longer_match(ip, match_limit, lz4_min_match - 1, attempts) {
+      Some(m) => m
+      None => {
+        ip += 1
+        continue
+      }
+    }
+    if first.len > sufficient_len {
+      if !out.sequence(ip, first.start - first.source, first.len) {
+        return None
+      }
+      ip = first.start + first.len
+      continue
+    }
+
+    let llen = ip - out.anchor
+    let mut k = 0
+    while k < lz4_min_match {
+      opt_price[k] = lz4_literals_price(llen + k)
+      opt_mlen[k] = 1
+      opt_off[k] = 0
+      opt_litlen[k] = llen + k
+      k += 1
+    }
+    let first_off = first.start - first.source
+    let mut ml = lz4_min_match
+    while ml <= first.len {
+      opt_price[ml] = lz4_sequence_price(llen, ml)
+      opt_mlen[ml] = ml
+      opt_off[ml] = first_off
+      opt_litlen[ml] = llen
+      ml += 1
+    }
+    let mut last = first.len
+    // pad_literals
+    let mut pk = 1
+    while pk <= lz4_trailing_literals {
+      opt_price[last + pk] = opt_price[last] + lz4_literals_price(pk)
+      opt_mlen[last + pk] = 1
+      opt_off[last + pk] = 0
+      opt_litlen[last + pk] = pk
+      pk += 1
+    }
+
+    let mut has_forced = false
+    let mut forced_cur = 0
+    let mut forced_len = 0
+    let mut forced_off = 0
+    let mut cur = 1
+    while cur < last && ip + cur <= mf_limit {
+      let here = opt_price[cur]
+      let next_not_worse = opt_price[cur + 1] <= here
+      // full_update = true for LEVEL_12
+      if next_not_worse && opt_price[cur + lz4_min_match] < here + 3 {
+        cur += 1
+        continue
+      }
+      let m = match
+      finder.longer_match(
+        ip + cur,
+        match_limit,
+        lz4_min_match - 1,
+        attempts,
+      ) {
+        Some(v) => v
+        None => {
+          cur += 1
+          continue
+        }
+      }
+      if m.len > sufficient_len || cur + m.len >= lz4_opt_num {
+        has_forced = true
+        forced_cur = cur
+        forced_len = m.len
+        forced_off = m.start - m.source
+        break
+      }
+      // relax_literals
+      let base_p = opt_price[cur]
+      let base_ll = opt_litlen[cur]
+      let base_ll_price = lz4_literals_price(base_ll)
+      let mut rk = 1
+      while rk < lz4_min_match {
+        let price = base_p - base_ll_price + lz4_literals_price(base_ll + rk)
+        if price < opt_price[cur + rk] {
+          opt_price[cur + rk] = price
+          opt_mlen[cur + rk] = 1
+          opt_off[cur + rk] = 0
+          opt_litlen[cur + rk] = base_ll + rk
+        }
+        rk += 1
+      }
+      // relax_match
+      let (litlen, base_price) = if opt_mlen[cur] == 1 {
+        let ll = opt_litlen[cur]
+        let bp = if cur > ll { opt_price[cur - ll] } else { 0 }
+        (ll, bp)
+      } else {
+        (0, opt_price[cur])
+      }
+      let horizon = last + lz4_trailing_literals
+      let m_off = m.start - m.source
+      let mut rml = lz4_min_match
+      while rml <= m.len {
+        let pos = cur + rml
+        let price = base_price + lz4_sequence_price(litlen, rml)
+        if pos > horizon || price <= opt_price[pos] {
+          if rml == m.len && pos > last {
+            last = pos
+          }
+          opt_price[pos] = price
+          opt_mlen[pos] = rml
+          opt_off[pos] = m_off
+          opt_litlen[pos] = litlen
+        }
+        rml += 1
+      }
+      // pad_literals
+      let mut pk2 = 1
+      while pk2 <= lz4_trailing_literals {
+        opt_price[last + pk2] = opt_price[last] + lz4_literals_price(pk2)
+        opt_mlen[last + pk2] = 1
+        opt_off[last + pk2] = 0
+        opt_litlen[last + pk2] = pk2
+        pk2 += 1
+      }
+      cur += 1
+    }
+
+    let (start_pos, final_mlen, final_off) = if has_forced {
+      (forced_cur, forced_len, forced_off)
+    } else {
+      (last - opt_mlen[last], opt_mlen[last], opt_off[last])
+    }
+    // trace_back
+    let mut path_len = 0
+    path_mlen[0] = final_mlen
+    path_off[0] = final_off
+    path_len = 1
+    let mut tpos = start_pos
+    while tpos > 0 {
+      let n_mlen = opt_mlen[tpos]
+      let n_off = opt_off[tpos]
+      path_mlen[path_len] = n_mlen
+      path_off[path_len] = n_off
+      path_len += 1
+      tpos -= n_mlen
+    }
+    let mut pi = path_len - 1
+    while pi >= 0 {
+      let step_mlen = path_mlen[pi]
+      if step_mlen == 1 {
+        ip += 1
+      } else {
+        if !out.sequence(ip, path_off[pi], step_mlen) {
+          return None
+        }
+        ip += step_mlen
+      }
+      pi -= 1
+    }
+  }
+  out.finish()
+}

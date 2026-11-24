@@ -1,0 +1,503 @@
+///| UnityFS container codec using byte-exact LZ4HC compressors.
+
+let unityfs_magic : Bytes = bytes_from_array([
+  (0x55).to_byte(),
+  (0x6e).to_byte(),
+  (0x69).to_byte(),
+  (0x74).to_byte(),
+  (0x79).to_byte(),
+  (0x46).to_byte(),
+  (0x53).to_byte(),
+  (0x00).to_byte(),
+])
+
+let unityfs_compression_mask : UInt = 0x3FU
+
+let unityfs_blocks_info_at_end : UInt = 0x80U
+
+let unityfs_block_info_need_padding : UInt = 0x200U
+
+let unityfs_compression_none : UInt = 0U
+
+let unityfs_compression_lz4 : UInt = 2U
+
+let unityfs_compression_lz4hc : UInt = 3U
+
+let unityfs_max_lz4_ratio : Int = 255
+
+let unityfs_give_up_after : Int = 4
+
+fn unityfs_is_lz4(c : UInt) -> Bool {
+  c == unityfs_compression_lz4 || c == unityfs_compression_lz4hc
+}
+
+fn next_multiple_of_16(v : Int) -> Int {
+  let rem = v & 15
+  if rem == 0 {
+    v
+  } else {
+    v + (16 - rem)
+  }
+}
+
+struct UnityFsRawRegion {
+  start : Int
+  end : Int
+  lz4_size : Option[Int]
+}
+
+struct UnityFsLayout {
+  engine_version : String
+  regions : Array[UnityFsRawRegion]
+}
+
+///| One LZ4 region of a UnityFS archive: a storage block or compressed blocks info.
+pub struct Lz4Region {
+  pub start : Int
+  pub end : Int
+  pub decompressed_len : Int
+  pub compressor : Option[Compressor]
+}
+
+///| Analysis report for a UnityFS archive.
+pub struct UnityFsReport {
+  pub engine_version : String
+  pub lz4_regions : Array[Lz4Region]
+}
+
+fn unityfs_decompress(compressed : Bytes, size : Int) -> Option[Bytes] {
+  if size / unityfs_max_lz4_ratio > compressed.length() {
+    return None
+  }
+  match lz4_decompress(compressed, size) {
+    Ok(raw) => if raw.length() == size { Some(raw) } else { None }
+    Err(_) => None
+  }
+}
+
+fn unityfs_read_cstr(buf : Bytes, pos : Int) -> Option[(Bytes, Int)] {
+  match bytes_find_byte_from(buf, (0).to_byte(), pos) {
+    Some(end) => Some((bytes_slice(buf, pos, end), end + 1))
+    None => None
+  }
+}
+
+fn unityfs_parse_layout(input : Bytes) -> Option[UnityFsLayout] {
+  let ilen = input.length()
+  if ilen < 8 || !bytes_starts_with(input, unityfs_magic) {
+    return None
+  }
+  let mut pos = 8
+  if pos + 4 > ilen {
+    return None
+  }
+  let archive_version = read_u32_be(input, pos)
+  pos += 4
+  let (unity_version, p1) = match unityfs_read_cstr(input, pos) {
+    Some(v) => v
+    None => return None
+  }
+  let (unity_revision, p2) = match unityfs_read_cstr(input, p1) {
+    Some(v) => v
+    None => return None
+  }
+  pos = p2
+  if pos + 20 > ilen {
+    return None
+  }
+  // skip size (8 bytes)
+  pos += 8
+  let info_compressed_size_u = read_u32_be(input, pos)
+  pos += 4
+  let info_size_u = read_u32_be(input, pos)
+  pos += 4
+  let flags = read_u32_be(input, pos)
+  pos += 4
+  if info_compressed_size_u > 0x7FFFFFFFU || info_size_u > 0x7FFFFFFFU {
+    return None
+  }
+  let info_compressed_size = info_compressed_size_u.to_int()
+  let info_size = info_size_u.to_int()
+  let mut header_end = pos
+  if archive_version >= 7U {
+    header_end = next_multiple_of_16(header_end)
+  }
+  let info_at_end = (flags & unityfs_blocks_info_at_end) != 0U
+  let (info_start, info_end) = if info_at_end {
+    if ilen < info_compressed_size {
+      return None
+    }
+    (ilen - info_compressed_size, ilen)
+  } else {
+    match int_checked_add(header_end, info_compressed_size) {
+      Some(end) => (header_end, end)
+      None => return None
+    }
+  }
+  if info_start >= info_end || info_start < header_end || info_end > ilen {
+    return None
+  }
+  let mut storage_start = if info_at_end { header_end } else { info_end }
+  if (flags & unityfs_block_info_need_padding) != 0U {
+    storage_start = next_multiple_of_16(storage_start)
+  }
+  let storage_end = if info_at_end { info_start } else { ilen }
+  if storage_start > storage_end {
+    return None
+  }
+  let info_compression = flags & unityfs_compression_mask
+  let info_compressed = bytes_slice(input, info_start, info_end)
+  let info = if info_compression == unityfs_compression_none &&
+  info_compressed.length() == info_size {
+    info_compressed
+  } else if unityfs_is_lz4(info_compression) {
+    match unityfs_decompress(info_compressed, info_size) {
+      Some(v) => v
+      None => return None
+    }
+  } else {
+    return None
+  }
+  let info_lz4_size = if unityfs_is_lz4(info_compression) {
+    Some(info_size)
+  } else {
+    None
+  }
+  let regions : Array[UnityFsRawRegion] = []
+  if info_at_end {
+    regions.push(UnityFsRawRegion::{
+      start: 0,
+      end: storage_start,
+      lz4_size: None,
+    })
+  } else {
+    regions.push(UnityFsRawRegion::{ start: 0, end: info_start, lz4_size: None })
+    regions.push(UnityFsRawRegion::{
+      start: info_start,
+      end: info_end,
+      lz4_size: info_lz4_size,
+    })
+    regions.push(UnityFsRawRegion::{
+      start: info_end,
+      end: storage_start,
+      lz4_size: None,
+    })
+  }
+  // hash[16], block_count(u32), then block table entries (10 bytes each)
+  if info.length() < 20 {
+    return None
+  }
+  let block_count_u = read_u32_be(info, 16)
+  if block_count_u > 0x7FFFFFFFU {
+    return None
+  }
+  let block_count = block_count_u.to_int()
+  if block_count > info.length() / 10 {
+    return None
+  }
+  let mut tpos = 20
+  let mut offset = storage_start
+  let mut bi = 0
+  while bi < block_count {
+    if tpos + 10 > info.length() {
+      return None
+    }
+    let size_u = read_u32_be(info, tpos)
+    let csize_u = read_u32_be(info, tpos + 4)
+    let bflags = read_u16_be(info, tpos + 8)
+    tpos += 10
+    if size_u > 0x7FFFFFFFU || csize_u > 0x7FFFFFFFU {
+      return None
+    }
+    let end = match int_checked_add(offset, csize_u.to_int()) {
+      Some(e) => if e <= storage_end { e } else { return None }
+      None => return None
+    }
+    let bcomp = bflags.to_uint() & unityfs_compression_mask
+    let b_lz4 = if unityfs_is_lz4(bcomp) { Some(size_u.to_int()) } else { None }
+    regions.push(UnityFsRawRegion::{ start: offset, end, lz4_size: b_lz4 })
+    offset = end
+    bi += 1
+  }
+  if offset != storage_end {
+    return None
+  }
+  if info_at_end {
+    regions.push(UnityFsRawRegion::{
+      start: info_start,
+      end: info_end,
+      lz4_size: info_lz4_size,
+    })
+  }
+  let ver_bytes = if unity_revision.length() == 0 {
+    unity_version
+  } else {
+    unity_revision
+  }
+  Some(UnityFsLayout::{
+    engine_version: bytes_to_utf8_lossy(ver_bytes),
+    regions,
+  })
+}
+
+struct UnityFsCandidates {
+  order : FixedArray[Compressor]
+  mut hit : Bool
+  mut misses : Int
+}
+
+fn str_starts_with(s : String, prefix : String) -> Bool {
+  let sb = s.to_bytes()
+  let pb = prefix.to_bytes()
+  bytes_starts_with(sb, pb)
+}
+
+fn UnityFsCandidates::for_engine(engine_version : String) -> UnityFsCandidates {
+  let order : FixedArray[Compressor] = [
+    Compressor::V1_10_0_L12,
+    Compressor::V1_9_1_L12,
+    Compressor::R131_L16,
+  ]
+  let preferred = if str_starts_with(engine_version, "2017.") {
+    Some(Compressor::R131_L16)
+  } else if str_starts_with(engine_version, "2021.") {
+    Some(Compressor::V1_9_1_L12)
+  } else if str_starts_with(engine_version, "2022.") ||
+  str_starts_with(engine_version, "6000.") {
+    Some(Compressor::V1_10_0_L12)
+  } else {
+    None
+  }
+  match preferred {
+    Some(p) => {
+      let mut idx = -1
+      let mut i = 0
+      while i < 3 {
+        if compressor_eq(order[i], p) {
+          idx = i
+          break
+        }
+        i += 1
+      }
+      if idx > 0 {
+        let mut j = idx
+        while j > 0 {
+          order[j] = order[j - 1]
+          j -= 1
+        }
+        order[0] = p
+      }
+    }
+    None => ()
+  }
+  UnityFsCandidates::{ order, hit: false, misses: 0 }
+}
+
+fn UnityFsCandidates::given_up(self : UnityFsCandidates) -> Bool {
+  !self.hit && self.misses >= unityfs_give_up_after
+}
+
+fn UnityFsCandidates::reproduce(
+  self : UnityFsCandidates,
+  raw : Bytes,
+  compressed : Bytes,
+) -> Option[Compressor] {
+  let mut i = 0
+  while i < 3 {
+    let c = self.order[i]
+    match c.compress(raw, compressed.length()) {
+      Some(out) =>
+      if bytes_eq(out, compressed) {
+        let mut j = i
+        while j > 0 {
+          self.order[j] = self.order[j - 1]
+          j -= 1
+        }
+        self.order[0] = c
+        self.hit = true
+        return Some(c)
+      }
+      None => ()
+    }
+    i += 1
+  }
+  self.misses += 1
+  None
+}
+
+fn unityfs_convert(
+  input : Bytes,
+  config : EncodeConfig,
+  budget : EncodeBudget,
+) -> Result[Option[(Array[Pcf2Segment], UnityFsReport)], Error] {
+  let layout = match unityfs_parse_layout(input) {
+    Some(l) => l
+    None => return Ok(None)
+  }
+  let candidates = UnityFsCandidates::for_engine(layout.engine_version)
+  let lz4_regions : Array[Lz4Region] = []
+  let segments : Array[Pcf2Segment] = []
+  // Coalesce contiguous literal regions in O(1) and slice once on flush.
+  let mut lit_start = 0
+  let mut lit_end = 0
+  let mut ri = 0
+  while ri < layout.regions.length() {
+    let reg = layout.regions[ri]
+    match reg.lz4_size {
+      None =>
+      if reg.end > reg.start {
+        if lit_end == lit_start {
+          lit_start = reg.start
+          lit_end = reg.end
+        } else if lit_end == reg.start {
+          lit_end = reg.end
+        } else {
+          segments.push(Pcf2Segment::lit(bytes_slice(input, lit_start, lit_end)))
+          lit_start = reg.start
+          lit_end = reg.end
+        }
+      }
+      Some(size) => {
+        let bytes = bytes_slice(input, reg.start, reg.end)
+        let converted = if candidates.given_up() {
+          None
+        } else {
+          match unityfs_decompress(bytes, size) {
+            Some(raw) =>
+            match candidates.reproduce(raw, bytes) {
+              Some(c) => Some((c, raw))
+              None => None
+            }
+            None => None
+          }
+        }
+        let comp = match converted {
+          Some((compressor, raw)) =>
+          if u64_saturating_add(
+            budget.total_output,
+            raw.length().to_int64().to_uint64(),
+          ) <=
+          config.max_total_output {
+            match budget.consume(raw.length(), config) {
+              Err(e) => return Err(e)
+              Ok(_) => ()
+            }
+            if lit_end > lit_start {
+              segments.push(Pcf2Segment::lit(bytes_slice(input, lit_start, lit_end)))
+              lit_start = 0
+              lit_end = 0
+            }
+            segments.push(Pcf2Segment::{
+              kind: SegmentKind::UnityFs.to_u8(),
+              flags: (0).to_byte(),
+              orig_len: bytes.length().to_int64().to_uint64(),
+              meta: bytes_from_array([compressor.to_u8()]),
+              data: raw,
+            })
+            Some(compressor)
+          } else {
+            if reg.end > reg.start {
+              if lit_end == lit_start {
+                lit_start = reg.start
+                lit_end = reg.end
+              } else if lit_end == reg.start {
+                lit_end = reg.end
+              } else {
+                segments.push(Pcf2Segment::lit(bytes_slice(input, lit_start, lit_end)))
+                lit_start = reg.start
+                lit_end = reg.end
+              }
+            }
+            None
+          }
+          None => {
+            if reg.end > reg.start {
+              if lit_end == lit_start {
+                lit_start = reg.start
+                lit_end = reg.end
+              } else if lit_end == reg.start {
+                lit_end = reg.end
+              } else {
+                segments.push(Pcf2Segment::lit(bytes_slice(input, lit_start, lit_end)))
+                lit_start = reg.start
+                lit_end = reg.end
+              }
+            }
+            None
+          }
+        }
+        lz4_regions.push(Lz4Region::{
+          start: reg.start,
+          end: reg.end,
+          decompressed_len: size,
+          compressor: comp,
+        })
+      }
+    }
+    ri += 1
+  }
+  if lit_end > lit_start {
+    segments.push(Pcf2Segment::lit(bytes_slice(input, lit_start, lit_end)))
+  }
+  Ok(Some((segments, UnityFsReport::{ engine_version: layout.engine_version, lz4_regions })))
+}
+
+///| Analyze a UnityFS archive with default config and report each LZ4 region.
+pub fn analyze_unityfs(input : Bytes) -> Option[UnityFsReport] {
+  match unityfs_convert(input, EncodeConfig::default(), EncodeBudget::new()) {
+    Ok(Some((_, report))) => Some(report)
+    _ => None
+  }
+}
+
+fn encode_unityfs(
+  input : Bytes,
+  config : EncodeConfig,
+  budget : EncodeBudget,
+) -> Result[Option[Array[Pcf2Segment]], Error] {
+  match unityfs_convert(input, config, budget) {
+    Ok(Some((segs, _))) => Ok(Some(segs))
+    Ok(None) => Ok(None)
+    Err(e) => Err(e)
+  }
+}
+
+fn decode_unityfs_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  if segment.meta.length() != 1 {
+    return Err(
+      Error::InvalidSegment("unityfs meta must be exactly the compressor id"),
+    )
+  }
+  let compressor = match Compressor::from_u8(segment.meta[0]) {
+    Ok(c) => c
+    Err(e) => return Err(e)
+  }
+  let orig_len = match u64_to_int_checked(segment.orig_len) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match budget.consume(orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match compressor.compress(segment.data, orig_len) {
+    Some(out) =>
+    if out.length() == orig_len {
+      Ok(out)
+    } else {
+      Err(
+        Error::InvalidSegment(
+          "unityfs payload does not recompress to orig_len",
+        ),
+      )
+    }
+    None =>
+    Err(
+      Error::InvalidSegment("unityfs payload does not recompress to orig_len"),
+    )
+  }
+}

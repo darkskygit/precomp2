@@ -1,0 +1,105 @@
+///| ZIP and SWF container codecs wrapping DEFLATE and zlib streams.
+
+let zip_local_magic : Bytes = bytes_from_array([
+  (0x50).to_byte(),
+  (0x4B).to_byte(),
+  (0x03).to_byte(),
+  (0x04).to_byte(),
+])
+
+let swf_cws_magic : Bytes = "CWS".to_bytes()
+
+fn encode_zip(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Array[Pcf2Segment]], Error] {
+  let ilen = input.length()
+  if ilen < 4 || !bytes_starts_with(input, zip_local_magic) {
+    return Ok(None)
+  }
+  let segments : Array[Pcf2Segment] = []
+  let mut cursor = 0
+  let mut offset = 0
+  while 30 <= ilen - offset {
+    if !bytes_starts_with_at(input, offset, zip_local_magic) {
+      break
+    }
+    let flags = read_u16_le(input, offset + 6)
+    if (flags & 0x0008) != 0 {
+      return Ok(None)
+    }
+    let compression = read_u16_le(input, offset + 8)
+    let csize_u = read_u32_le(input, offset + 18)
+    if csize_u > 0x7FFFFFFFU {
+      break
+    }
+    let compressed_size = csize_u.to_int()
+    let name_len = read_u16_le(input, offset + 26)
+    let extra_len = read_u16_le(input, offset + 28)
+    let hdr_tail = match int_checked_add(30, name_len) {
+      Some(v) =>
+      match int_checked_add(v, extra_len) {
+        Some(v2) => v2
+        None => break
+      }
+      None => break
+    }
+    let data_start = match int_checked_add(offset, hdr_tail) {
+      Some(v) => v
+      None => break
+    }
+    let data_end = match int_checked_add(data_start, compressed_size) {
+      Some(e) => e
+      None => break
+    }
+    if data_end > ilen {
+      break
+    }
+    if cursor < data_start {
+      segments.push(Pcf2Segment::lit(bytes_slice(input, cursor, data_start)))
+    }
+    let slice = bytes_slice(input, data_start, data_end)
+    if compression == 8 {
+      match encode_deflate(slice, config, depth, budget) {
+        Ok(Some(seg)) => segments.push(seg)
+        Ok(None) => return Ok(None)
+        Err(e) => return Err(e)
+      }
+    } else {
+      segments.push(Pcf2Segment::lit(slice))
+    }
+    cursor = data_end
+    offset = data_end
+  }
+  if segments.length() == 0 {
+    return Ok(None)
+  }
+  if cursor < ilen {
+    segments.push(Pcf2Segment::lit(bytes_slice(input, cursor, ilen)))
+  }
+  Ok(Some(segments))
+}
+
+fn encode_swf(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Array[Pcf2Segment]], Error] {
+  let ilen = input.length()
+  if ilen < 8 || !bytes_starts_with(input, swf_cws_magic) {
+    return Ok(None)
+  }
+  let header = bytes_slice(input, 0, 8)
+  let body = bytes_slice(input, 8, ilen)
+  let segments : Array[Pcf2Segment] = []
+  segments.push(Pcf2Segment::lit(header))
+  match encode_zlib(body, config, depth, budget) {
+    Ok(Some(seg)) => segments.push(seg)
+    Ok(None) => return Ok(None)
+    Err(e) => return Err(e)
+  }
+  Ok(Some(segments))
+}

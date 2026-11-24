@@ -1,0 +1,54 @@
+///| Nested payload selection during encoding and recursive unpacking during decoding.
+
+fn choose_payload(
+  plain : Bytes,
+  orig_len : Int,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[(Byte, Bytes), Error] {
+  if depth < config.max_depth && orig_len > 0 {
+    let ratio = plain.length().to_double() / orig_len.to_double()
+    let next_total = u64_saturating_add(
+      budget.total_output,
+      plain.length().to_int64().to_uint64(),
+    )
+    if ratio <= config.max_expand_ratio && next_total <= config.max_total_output {
+      let nested_segments = match
+      encode_segments(plain, config, depth + 1, budget) {
+        Ok(segs) => segs
+        Err(e) => return Err(e)
+      }
+      let nested_file = Pcf2File::from_segments(nested_segments)
+      let nested_bytes = match nested_file.encode() {
+        Ok(b) => b
+        Err(e) => return Err(e)
+      }
+      match budget.consume(plain.length(), config) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      return Ok(((1).to_byte(), nested_bytes))
+    }
+  }
+  Ok(((0).to_byte(), plain))
+}
+
+fn decode_payload(
+  payload_kind : Byte,
+  payload : Bytes,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  if payload_kind == (0).to_byte() {
+    return Ok(payload)
+  }
+  if payload_kind != (1).to_byte() {
+    return Err(Error::InvalidSegment("payload_kind"))
+  }
+  if depth >= config.max_depth {
+    return Err(Error::Other("nested depth exceeded"))
+  }
+  decode_stream(payload, config, depth + 1, budget)
+}

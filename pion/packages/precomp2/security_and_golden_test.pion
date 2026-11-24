@@ -1,0 +1,737 @@
+///| Security bounds tests, P2 parity regressions, shared v1 fixture, and golden LZ4HC byte-exact tests.
+
+import "flate"
+
+let test_sha_k : FixedArray[UInt] = [
+  0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+  0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+  0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+  0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+  0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+  0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+  0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+  0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+]
+
+let test_hex_chars : FixedArray[Char] = [
+  '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+]
+
+fn test_rotr(x : UInt, n : Int) -> UInt {
+  (x >> n) | (x << (32 - n))
+}
+
+fn test_sha256_hex(data : Bytes) -> String {
+  let dlen = data.length()
+  let mut h0 = 0x6a09e667U
+  let mut h1 = 0xbb67ae85U
+  let mut h2 = 0x3c6ef372U
+  let mut h3 = 0xa54ff53aU
+  let mut h4 = 0x510e527fU
+  let mut h5 = 0x9b05688cU
+  let mut h6 = 0x1f83d9abU
+  let mut h7 = 0x5be0cd19U
+  let pad_len = (dlen + 9 + 63) / 64 * 64
+  let padded = Bytes::new(pad_len)
+  let mut i = 0
+  while i < dlen {
+    padded[i] = data[i]
+    i += 1
+  }
+  padded[dlen] = (0x80).to_byte()
+  let bit_len = dlen.to_int64().to_uint64() * 8UL
+  let mut bi = 0
+  while bi < 8 {
+    padded[pad_len - 1 - bi] = ((bit_len >> (bi * 8)) & 0xFFUL).to_int().to_byte()
+    bi += 1
+  }
+  let w : FixedArray[UInt] = FixedArray::make(64, 0U)
+  let mut off = 0
+  while off < pad_len {
+    let mut j = 0
+    while j < 16 {
+      let p = off + j * 4
+      w[j] = (padded[p].to_int().to_uint() << 24) |
+      (padded[p + 1].to_int().to_uint() << 16) |
+      (padded[p + 2].to_int().to_uint() << 8) |
+      padded[p + 3].to_int().to_uint()
+      j += 1
+    }
+    while j < 64 {
+      let s0 = test_rotr(w[j - 15], 7) ^ test_rotr(w[j - 15], 18) ^ (w[j - 15] >> 3)
+      let s1 = test_rotr(w[j - 2], 17) ^ test_rotr(w[j - 2], 19) ^ (w[j - 2] >> 10)
+      w[j] = w[j - 16] + s0 + w[j - 7] + s1
+      j += 1
+    }
+    let mut a = h0
+    let mut b = h1
+    let mut c = h2
+    let mut d = h3
+    let mut e = h4
+    let mut f = h5
+    let mut g = h6
+    let mut hh = h7
+    let mut k = 0
+    while k < 64 {
+      let s1 = test_rotr(e, 6) ^ test_rotr(e, 11) ^ test_rotr(e, 25)
+      let ch = (e & f) ^ ((e ^ 0xFFFFFFFFU) & g)
+      let t1 = hh + s1 + ch + test_sha_k[k] + w[k]
+      let s0 = test_rotr(a, 2) ^ test_rotr(a, 13) ^ test_rotr(a, 22)
+      let maj = (a & b) ^ (a & c) ^ (b & c)
+      let t2 = s0 + maj
+      hh = g
+      g = f
+      f = e
+      e = d + t1
+      d = c
+      c = b
+      b = a
+      a = t1 + t2
+      k += 1
+    }
+    h0 = h0 + a
+    h1 = h1 + b
+    h2 = h2 + c
+    h3 = h3 + d
+    h4 = h4 + e
+    h5 = h5 + f
+    h6 = h6 + g
+    h7 = h7 + hh
+    off += 64
+  }
+  let hs : FixedArray[UInt] = [h0, h1, h2, h3, h4, h5, h6, h7]
+  let sb = StringBuilder::new()
+  let mut hi = 0
+  while hi < 8 {
+    let v = hs[hi]
+    let mut sh = 28
+    while sh >= 0 {
+      sb.write_char(test_hex_chars[((v >> sh) & 0xFU).to_int()])
+      sh -= 4
+    }
+    hi += 1
+  }
+  sb.to_string()
+}
+
+struct GoldenRng {
+  mut s : UInt64
+}
+
+fn GoldenRng::next(self : GoldenRng) -> UInt64 {
+  self.s = self.s ^ (self.s << 13)
+  self.s = self.s ^ (self.s >> 7)
+  self.s = self.s ^ (self.s << 17)
+  self.s
+}
+
+fn GoldenRng::below(self : GoldenRng, n : Int) -> Int {
+  let m = if n > 1 { n } else { 1 }
+  (self.next() % m.to_int64().to_uint64()).to_int()
+}
+
+fn GoldenRng::bytes(self : GoldenRng, len : Int) -> Bytes {
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = (self.next() & 0xFFUL).to_int().to_byte()
+    i += 1
+  }
+  out
+}
+
+fn golden_boundary_corpus() -> Array[Bytes] {
+  let rng = GoldenRng::{ s: 0x853c49e6748fea9bUL }
+  let inputs : Array[Bytes] = []
+  let mut len = 0
+  while len <= 96 {
+    let b = Bytes::new(len)
+    let mut i = 0
+    while i < len {
+      let r = rng.below(4)
+      b[i] = if r == 0 {
+        (97 + rng.below(8)).to_byte()
+      } else if r == 1 {
+        (rng.next() & 0xFFUL).to_int().to_byte()
+      } else {
+        (rng.next() % 3UL).to_int().to_byte()
+      }
+      i += 1
+    }
+    inputs.push(b)
+    len += 1
+  }
+  let lens : Array[Int] = [
+    255, 256, 257, 4095, 4096, 4097, 65534, 65535, 65536, 65537, 131071, 131072,
+  ]
+  let fox = "the quick brown fox jumps over the lazy dog. ".to_bytes()
+  let letters = "aeiourstln ".to_bytes()
+  let mut li = 0
+  while li < lens.length() {
+    let l = lens[li]
+    let mut kind = 0
+    while kind < 3 {
+      let out = Bytes::new(l)
+      let mut pos = 0
+      while pos < l {
+        if kind == 0 {
+          let mut k = 0
+          while k < fox.length() && pos < l {
+            out[pos] = fox[k]
+            pos += 1
+            k += 1
+          }
+        } else if kind == 1 {
+          let ch = (rng.next() & 0xFFUL).to_int().to_byte()
+          let cnt = 1 + rng.below(700)
+          let mut k = 0
+          while k < cnt && pos < l {
+            out[pos] = ch
+            pos += 1
+            k += 1
+          }
+          let sep = (rng.next() & 0xFFUL).to_int().to_byte()
+          if pos < l {
+            out[pos] = sep
+            pos += 1
+          }
+        } else {
+          let mut k = 0
+          while k < 64 {
+            let b = letters[rng.below(11)]
+            if pos < l {
+              out[pos] = b
+              pos += 1
+            }
+            k += 1
+          }
+        }
+      }
+      inputs.push(out)
+      kind += 1
+    }
+    li += 1
+  }
+  let m3s : Array[Int] = [33, 25]
+  let mut mi = 0
+  while mi < m3s.length() {
+    let m3_start = m3s[mi]
+    let target = rng.bytes(200)
+    let v : Array[Byte] = []
+    let push_b = fn(bs : Bytes) -> Unit {
+      let mut i = 0
+      while i < bs.length() {
+        v.push(bs[i])
+        i += 1
+      }
+    }
+    let push_sl = fn(bs : Bytes, s : Int, e : Int) -> Unit {
+      let mut i = s
+      while i < e {
+        v.push(bs[i])
+        i += 1
+      }
+    }
+    push_b(rng.bytes(64))
+    push_sl(target, 0, 30)
+    v.push(((target[30].to_int() + 1) & 0xFF).to_byte())
+    push_b(rng.bytes(64))
+    v.push(((target[4].to_int() + 1) & 0xFF).to_byte())
+    push_sl(target, 5, 45)
+    v.push(((target[45].to_int() + 1) & 0xFF).to_byte())
+    push_b(rng.bytes(64))
+    v.push(((target[m3_start - 1].to_int() + 1) & 0xFF).to_byte())
+    push_sl(target, m3_start, m3_start + 46)
+    v.push(((target[m3_start + 46].to_int() + 1) & 0xFF).to_byte())
+    push_b(rng.bytes(64))
+    push_b(target)
+    inputs.push(arr_to_bytes(v))
+    mi += 1
+  }
+  inputs
+}
+
+fn golden_long_run_corpus() -> Array[Bytes] {
+  let rng = GoldenRng::{ s: 0x2545f4914f6cdd1dUL }
+  let inputs : Array[Bytes] = []
+  let runs : Array[Int] = [65536, 140000]
+  let prefixes : Array[Int] = [13, 40000]
+  let resumes : Array[Bool] = [false, true]
+  let mut ri = 0
+  while ri < runs.length() {
+    let run = runs[ri]
+    let mut pi = 0
+    while pi < prefixes.length() {
+      let prefix = prefixes[pi]
+      let mut rsi = 0
+      while rsi < resumes.length() {
+        let resume = resumes[rsi]
+        let v : Array[Byte] = []
+        let pb = rng.bytes(prefix)
+        let mut k = 0
+        while k < pb.length() {
+          v.push(pb[k])
+          k += 1
+        }
+        k = 0
+        while k < run {
+          v.push((0xaa).to_byte())
+          k += 1
+        }
+        if resume {
+          let gap = 1 + rng.below(32)
+          let gb = rng.bytes(gap)
+          k = 0
+          while k < gb.length() {
+            v.push(gb[k])
+            k += 1
+          }
+          let r2 = 1 + rng.below(run)
+          k = 0
+          while k < r2 {
+            v.push((0xaa).to_byte())
+            k += 1
+          }
+        }
+        let tb = rng.bytes(64)
+        k = 0
+        while k < tb.length() {
+          v.push(tb[k])
+          k += 1
+        }
+        inputs.push(arr_to_bytes(v))
+        rsi += 1
+      }
+      pi += 1
+    }
+    ri += 1
+  }
+  let pairs : Array[(Int, Int)] = [(5, 0), (8, 0), (8, 1), (8, -1), (40, 0)]
+  let mut qi = 0
+  while qi < pairs.length() {
+    let (first_run, shift) = pairs[qi]
+    let v : Array[Byte] = []
+    let p1 = rng.bytes(17)
+    let mut k = 0
+    while k < p1.length() {
+      v.push(p1[k])
+      k += 1
+    }
+    k = 0
+    while k < first_run {
+      v.push((0xbb).to_byte())
+      k += 1
+    }
+    let floor = v.length() - 4
+    let gap = floor + 65535 + shift - v.length()
+    k = 0
+    while k < gap {
+      v.push((rng.next() % 0xbbUL).to_int().to_byte())
+      k += 1
+    }
+    k = 0
+    while k < 100 {
+      v.push((0xbb).to_byte())
+      k += 1
+    }
+    let t2 = rng.bytes(64)
+    k = 0
+    while k < t2.length() {
+      v.push(t2[k])
+      k += 1
+    }
+    inputs.push(arr_to_bytes(v))
+    qi += 1
+  }
+  inputs
+}
+
+fn wrap_single_segment_pcf2(seg : Pcf2Segment) -> Bytes {
+  match Pcf2File::from_segments([seg]).encode() {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+}
+
+test "crafted_wraparound_and_budget_malicious_inputs_return_err" {
+  let cfg = DecodeConfig::default()
+
+  // 1. Base64 header_len = 0x7FFFFFFF (p1 + header_len signed wraparound)
+  let m1 : Array[Byte] = [(0).to_byte(), (0).to_byte()]
+  write_varint(0x7FFFFFFFUL, m1)
+  let b64_hdr_wrap = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Base64.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: arr_to_bytes(m1),
+    data: Bytes::new(0),
+  })
+  match decode_bytes(b64_hdr_wrap, cfg) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "base64 header wrap must return Err")
+  }
+
+  // 2. Base64 line_case = 2, line_count = 0x7FFFFFFF (offset + line_count wraparound)
+  let m2 : Array[Byte] = [(0).to_byte(), (0).to_byte(), (0).to_byte(), (2).to_byte()]
+  write_varint(0x7FFFFFFFUL, m2)
+  let b64_lc2_wrap = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Base64.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: arr_to_bytes(m2),
+    data: Bytes::new(0),
+  })
+  match decode_bytes(b64_lc2_wrap, cfg) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "base64 line_case 2 wrap must return Err")
+  }
+
+  // 3. Base64 line_case = 0, line_count = 0x7FFFFFFF (budget enforced before allocation)
+  let m3 : Array[Byte] = [(0).to_byte(), (0).to_byte(), (0).to_byte(), (0).to_byte()]
+  write_varint(0x7FFFFFFFUL, m3)
+  m3.push((0).to_byte())
+  let b64_giant_lines = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Base64.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: arr_to_bytes(m3),
+    data: "A".to_bytes(),
+  })
+  match decode_bytes(b64_giant_lines, DecodeConfig::{ max_depth: 4, max_total_output: 1024UL, recover: false }) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "base64 giant line_count must return Err without OOM")
+  }
+
+  // 4. Preflate corrections_len = 0x7FFFFFFF (p1 + corr_len wraparound)
+  let d4 : Array[Byte] = []
+  write_varint(0x7FFFFFFFUL, d4)
+  let dflt_wrap = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Dflt.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: make_test_bytes([0, 0]),
+    data: arr_to_bytes(d4),
+  })
+  match decode_bytes(dflt_wrap, cfg) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "preflate wrap must return Err")
+  }
+
+  // 5. Gzip header_len = 0x7FFFFFF8 (p1 + header_len + 8 wraparound)
+  let m5 : Array[Byte] = [(0).to_byte(), (0).to_byte()]
+  write_varint(0x7FFFFFF8UL, m5)
+  let gzip_wrap = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Gzip.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: arr_to_bytes(m5),
+    data: Bytes::new(0),
+  })
+  match decode_bytes(gzip_wrap, cfg) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "gzip wrap must return Err")
+  }
+
+  // 6. PNG idat_lengths sum wraparound (0x40000001 + 0x40000001)
+  let m6 : Array[Byte] = [
+    (1).to_byte(), (0).to_byte(), (0).to_byte(),
+    (0x78).to_byte(), (0x9C).to_byte(),
+    (0).to_byte(), (0).to_byte(), (0).to_byte(), (1).to_byte(),
+  ]
+  write_varint(2UL, m6)
+  write_varint(0x40000001UL, m6)
+  write_varint(0x40000001UL, m6)
+  m6.push((0).to_byte())
+  let png_wrap = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::PngIdat.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: arr_to_bytes(m6),
+    data: make_test_bytes([0, 0]),
+  })
+  match decode_bytes(png_wrap, cfg) {
+    Err(Error::LengthOverflow) => ()
+    Err(e) => debug_assert(false, "png idat sum wrap expected LengthOverflow, got " + e.to_string())
+    Ok(_) => debug_assert(false, "png idat sum wrap must return Err")
+  }
+
+  // 7. LZ4 decompress: empty slice, EOF immediately after match, overflow literal length
+  match lz4_decompress(Bytes::new(0), 0) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "lz4 empty slice must return Err")
+  }
+  // 4 literals "abcd", then match offset=1 len=4, then immediate EOF (no trailing literal token!)
+  let eof_after_match = make_test_bytes([0x40, 0x61, 0x62, 0x63, 0x64, 0x01, 0x00])
+  match lz4_decompress(eof_after_match, 8) {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "lz4 eof after match must return Err")
+  }
+
+  // 8. Legacy PDF BMP aligned stride wraparound (width = 0x7FFFFFFE, mode = 1)
+  let bmp_wrap = decode_pdf_bmp_payload(
+    Bytes::new(2048),
+    PdfBmpMeta::{ mode: (1).to_byte(), width: 0x7FFFFFFEU, height: 1U },
+  )
+  match bmp_wrap {
+    Err(_) => ()
+    Ok(_) => debug_assert(false, "bmp stride wrap must return Err")
+  }
+}
+
+test "p2_parity_stream_len_pdf_bits_unityfs_utf8_and_iccp_trailing" {
+  // 1. Stream decoder verifies decoded length == seg.orig_len
+  let valid_b64 = "SGVsbG8=\r\n".to_bytes()
+  let enc_b64 = match encode_bytes(valid_b64, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  let pf = match Pcf2File::decode(enc_b64) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  let bad_orig = Pcf2Segment::{
+    kind: pf.segments[0].kind,
+    flags: (0).to_byte(),
+    orig_len: 999UL,
+    meta: pf.segments[0].meta,
+    data: pf.segments[0].data,
+  }
+  match decode_bytes(wrap_single_segment_pcf2(bad_orig), DecodeConfig::default()) {
+    Err(Error::SizeMismatch(_, _)) => ()
+    _ => debug_assert(false, "expected SizeMismatch when decoded len != orig_len")
+  }
+
+  // 2. pdf_image rejects BitsPerComponent = 2^32 + 8 (no UInt64 -> Int truncation)
+  let fake_dict = PdfValue::Dict([
+    ("Subtype".to_bytes(), PdfValue::Name("Image".to_bytes())),
+    ("Width".to_bytes(), PdfValue::Int(1UL)),
+    ("Height".to_bytes(), PdfValue::Int(1UL)),
+    ("ColorSpace".to_bytes(), PdfValue::Name("DeviceRGB".to_bytes())),
+    ("BitsPerComponent".to_bytes(), PdfValue::Int(0x100000008UL)),
+  ])
+  match pdf_image_encode(make_test_bytes([1, 2, 3]), fake_dict) {
+    Ok(None) => ()
+    _ => debug_assert(false, "BitsPerComponent=2^32+8 must be rejected")
+  }
+
+  // 3. UnityFS UTF-8 lossy decoding preserves valid UTF-8 and replaces invalid bytes with U+FFFD
+  let utf8_mixed = make_test_bytes([0x32, 0x30, 0x32, 0x32, 0x2E, 0xC3, 0xA9, 0xFF, 0x61])
+  let decoded_ver = bytes_to_utf8_lossy(utf8_mixed)
+  debug_assert(decoded_ver == "2022.é\u{FFFD}a", "utf8 lossy mismatch")
+
+  // 4. PNG decode_png_icc rejects trailing bytes after zlib trailer
+  let profile = Bytes::new(132)
+  profile[3] = (132).to_byte()
+  profile[16] = (0x52).to_byte() // 'R'
+  profile[17] = (0x47).to_byte() // 'G'
+  profile[18] = (0x42).to_byte() // 'B'
+  profile[19] = (0x20).to_byte() // ' '
+  profile[36] = (0x61).to_byte() // 'a'
+  profile[37] = (0x63).to_byte() // 'c'
+  profile[38] = (0x73).to_byte() // 's'
+  profile[39] = (0x70).to_byte() // 'p'
+  let zlib_ok = flate::zlib_compress_default(profile)
+  let iccp_ok_arr : Array[Byte] = []
+  let pfx = "p\u{00}\u{00}".to_bytes()
+  let mut i = 0
+  while i < pfx.length() {
+    iccp_ok_arr.push(pfx[i])
+    i += 1
+  }
+  i = 0
+  while i < zlib_ok.length() {
+    iccp_ok_arr.push(zlib_ok[i])
+    i += 1
+  }
+  match decode_png_icc(arr_to_bytes(iccp_ok_arr), 100000UL) {
+    Ok(Some(got)) => debug_assert(bytes_eq(got, profile), "valid iccp profile mismatch")
+    _ => debug_assert(false, "valid iccp should decode")
+  }
+  // Append 1 trailing garbage byte -> must return Ok(None)
+  iccp_ok_arr.push((0x42).to_byte())
+  match decode_png_icc(arr_to_bytes(iccp_ok_arr), 100000UL) {
+    Ok(None) => ()
+    _ => debug_assert(false, "iccp with trailing byte must be discarded")
+  }
+}
+
+test "shared_fixture_pdf_v1_0_and_legacy_pdf_flate_paths" {
+  // Exact bytes of fixtures/pdf-v1-0.pcf (v1 container, 140-byte PDF)
+  let pdf_v1_0_pcf = make_test_bytes([
+    80, 67, 70, 50, 1, 0, 0, 0, 0, 0, 140, 0, 0, 0, 0, 0, 0, 0, 0, 0, 102, 0, 102,
+    37, 80, 68, 70, 45, 49, 46, 52, 10, 49, 32, 48, 32, 111, 98, 106, 10, 60, 60,
+    32, 47, 76, 101, 110, 103, 116, 104, 32, 49, 52, 32, 47, 70, 105, 108, 116,
+    101, 114, 32, 47, 70, 108, 97, 116, 101, 68, 101, 99, 111, 100, 101, 32, 47,
+    87, 105, 100, 116, 104, 32, 51, 32, 47, 72, 101, 105, 103, 104, 116, 32, 50,
+    32, 47, 66, 105, 116, 115, 80, 101, 114, 67, 111, 109, 112, 111, 110, 101,
+    110, 116, 32, 56, 32, 32, 62, 62, 10, 115, 116, 114, 101, 97, 109, 10, 0, 0,
+    15, 0, 15, 120, 156, 99, 100, 98, 102, 97, 101, 3, 0, 0, 62, 0, 22, 10, 0, 0,
+    23, 0, 23, 101, 110, 100, 115, 116, 114, 101, 97, 109, 10, 101, 110, 100, 111,
+    98, 106, 10, 37, 37, 69, 79, 70, 10,
+  ])
+  let pf = match Pcf2File::decode(pdf_v1_0_pcf) {
+    Ok(f) => f
+    Err(_) => {
+      debug_assert(false, "pdf-v1-0.pcf decode failed")
+      Pcf2File::from_segments([])
+    }
+  }
+  debug_assert(pf.header.version == 1, "expected v1 header")
+  debug_assert(pf.header.original_size == 140UL, "expected 140-byte original_size")
+  let decoded = match decode_bytes(pdf_v1_0_pcf, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "pdf-v1-0.pcf decode_bytes failed")
+      Bytes::new(0)
+    }
+  }
+  debug_assert(decoded.length() == 140, "decoded pdf length 140")
+  debug_assert(bytes_starts_with(decoded, "%PDF-1.4\n1 0 obj".to_bytes()), "pdf header")
+
+  // Genuine legacy PdfFlate segment metadata validation (transform=1 predictor, transform=2 BMP)
+  let pred_params = PdfDecodeParms::{ predictor: (12).to_byte(), colors: (3).to_byte(), bpc: (8).to_byte(), columns: 2U }
+  let raw_pixels = make_test_bytes([10, 20, 30, 40, 50, 60, 15, 25, 35, 45, 55, 65])
+  let pred_out = match encode_pdf_predictor(raw_pixels, pred_params) {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "legacy encode_pdf_predictor failed")
+      Bytes::new(0)
+    }
+  }
+  debug_assert(pred_out[6] == (5).to_byte() && pred_out[7] == (5).to_byte(), "legacy PNG Up predictor")
+
+  // Zero-width legacy BMP with huge height must return empty immediately in O(1).
+  let zero_bmp_hdr = Bytes::new(14 + 40 + 1024)
+  match decode_pdf_bmp_payload(
+    zero_bmp_hdr,
+    PdfBmpMeta::{ mode: (1).to_byte(), width: 0U, height: 2000000000U },
+  ) {
+    Ok(b) => debug_assert(b.length() == 0, "zero-width BMP must return empty")
+    Err(_) => debug_assert(false, "zero-width BMP should succeed in O(1)")
+  }
+
+  // Base64 [0, 4] (line_case=1, line_count=2, uniform_len=0, last_len=4) must decode to "\r\nQUJD\r\n".
+  let b64_meta : Array[Byte] = [
+    (0).to_byte(), (0).to_byte(), (0).to_byte(),
+    (1).to_byte(), (2).to_byte(), (0).to_byte(), (4).to_byte(), (3).to_byte(),
+  ]
+  let b64_pcf = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Base64.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 8UL,
+    meta: arr_to_bytes(b64_meta),
+    data: "ABC".to_bytes(),
+  })
+  match decode_bytes(b64_pcf, DecodeConfig::default()) {
+    Ok(b) => debug_assert(bytes_eq(b, "\r\nQUJD\r\n".to_bytes()), "base64 [0, 4] parity")
+    Err(e) => debug_assert(false, "base64 [0, 4] failed: " + e.to_string())
+  }
+  // Base64 output between Int::max (2 GiB) and default budget (4 GiB) must return LengthOverflow.
+  let b64_huge_meta : Array[Byte] = [(0).to_byte(), (0).to_byte(), (0).to_byte(), (1).to_byte()]
+  write_varint(1100000000UL, b64_huge_meta)
+  b64_huge_meta.push((0).to_byte())
+  b64_huge_meta.push((4).to_byte())
+  b64_huge_meta.push((3).to_byte())
+  let b64_huge_pcf = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Base64.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 2200000004UL,
+    meta: arr_to_bytes(b64_huge_meta),
+    data: "ABC".to_bytes(),
+  })
+  match decode_bytes(b64_huge_pcf, DecodeConfig::default()) {
+    Err(Error::LengthOverflow) => ()
+    Err(e) => debug_assert(false, "base64 >2GiB expected LengthOverflow, got " + e.to_string())
+    Ok(_) => debug_assert(false, "base64 >2GiB must fail")
+  }
+
+  // Incomplete 2-byte prefix of a 3-byte UTF-8 sequence (E2 82) must produce a single U+FFFD.
+  let lossy = bytes_to_utf8_lossy(make_test_bytes([0xE2, 0x82])).to_bytes()
+  debug_assert(
+    lossy.length() == 3 && lossy[0] == (0xEF).to_byte() && lossy[1] == (0xBF).to_byte() && lossy[2] == (0xBD).to_byte(),
+    "incomplete UTF-8 E2 82 must emit single U+FFFD",
+  )
+}
+
+test "golden_lz4_byte_exact_matches_rust_and_c_liblz4" {
+  let bc = golden_boundary_corpus()
+  let comps : Array[(Compressor, String)] = [
+    (Compressor::V1_10_0_L12, "67c4be02d0f997a3039e6df16137a9ecafdca3432611669430ebbd461e3526a0"),
+    (Compressor::V1_9_1_L12, "ff385935731857190d7cfb3d650d7c994c9c8f17b12fefa4d2e2428d7a321203"),
+    (Compressor::R131_L16, "4cb9438385565256c51c67289e747af1691e18de8d70ddaddaa5814ebbccefba"),
+  ]
+  let mut ci = 0
+  while ci < comps.length() {
+    let (c, expected_sha) = comps[ci]
+    let id = c.to_u8().to_int()
+    let sb = StringBuilder::new()
+    let mut idx = 0
+    while idx < bc.length() {
+      let input = bc[idx]
+      let b0 = compress_bound(input.length())
+      let bound = if b0 > 1 { b0 } else { 1 }
+      let full = match c.compress(input, bound) {
+        Some(v) => v
+        None => {
+          debug_assert(false, "boundary compress failed")
+          Bytes::new(0)
+        }
+      }
+      let exact = match c.compress(input, full.length()) {
+        Some(_) => "true"
+        None => "false"
+      }
+      let minus1 = match c.compress(input, full.length() - 1) {
+        Some(_) => "true"
+        None => "false"
+      }
+      let flen = full.length()
+      let hex = test_sha256_hex(full)
+      sb.write_string("B \{idx} \{id} \{flen} \{exact} \{minus1} \{hex}\n")
+      idx += 1
+    }
+    let digest = test_sha256_hex(sb.to_string().to_bytes())
+    debug_assert(digest == expected_sha, "golden boundary corpus sha256 mismatch")
+    ci += 1
+  }
+
+  let lc = golden_long_run_corpus()
+  let opt_comps : Array[(Compressor, String)] = [
+    (Compressor::V1_10_0_L12, "408d19c0a3b1e564739302c494f8ec09e8d2a9acc8837b1b4c376a6a3346d141"),
+    (Compressor::V1_9_1_L12, "1a8ef25c41ab8afef46aba13e753a09323c451821148cd3c63c89ce08b6a4e70"),
+  ]
+  ci = 0
+  while ci < opt_comps.length() {
+    let (c, expected_sha) = opt_comps[ci]
+    let id = c.to_u8().to_int()
+    let sb = StringBuilder::new()
+    let mut idx = 0
+    while idx < lc.length() {
+      let input = lc[idx]
+      let b0 = compress_bound(input.length())
+      let bound = if b0 > 1 { b0 } else { 1 }
+      let full = match c.compress(input, bound) {
+        Some(v) => v
+        None => {
+          debug_assert(false, "long_run compress failed")
+          Bytes::new(0)
+        }
+      }
+      let exact = match c.compress(input, full.length()) {
+        Some(_) => "true"
+        None => "false"
+      }
+      let minus1 = match c.compress(input, full.length() - 1) {
+        Some(_) => "true"
+        None => "false"
+      }
+      let flen = full.length()
+      let hex = test_sha256_hex(full)
+      sb.write_string("L \{idx} \{id} \{flen} \{exact} \{minus1} \{hex}\n")
+      idx += 1
+    }
+    let digest = test_sha256_hex(sb.to_string().to_bytes())
+    debug_assert(digest == expected_sha, "golden long_run corpus sha256 mismatch")
+    ci += 1
+  }
+}

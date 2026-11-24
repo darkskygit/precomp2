@@ -1,0 +1,431 @@
+///| PCF2 container framing: header, segment kinds, encoder, and streaming decoder.
+
+///| PCF2 magic header bytes ("PCF2").
+pub let pcf2_magic : Bytes = "PCF2".to_bytes()
+
+///| PCF2 container version emitted by writers. Readers accept v1 and v2.
+pub let pcf2_version : Int = 2
+
+///| Segment tag discriminant written into PCF2 frames.
+pub enum SegmentKind {
+  Lit
+  Dflt
+  Zlib
+  Gzip
+  PngIdat
+  Jpg
+  Nested
+  Base64
+  Bzip2
+  PdfFlate
+  PdfStream
+  UnityFs
+}
+
+///| Decode a segment kind from its wire byte.
+pub fn SegmentKind::from_u8(value : Byte) -> Option[SegmentKind] {
+  match value.to_int() {
+    0x00 => Some(SegmentKind::Lit)
+    0x01 => Some(SegmentKind::Dflt)
+    0x02 => Some(SegmentKind::Zlib)
+    0x03 => Some(SegmentKind::Gzip)
+    0x04 => Some(SegmentKind::PngIdat)
+    0x05 => Some(SegmentKind::Jpg)
+    0x06 => Some(SegmentKind::Nested)
+    0x07 => Some(SegmentKind::Base64)
+    0x08 => Some(SegmentKind::Bzip2)
+    0x09 => Some(SegmentKind::PdfFlate)
+    0x0a => Some(SegmentKind::PdfStream)
+    0x0b => Some(SegmentKind::UnityFs)
+    _ => None
+  }
+}
+
+///| Return the wire byte for this segment kind.
+pub fn SegmentKind::to_u8(self : SegmentKind) -> Byte {
+  match self {
+    SegmentKind::Lit => (0x00).to_byte()
+    SegmentKind::Dflt => (0x01).to_byte()
+    SegmentKind::Zlib => (0x02).to_byte()
+    SegmentKind::Gzip => (0x03).to_byte()
+    SegmentKind::PngIdat => (0x04).to_byte()
+    SegmentKind::Jpg => (0x05).to_byte()
+    SegmentKind::Nested => (0x06).to_byte()
+    SegmentKind::Base64 => (0x07).to_byte()
+    SegmentKind::Bzip2 => (0x08).to_byte()
+    SegmentKind::PdfFlate => (0x09).to_byte()
+    SegmentKind::PdfStream => (0x0a).to_byte()
+    SegmentKind::UnityFs => (0x0b).to_byte()
+  }
+}
+
+///| Lowest container version that may carry this segment kind.
+pub fn SegmentKind::min_version(self : SegmentKind) -> Int {
+  match self {
+    SegmentKind::PdfStream | SegmentKind::UnityFs => 2
+    _ => 1
+  }
+}
+
+///| PCF2 file header.
+pub struct Pcf2Header {
+  pub version : Int
+  pub flags : Int
+  pub original_size : UInt64
+  pub header_ext : Bytes
+}
+
+///| Construct a v2 PCF2 header for `original_size`.
+pub fn Pcf2Header::new(original_size : UInt64) -> Pcf2Header {
+  Pcf2Header::{
+    version: pcf2_version,
+    flags: 0,
+    original_size,
+    header_ext: Bytes::new(0),
+  }
+}
+
+///| Encode this header into `out`.
+pub fn Pcf2Header::encode_into(
+  self : Pcf2Header,
+  out : Array[Byte],
+) -> Result[Unit, Error] {
+  if self.header_ext.length() > 65535 {
+    return Err(Error::LengthOverflow)
+  }
+  append_bytes(out, pcf2_magic)
+  write_u16_le(self.version, out)
+  write_u16_le(self.flags, out)
+  write_u16_le(self.header_ext.length(), out)
+  write_u64_le(self.original_size, out)
+  append_bytes(out, self.header_ext)
+  Ok(())
+}
+
+///| Encode this header to a new `Bytes`.
+pub fn Pcf2Header::encode(self : Pcf2Header) -> Result[Bytes, Error] {
+  let out : Array[Byte] = []
+  match self.encode_into(out) {
+    Ok(_) => Ok(bytes_from_array(out))
+    Err(e) => Err(e)
+  }
+}
+
+///| Decode a header starting at `offset` in `input`. Returns `(header, next_offset)`.
+pub fn Pcf2Header::decode_at(
+  input : Bytes,
+  offset : Int,
+) -> Result[(Pcf2Header, Int), Error] {
+  if offset < 0 || 18 > input.length() - offset {
+    return Err(Error::InvalidHeader("truncated header"))
+  }
+  if !bytes_starts_with_at(input, offset, pcf2_magic) {
+    return Err(Error::InvalidHeader("invalid magic"))
+  }
+  let version = read_u16_le(input, offset + 4)
+  let flags = read_u16_le(input, offset + 6)
+  let ext_len = read_u16_le(input, offset + 8)
+  let original_size = read_u64_le(input, offset + 10)
+  if version < 1 || version > pcf2_version {
+    return Err(Error::InvalidHeader("unsupported version"))
+  }
+  if flags != 0 {
+    return Err(Error::InvalidHeader("flags must be 0 for v1"))
+  }
+  if ext_len != 0 {
+    return Err(Error::InvalidHeader("header_ext_len must be 0 for v1"))
+  }
+  let next = offset + 18 + ext_len
+  if next > input.length() {
+    return Err(Error::InvalidHeader("truncated header_ext"))
+  }
+  let header_ext = bytes_slice(input, offset + 18, next)
+  Ok((Pcf2Header::{ version, flags, original_size, header_ext }, next))
+}
+
+///| Decode a header from the start of `input`.
+pub fn Pcf2Header::decode(input : Bytes) -> Result[Pcf2Header, Error] {
+  match Pcf2Header::decode_at(input, 0) {
+    Ok((h, _)) => Ok(h)
+    Err(e) => Err(e)
+  }
+}
+
+///| A single segment inside a PCF2 container.
+pub struct Pcf2Segment {
+  pub kind : Byte
+  pub flags : Byte
+  pub mut orig_len : UInt64
+  pub meta : Bytes
+  pub mut data : Bytes
+}
+
+///| Construct a literal (`Lit`) segment.
+pub fn Pcf2Segment::lit(data : Bytes) -> Pcf2Segment {
+  Pcf2Segment::{
+    kind: SegmentKind::Lit.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: data.length().to_int64().to_uint64(),
+    meta: Bytes::new(0),
+    data,
+  }
+}
+
+///| Validate segment invariants before encoding or after decoding.
+pub fn Pcf2Segment::validate(self : Pcf2Segment) -> Result[Unit, Error] {
+  if self.flags != (0).to_byte() {
+    return Err(Error::InvalidSegment("flags must be 0 for v1"))
+  }
+  if self.kind == SegmentKind::Lit.to_u8() {
+    if self.meta.length() != 0 {
+      return Err(Error::InvalidSegment("lit meta must be empty"))
+    }
+    if self.orig_len != self.data.length().to_int64().to_uint64() {
+      return Err(Error::InvalidSegment("lit orig_len must match data_len"))
+    }
+  }
+  if self.kind == SegmentKind::Nested.to_u8() {
+    if self.meta.length() != 1 || self.meta[0] != (0).to_byte() {
+      return Err(Error::InvalidSegment("nested meta_version must be 0"))
+    }
+    if self.data.length() < 4 {
+      return Err(Error::InvalidSegment("nested data too small"))
+    }
+    if !bytes_starts_with(self.data, pcf2_magic) {
+      return Err(Error::InvalidSegment("nested data missing magic"))
+    }
+  }
+  Ok(())
+}
+
+///| Encode this segment into `out`.
+pub fn Pcf2Segment::encode_into(
+  self : Pcf2Segment,
+  out : Array[Byte],
+) -> Result[Unit, Error] {
+  match self.validate() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  out.push(self.kind)
+  out.push(self.flags)
+  write_varint(self.orig_len, out)
+  write_varint(self.meta.length().to_int64().to_uint64(), out)
+  write_varint(self.data.length().to_int64().to_uint64(), out)
+  append_bytes(out, self.meta)
+  append_bytes(out, self.data)
+  Ok(())
+}
+
+///| Encode this segment into a new `Bytes`.
+pub fn Pcf2Segment::encode(self : Pcf2Segment) -> Result[Bytes, Error] {
+  let out : Array[Byte] = []
+  match self.encode_into(out) {
+    Ok(_) => Ok(bytes_from_array(out))
+    Err(e) => Err(e)
+  }
+}
+
+///| Complete PCF2 file representation.
+pub struct Pcf2File {
+  pub header : Pcf2Header
+  pub segments : Array[Pcf2Segment]
+}
+
+///| Construct a `Pcf2File` from `segments`, summing `orig_len` for the header.
+pub fn Pcf2File::from_segments(segments : Array[Pcf2Segment]) -> Pcf2File {
+  let mut total : UInt64 = 0UL
+  let mut i = 0
+  while i < segments.length() {
+    total = total + segments[i].orig_len
+    i += 1
+  }
+  Pcf2File::{ header: Pcf2Header::new(total), segments }
+}
+
+///| Encode this PCF2 file into a new `Bytes`.
+pub fn Pcf2File::encode(self : Pcf2File) -> Result[Bytes, Error] {
+  let mut total : UInt64 = 0UL
+  let mut i = 0
+  while i < self.segments.length() {
+    total = total + self.segments[i].orig_len
+    i += 1
+  }
+  if total != self.header.original_size {
+    return Err(Error::InvalidHeader("original_size mismatch"))
+  }
+  let out : Array[Byte] = []
+  match self.header.encode_into(out) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let mut j = 0
+  while j < self.segments.length() {
+    let seg = self.segments[j]
+    match SegmentKind::from_u8(seg.kind) {
+      Some(k) =>
+      if self.header.version < k.min_version() {
+        return Err(Error::InvalidSegment("segment kind requires v2"))
+      }
+      None => ()
+    }
+    match seg.encode_into(out) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    j += 1
+  }
+  Ok(bytes_from_array(out))
+}
+
+///| Decode a complete `Pcf2File` from `input`.
+pub fn Pcf2File::decode(input : Bytes) -> Result[Pcf2File, Error] {
+  let decoder = match Pcf2Decoder::new(input) {
+    Ok(d) => d
+    Err(e) => return Err(e)
+  }
+  let header = decoder.header
+  let segments : Array[Pcf2Segment] = []
+  while true {
+    match decoder.next_segment() {
+      Ok(Some(seg)) => segments.push(seg)
+      Ok(None) => break
+      Err(e) => return Err(e)
+    }
+  }
+  Ok(Pcf2File::{ header, segments })
+}
+
+///| Streaming slice-backed PCF2 segment decoder.
+pub struct Pcf2Decoder {
+  input : Bytes
+  pub mut pos : Int
+  pub header : Pcf2Header
+  mut remaining_orig : UInt64
+  mut finished : Bool
+}
+
+///| Construct a `Pcf2Decoder` starting at `offset` inside `input`.
+pub fn Pcf2Decoder::new_at(
+  input : Bytes,
+  offset : Int,
+) -> Result[Pcf2Decoder, Error] {
+  let (header, next) = match Pcf2Header::decode_at(input, offset) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  Ok(Pcf2Decoder::{
+    input,
+    pos: next,
+    header,
+    remaining_orig: header.original_size,
+    finished: false,
+  })
+}
+
+///| Construct a `Pcf2Decoder` starting at byte 0 of `input`.
+pub fn Pcf2Decoder::new(input : Bytes) -> Result[Pcf2Decoder, Error] {
+  Pcf2Decoder::new_at(input, 0)
+}
+
+///| Read and validate the next segment, or `None` at EOF.
+pub fn Pcf2Decoder::next_segment(
+  self : Pcf2Decoder,
+) -> Result[Option[Pcf2Segment], Error] {
+  if self.finished {
+    return Ok(None)
+  }
+  let len = self.input.length()
+  if self.pos >= len {
+    self.finished = true
+    if self.remaining_orig != 0UL {
+      let actual = self.header.original_size - self.remaining_orig
+      return Err(Error::SizeMismatch(self.header.original_size, actual))
+    }
+    return Ok(None)
+  }
+  let kind = self.input[self.pos]
+  self.pos += 1
+  match SegmentKind::from_u8(kind) {
+    Some(k) =>
+    if self.header.version < k.min_version() {
+      return Err(Error::InvalidSegment("segment kind requires v2"))
+    }
+    None => ()
+  }
+  if self.pos >= len {
+    return Err(Error::InvalidSegment("truncated segment flags"))
+  }
+  let flags = self.input[self.pos]
+  self.pos += 1
+  let (orig_len, p1) = match read_varint_slice(self.input, self.pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (meta_len, p2) = match read_varint_slice(self.input, p1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (data_len, p3) = match read_varint_slice(self.input, p2) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  self.pos = p3
+  if flags != (0).to_byte() {
+    return Err(Error::InvalidSegment("flags must be 0 for v1"))
+  }
+  let available = (len - self.pos).to_int64().to_uint64()
+  if meta_len > available {
+    return Err(Error::SizeMismatch(meta_len, available))
+  }
+  let meta_len_int = match u64_to_int_checked(meta_len) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let meta = bytes_slice(self.input, self.pos, self.pos + meta_len_int)
+  self.pos += meta_len_int
+  if orig_len > self.remaining_orig {
+    return Err(Error::InvalidSegment("orig_len exceeds original_size"))
+  }
+  self.remaining_orig = self.remaining_orig - orig_len
+  if kind == SegmentKind::Lit.to_u8() {
+    if meta_len != 0UL {
+      return Err(Error::InvalidSegment("lit meta must be empty"))
+    }
+    if orig_len != data_len {
+      return Err(Error::InvalidSegment("lit orig_len must match data_len"))
+    }
+  }
+  if kind == SegmentKind::Nested.to_u8() {
+    if meta_len != 1UL || meta[0] != (0).to_byte() {
+      return Err(Error::InvalidSegment("nested meta_version must be 0"))
+    }
+    if data_len < 4UL {
+      return Err(Error::InvalidSegment("nested data too small"))
+    }
+    if 4 > len - self.pos {
+      return Err(
+        Error::SizeMismatch(data_len, (len - self.pos).to_int64().to_uint64()),
+      )
+    }
+    if !bytes_starts_with_at(self.input, self.pos, pcf2_magic) {
+      return Err(Error::InvalidSegment("nested data missing magic"))
+    }
+  }
+  let avail_data = (len - self.pos).to_int64().to_uint64()
+  if data_len > avail_data {
+    return Err(Error::SizeMismatch(data_len, avail_data))
+  }
+  let data_len_int = match u64_to_int_checked(data_len) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let data = bytes_slice(self.input, self.pos, self.pos + data_len_int)
+  self.pos += data_len_int
+  let seg = Pcf2Segment::{ kind, flags, orig_len, meta, data }
+  match seg.validate() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(Some(seg))
+}

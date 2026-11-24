@@ -1,0 +1,650 @@
+///| Comprehensive unit tests for varint, PCF2 framing, Base64, PNG, PDF, and recovery.
+
+import "base64"
+import "flate"
+
+fn make_test_bytes(arr : Array[Int]) -> Bytes {
+  let n = arr.length()
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = arr[i].to_byte()
+    i += 1
+  }
+  out
+}
+
+fn push_be32(out : Array[Byte], v : UInt) -> Unit {
+  out.push(((v >> 24) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 16) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 8) & 0xFFU).to_int().to_byte())
+  out.push((v & 0xFFU).to_int().to_byte())
+}
+
+fn write_test_png_chunk(
+  out : Array[Byte],
+  chunk_type : Bytes,
+  data : Bytes,
+) -> Unit {
+  push_be32(out, data.length().to_uint())
+  let mut i = 0
+  while i < 4 {
+    out.push(chunk_type[i])
+    i += 1
+  }
+  let mut j = 0
+  while j < data.length() {
+    out.push(data[j])
+    j += 1
+  }
+  let c0 = flate::crc32(chunk_type)
+  let crc = flate::crc32_update(c0, data)
+  push_be32(out, crc)
+}
+
+fn arr_to_bytes(arr : Array[Byte]) -> Bytes {
+  let out = Bytes::new(arr.length())
+  let mut i = 0
+  while i < arr.length() {
+    out[i] = arr[i]
+    i += 1
+  }
+  out
+}
+
+test "varint_roundtrip_and_overflow_rejection" {
+  let values : Array[UInt64] = [
+    0UL,
+    1UL,
+    2UL,
+    127UL,
+    128UL,
+    255UL,
+    16384UL,
+    4294967295UL,
+    0xFFFFFFFFFFFFFFFFUL,
+  ]
+  let mut i = 0
+  while i < values.length() {
+    let v = values[i]
+    let encoded = write_varint_bytes(v)
+    match read_varint(encoded) {
+      Ok(decoded) => debug_assert(decoded == v, "varint roundtrip mismatch")
+      Err(_) => debug_assert(false, "varint decode failed")
+    }
+    i += 1
+  }
+  // 11 continuation bytes -> rejected as overflow/too-long
+  let too_long = Bytes::new(11)
+  let mut k = 0
+  while k < 11 {
+    too_long[k] = (0x80).to_byte()
+    k += 1
+  }
+  match read_varint(too_long) {
+    Err(Error::VarintTooLong) | Err(Error::VarintOverflow) => ()
+    _ => debug_assert(false, "expected varint too long / overflow")
+  }
+  // 10th byte with value > 1 -> VarintOverflow
+  let overflow_buf = Bytes::new(10)
+  let mut j = 0
+  while j < 9 {
+    overflow_buf[j] = (0xFF).to_byte()
+    j += 1
+  }
+  overflow_buf[9] = (0x02).to_byte()
+  match read_varint(overflow_buf) {
+    Err(Error::VarintOverflow) => ()
+    _ => debug_assert(false, "expected VarintOverflow")
+  }
+}
+
+test "pcf2_header_file_nested_streaming_and_validation" {
+  let hdr = Pcf2Header::new(123UL)
+  let enc_hdr = match hdr.encode() {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "header encode")
+      Bytes::new(0)
+    }
+  }
+  let dec_hdr = match Pcf2Header::decode(enc_hdr) {
+    Ok(h) => h
+    Err(_) => {
+      debug_assert(false, "header decode")
+      Pcf2Header::new(0UL)
+    }
+  }
+  debug_assert(dec_hdr.version == pcf2_version, "header version")
+  debug_assert(dec_hdr.original_size == 123UL, "header original_size")
+
+  // Nested file roundtrip
+  let inner = Pcf2File::from_segments([Pcf2Segment::lit("nested".to_bytes())])
+  let inner_bytes = match inner.encode() {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "inner encode")
+      Bytes::new(0)
+    }
+  }
+  let nested_seg = Pcf2Segment::{
+    kind: SegmentKind::Nested.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: inner.header.original_size,
+    meta: make_test_bytes([0]),
+    data: inner_bytes,
+  }
+  let outer = Pcf2File::from_segments([
+    Pcf2Segment::lit("hello".to_bytes()),
+    nested_seg,
+  ])
+  let outer_bytes = match outer.encode() {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "outer encode")
+      Bytes::new(0)
+    }
+  }
+  let decoded_file = match Pcf2File::decode(outer_bytes) {
+    Ok(f) => f
+    Err(_) => {
+      debug_assert(false, "outer decode")
+      Pcf2File::from_segments([])
+    }
+  }
+  debug_assert(decoded_file.segments.length() == 2, "segment count")
+  debug_assert(
+    bytes_eq(decoded_file.segments[0].data, "hello".to_bytes()),
+    "first seg data",
+  )
+  let full_dec = match decode_bytes(outer_bytes, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "decode nested bytes")
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(full_dec, "hellonested".to_bytes()), "nested output")
+
+  // Reject lit with non-empty meta
+  let bad_lit = Pcf2Segment::{
+    kind: SegmentKind::Lit.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: make_test_bytes([1]),
+    data: make_test_bytes([2]),
+  }
+  match bad_lit.validate() {
+    Err(Error::InvalidSegment(_)) => ()
+    _ => debug_assert(false, "expected invalid lit meta")
+  }
+
+  // Reject oversized segment lengths without allocation
+  let mut bad_buf : Array[Byte] = []
+  let h1 = Pcf2Header::new(1UL)
+  let _ = h1.encode_into(bad_buf)
+  bad_buf.push(SegmentKind::Dflt.to_u8())
+  bad_buf.push((0).to_byte())
+  write_varint(1UL, bad_buf)
+  write_varint(1UL << 40, bad_buf)
+  write_varint(1UL << 40, bad_buf)
+  match Pcf2File::decode(arr_to_bytes(bad_buf)) {
+    Err(Error::SizeMismatch(_, _)) => ()
+    _ => debug_assert(false, "expected SizeMismatch on oversized meta")
+  }
+
+  // Reject original_size mismatch
+  let bad_sz_buf : Array[Byte] = []
+  let h10 = Pcf2Header::new(10UL)
+  let _ = h10.encode_into(bad_sz_buf)
+  let _ = Pcf2Segment::lit("abc".to_bytes()).encode_into(bad_sz_buf)
+  match Pcf2File::decode(arr_to_bytes(bad_sz_buf)) {
+    Err(Error::SizeMismatch(_, _)) => ()
+    _ => debug_assert(false, "expected SizeMismatch on truncated total")
+  }
+}
+
+test "recover_scan_and_rejections_and_budget" {
+  let payload = "recover".to_bytes()
+  let encoded = match encode_bytes(payload, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "encode recover")
+      Bytes::new(0)
+    }
+  }
+  let buf : Array[Byte] = []
+  let xxxx = "XXXX".to_bytes()
+  let yyyy = "YYYY".to_bytes()
+  let mut i = 0
+  while i < xxxx.length() {
+    buf.push(xxxx[i])
+    i += 1
+  }
+  i = 0
+  while i < encoded.length() {
+    buf.push(encoded[i])
+    i += 1
+  }
+  i = 0
+  while i < yyyy.length() {
+    buf.push(yyyy[i])
+    i += 1
+  }
+  i = 0
+  while i < encoded.length() {
+    buf.push(encoded[i])
+    i += 1
+  }
+  let rec_cfg = DecodeConfig::{
+    max_depth: 4,
+    max_total_output: 4294967296UL,
+    recover: true,
+  }
+  let recovered = match decode_bytes(arr_to_bytes(buf), rec_cfg) {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "recover decode failed")
+      Bytes::new(0)
+    }
+  }
+  debug_assert(
+    bytes_eq(recovered, "recoverrecover".to_bytes()),
+    "recover mismatch",
+  )
+
+  // Budget enforcement
+  let tiny_cfg = DecodeConfig::{
+    max_depth: 4,
+    max_total_output: 3UL,
+    recover: false,
+  }
+  match decode_bytes(encoded, tiny_cfg) {
+    Err(Error::Other(_)) => ()
+    _ => debug_assert(false, "expected decode budget error")
+  }
+
+  // Reject unknown segment kind
+  let unk_file = Pcf2File::from_segments([
+    Pcf2Segment::{
+      kind: (0xFF).to_byte(),
+      flags: (0).to_byte(),
+      orig_len: 0UL,
+      meta: Bytes::new(0),
+      data: Bytes::new(0),
+    },
+  ])
+  let unk_bytes = match unk_file.encode() {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  match decode_image_for_display(unk_bytes, DecodeConfig::default()) {
+    Err(Error::InvalidSegment(_)) => ()
+    _ => debug_assert(false, "expected unknown segment kind error")
+  }
+
+  // Reject old png/jpg meta versions
+  let old_png = Pcf2Segment::{
+    kind: SegmentKind::PngIdat.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: make_test_bytes([0, 0, 0]),
+    data: Bytes::new(0),
+  }
+  let old_png_bytes = match Pcf2File::from_segments([old_png]).encode() {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  match decode_bytes(old_png_bytes, DecodeConfig::default()) {
+    Err(Error::InvalidSegment(_)) => ()
+    _ => debug_assert(false, "expected old png meta_version error")
+  }
+
+  let old_jpg = Pcf2Segment::{
+    kind: SegmentKind::Jpg.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 1UL,
+    meta: make_test_bytes([0, 0]),
+    data: Bytes::new(0),
+  }
+  let old_jpg_bytes = match Pcf2File::from_segments([old_jpg]).encode() {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  match decode_bytes(old_jpg_bytes, DecodeConfig::default()) {
+    Err(Error::InvalidSegment(_)) => ()
+    _ => debug_assert(false, "expected old jpg meta_version error")
+  }
+}
+
+test "base64_roundtrip_all_line_cases_and_invalid_fallback" {
+  let payload = "base64 payload data for testing!".to_bytes()
+  let b64 = base64::encode(payload).to_bytes()
+  // line_case 0: uniform 8-char lines (44 chars -> use 11-char lines: 44/11=4)
+  let cases : Array[Array[Int]] = [
+    [11, 11, 11, 11],
+    [16, 16, 12],
+    [10, 14, 8, 12],
+  ]
+  let mut ci = 0
+  while ci < cases.length() {
+    let lens = cases[ci]
+    let buf : Array[Byte] = []
+    let hdr = "Content-Transfer-Encoding: base64\r\n\r\n".to_bytes()
+    let mut hi = 0
+    while hi < hdr.length() {
+      buf.push(hdr[hi])
+      hi += 1
+    }
+    let mut pos = 0
+    let mut li = 0
+    while li < lens.length() {
+      let l = lens[li]
+      let mut k = 0
+      while k < l {
+        buf.push(b64[pos + k])
+        k += 1
+      }
+      buf.push((0x0D).to_byte())
+      buf.push((0x0A).to_byte())
+      pos += l
+      li += 1
+    }
+    let input = arr_to_bytes(buf)
+    let encoded = match encode_bytes(input, EncodeConfig::default()) {
+      Ok(b) => b
+      Err(_) => {
+        debug_assert(false, "base64 encode failed")
+        Bytes::new(0)
+      }
+    }
+    let pf = match Pcf2File::decode(encoded) {
+      Ok(f) => f
+      Err(_) => {
+        debug_assert(false, "base64 pcf2 decode")
+        Pcf2File::from_segments([])
+      }
+    }
+    debug_assert(
+      pf.segments[0].kind == SegmentKind::Base64.to_u8(),
+      "expected Base64 segment",
+    )
+    let decoded = match decode_bytes(encoded, DecodeConfig::default()) {
+      Ok(b) => b
+      Err(_) => {
+        debug_assert(false, "base64 decode failed")
+        Bytes::new(0)
+      }
+    }
+    debug_assert(bytes_eq(decoded, input), "base64 roundtrip mismatch")
+    ci += 1
+  }
+  // Invalid base64 without CRLF falls back to Lit
+  let invalid = "SGVsbG8=".to_bytes()
+  let enc_inv = match encode_bytes(invalid, EncodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  let dec_inv = match decode_bytes(enc_inv, DecodeConfig::default()) {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  debug_assert(bytes_eq(dec_inv, invalid), "invalid base64 fallback")
+}
+
+test "png_scanline_filters_and_metadata_iccp_cicp_precedence" {
+  // Test all 5 PNG filter types (0..4) roundtrip
+  let w = 4U
+  let h = 5U
+  let bpp = 4
+  let bitmap = Bytes::new(4 * 5 * 4)
+  let mut i = 0
+  while i < bitmap.length() {
+    bitmap[i] = ((i * 37 + 13) & 0xFF).to_byte()
+    i += 1
+  }
+  let filters = make_test_bytes([0, 1, 2, 3, 4])
+  let filtered = match apply_png_filters_with_types(bitmap, w, h, bpp, filters) {
+    Ok(b) => b
+    Err(_) => {
+      debug_assert(false, "apply_png_filters failed")
+      Bytes::new(0)
+    }
+  }
+  let (unfiltered, got_filters) = match undo_png_filters(filtered, w, h, bpp) {
+    Ok(v) => v
+    Err(_) => {
+      debug_assert(false, "undo_png_filters failed")
+      (Bytes::new(0), Bytes::new(0))
+    }
+  }
+  debug_assert(bytes_eq(unfiltered, bitmap), "png filter bitmap roundtrip")
+  debug_assert(bytes_eq(got_filters, filters), "png filter types roundtrip")
+
+  // Test parse_png_metadata with iCCP and cICP precedence
+  let ihdr = make_test_bytes([0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0])
+  let iccp_data = "profile\u{00}\u{00}abc".to_bytes()
+  let png1_buf : Array[Byte] = []
+  let sig = make_test_bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+  let mut s = 0
+  while s < sig.length() {
+    png1_buf.push(sig[s])
+    s += 1
+  }
+  write_test_png_chunk(png1_buf, "IHDR".to_bytes(), ihdr)
+  write_test_png_chunk(png1_buf, "iCCP".to_bytes(), iccp_data)
+  write_test_png_chunk(png1_buf, "IEND".to_bytes(), Bytes::new(0))
+  match parse_png_metadata(arr_to_bytes(png1_buf)) {
+    Ok(Some(meta)) => {
+      debug_assert(meta.ihdr.width == 1U, "ihdr width")
+      match meta.icc {
+        Some(_) => ()
+        None => debug_assert(false, "expected iCCP retained")
+      }
+    }
+    _ => debug_assert(false, "parse_png_metadata failed")
+  }
+
+  // With cICP present, iCCP is dropped
+  let png2_buf : Array[Byte] = []
+  s = 0
+  while s < sig.length() {
+    png2_buf.push(sig[s])
+    s += 1
+  }
+  write_test_png_chunk(png2_buf, "IHDR".to_bytes(), ihdr)
+  write_test_png_chunk(png2_buf, "iCCP".to_bytes(), iccp_data)
+  write_test_png_chunk(png2_buf, "cICP".to_bytes(), make_test_bytes([1, 13, 0, 1]))
+  write_test_png_chunk(png2_buf, "IEND".to_bytes(), Bytes::new(0))
+  match parse_png_metadata(arr_to_bytes(png2_buf)) {
+    Ok(Some(meta)) =>
+    match meta.icc {
+      None => ()
+      Some(_) => debug_assert(false, "cICP must suppress iCCP")
+    }
+    _ => debug_assert(false, "parse_png_metadata with cICP failed")
+  }
+}
+
+test "pdf_syntax_ascii_predictors_legacy_bmp_and_stream_roundtrip" {
+  // 1. PDF syntax scanner: indirect /Length, #xx name escape, strings, conflicting lengths
+  let payload = "literal endstream endobj 17 0 obj << /Length 3 >> stream\nfoo".to_bytes()
+  let plen_str = payload.length().to_string()
+  let doc = "%PDF-1.7\n1 0 obj << /Length 2 0 R /BBox [0 0 1.5 -2.3] /Name /Fl#61teDecode /Label (stream \\( fake) >> stream\r\n" +
+  "literal endstream endobj 17 0 obj << /Length 3 >> stream\nfoo" +
+  "\r\nendstream\nendobj\n2 0 obj " +
+  plen_str +
+  " endobj\n"
+  let scanned = pdf_scan_streams(doc.to_bytes())
+  debug_assert(scanned.length() == 1, "expected 1 pdf stream")
+  debug_assert(
+    bytes_eq(
+      bytes_slice(doc.to_bytes(), scanned[0].start, scanned[0].end),
+      payload,
+    ),
+    "scanned payload mismatch",
+  )
+  match scanned[0].dict.get("Name".to_bytes()) {
+    Some(PdfValue::Name(n)) =>
+    debug_assert(bytes_eq(n, "FlateDecode".to_bytes()), "#61 escape failed")
+    _ => debug_assert(false, "missing Name key")
+  }
+  // Conflicting indirect length objects must be rejected
+  let conflict = "%PDF\n1 0 obj << /Length 2 0 R >> stream\nabc\nendstream\nendobj\n2 0 obj 3 endobj\n2 0 obj 4 endobj\n".to_bytes()
+  debug_assert(pdf_scan_streams(conflict).length() == 0, "conflict not rejected")
+
+  // 2. ASCIIHex and ASCII85 roundtrip
+  let ascii_cases : Array[(Bool, Bytes)] = [
+    (true, "aB cD\r\nF>tail".to_bytes()),
+    (false, "z !!!!!\n87cURD]j7BEbo80~>\r\n".to_bytes()),
+    (false, " !! ~>".to_bytes()),
+    (true, ">".to_bytes()),
+  ]
+  let mut ai = 0
+  while ai < ascii_cases.length() {
+    let (is_hex, sample) = ascii_cases[ai]
+    let (bin, meta) = match pdf_ascii_unpack(sample, is_hex) {
+      Ok(v) => v
+      Err(_) => {
+        debug_assert(false, "ascii unpack failed")
+        (Bytes::new(0), Bytes::new(0))
+      }
+    }
+    let repacked = match pdf_ascii_repack(bin, meta, is_hex, sample.length()) {
+      Ok(v) => v
+      Err(_) => {
+        debug_assert(false, "ascii repack failed")
+        Bytes::new(0)
+      }
+    }
+    debug_assert(bytes_eq(repacked, sample), "ascii roundtrip mismatch")
+    ai += 1
+  }
+
+  // 3. All TIFF2 & PNG 10..15 predictors across bits in {1,2,4,8,16} and colors in {1,3,4}
+  let bits_list : Array[Int] = [1, 2, 4, 8, 16]
+  let colors_list : Array[Int] = [1, 3, 4]
+  let kinds_list : Array[Int] = [1, 2, 10, 11, 12, 13, 14, 15]
+  let mut bi = 0
+  while bi < bits_list.length() {
+    let bits = bits_list[bi]
+    let mut ci = 0
+    while ci < colors_list.length() {
+      let colors = colors_list[ci]
+      let mut ki = 0
+      while ki < kinds_list.length() {
+        let kind = kinds_list[ki]
+        let p = PdfPredictor::{
+          kind: kind.to_byte(),
+          bits,
+          colors,
+          columns: 7,
+        }
+        let row = match p.row_bytes() {
+          Ok(r) => r
+          Err(_) => 1
+        }
+        let data = Bytes::new(row * 5)
+        let mut n = 0
+        while n < data.length() {
+          data[n] = ((n * 71 + 123) & 0xFF).to_byte()
+          n += 1
+        }
+        let meta : Array[Byte] = []
+        meta.push(kind.to_byte())
+        pdf_write_num(colors, meta)
+        pdf_write_num(bits, meta)
+        pdf_write_num(7, meta)
+        let tags = if kind >= 10 {
+          make_test_bytes([0, 1, 2, 3, 4])
+        } else {
+          Bytes::new(0)
+        }
+        pdf_write_blob(tags, meta)
+        let meta_bytes = arr_to_bytes(meta)
+        let enc = match pdf_predictor_redo(data, meta_bytes, 1000000) {
+          Ok(v) => v
+          Err(_) => {
+            debug_assert(false, "predictor redo failed")
+            Bytes::new(0)
+          }
+        }
+        let (dec, saved) = match p.undo(enc) {
+          Ok(v) => v
+          Err(_) => {
+            debug_assert(false, "predictor undo failed")
+            (Bytes::new(0), Bytes::new(0))
+          }
+        }
+        debug_assert(bytes_eq(dec, data), "predictor data roundtrip")
+        debug_assert(bytes_eq(saved, meta_bytes), "predictor meta roundtrip")
+        ki += 1
+      }
+      ci += 1
+    }
+    bi += 1
+  }
+
+  // 4. Legacy BMP decode (mode 2 RGB, 3x2)
+  let bmp_hdr_size = 14 + 40
+  let bmp_padded_row = 12 // 3*3 = 9 -> padded to 12
+  let bmp = Bytes::new(bmp_hdr_size + bmp_padded_row * 2)
+  let mut bi2 = 0
+  while bi2 < 9 {
+    bmp[bmp_hdr_size + bi2] = (bi2 + 1).to_byte()
+    bmp[bmp_hdr_size + bmp_padded_row + bi2] = (bi2 + 11).to_byte()
+    bi2 += 1
+  }
+  let bmp_meta = PdfBmpMeta::{ mode: (2).to_byte(), width: 3U, height: 2U }
+  let bmp_out = match decode_pdf_bmp_payload(bmp, bmp_meta) {
+    Ok(v) => v
+    Err(_) => {
+      debug_assert(false, "legacy bmp decode failed")
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bmp_out.length() == 18, "legacy bmp length")
+  debug_assert(bmp_out[0] == (1).to_byte() && bmp_out[9] == (11).to_byte(), "legacy bmp pixels")
+
+  // 5. Full PDF stream encode/decode for ASCIIHex and ASCII85 chains
+  let pdf_ascii = "%PDF-1.7\n1 0 obj << /Length 15 /Filter [/ASCIIHexDecode] >>\nstream\n48 65 6c 6c 6f>endstream\nendobj\n%%EOF\n".to_bytes()
+  let (pdf_enc, stats) = match
+  encode_bytes_with_stats(pdf_ascii, EncodeConfig::default()) {
+    Ok(v) => v
+    Err(_) => {
+      debug_assert(false, "pdf ascii encode failed")
+      (Bytes::new(0), PdfStats::default())
+    }
+  }
+  debug_assert(stats.streams == 1 && stats.transformed == 1 && stats.ascii == 1, "pdf ascii stats")
+  let pdf_dec = match decode_bytes(pdf_enc, DecodeConfig::default()) {
+    Ok(v) => v
+    Err(_) => {
+      debug_assert(false, "pdf ascii decode failed")
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(pdf_dec, pdf_ascii), "pdf ascii roundtrip")
+
+  let pdf_a85 = "%PDF-1.7\n1 0 obj << /Length 15 /Filter [/ASCII85Decode] >>\nstream\n87cURD]j7BEbo~>endstream\nendobj\n%%EOF\n".to_bytes()
+  let (a85_enc, a85_stats) = match
+  encode_bytes_with_stats(pdf_a85, EncodeConfig::default()) {
+    Ok(v) => v
+    Err(_) => {
+      debug_assert(false, "pdf a85 encode failed")
+      (Bytes::new(0), PdfStats::default())
+    }
+  }
+  debug_assert(
+    a85_stats.streams == 1 && a85_stats.transformed == 1 && a85_stats.ascii == 1,
+    "pdf a85 stats",
+  )
+  let a85_dec = match decode_bytes(a85_enc, DecodeConfig::default()) {
+    Ok(v) => v
+    Err(_) => {
+      debug_assert(false, "pdf a85 decode failed")
+      Bytes::new(0)
+    }
+  }
+  debug_assert(bytes_eq(a85_dec, pdf_a85), "pdf a85 roundtrip")
+}

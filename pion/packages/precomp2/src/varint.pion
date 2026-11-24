@@ -1,0 +1,507 @@
+///| Unsigned LEB128 varints, binary integer helpers, and byte-slice utilities.
+
+///| Encode `value` as unsigned LEB128 and append to `out`.
+pub fn write_varint(value : UInt64, out : Array[Byte]) -> Unit {
+  let mut v = value
+  while true {
+    let mut b = (v & 0x7FUL).to_int()
+    v = v >> 7
+    if v != 0UL {
+      b = b | 0x80
+    }
+    out.push(b.to_byte())
+    if v == 0UL {
+      break
+    }
+  }
+}
+
+///| Encode `value` as unsigned LEB128 into a new `Bytes`.
+pub fn write_varint_bytes(value : UInt64) -> Bytes {
+  let out : Array[Byte] = []
+  write_varint(value, out)
+  bytes_from_array(out)
+}
+
+///| Decode an unsigned LEB128 varint starting at `offset` in `data`.
+///| Returns `(value, next_offset)`.
+pub fn read_varint_slice(
+  data : Bytes,
+  offset : Int,
+) -> Result[(UInt64, Int), Error] {
+  let len = data.length()
+  let mut pos = offset
+  let mut value : UInt64 = 0UL
+  let mut shift = 0
+  let mut i = 0
+  while i < 10 {
+    if pos >= len {
+      return Err(Error::VarintTooLong)
+    }
+    let byte = data[pos].to_int()
+    pos += 1
+    let part = (byte & 0x7F).to_int64().to_uint64()
+    if shift > 63 || (shift == 63 && part > 1UL) {
+      return Err(Error::VarintOverflow)
+    }
+    value = value | (part << shift)
+    if (byte & 0x80) == 0 {
+      return Ok((value, pos))
+    }
+    shift += 7
+    i += 1
+  }
+  Err(Error::VarintTooLong)
+}
+
+///| Decode an unsigned LEB128 varint from the start of `data`.
+pub fn read_varint(data : Bytes) -> Result[UInt64, Error] {
+  match read_varint_slice(data, 0) {
+    Ok((v, _)) => Ok(v)
+    Err(e) => Err(e)
+  }
+}
+
+///| Parse the 2-byte `(meta_version, payload_kind, rest)` header of segment metadata.
+pub fn parse_meta_header(meta : Bytes) -> Result[(Byte, Byte, Bytes), Error] {
+  if meta.length() < 2 {
+    return Err(Error::InvalidSegment("meta too short"))
+  }
+  let meta_version = meta[0]
+  let payload_kind = meta[1]
+  let rest = bytes_slice(meta, 2, meta.length())
+  Ok((meta_version, payload_kind, rest))
+}
+
+///| Convert a `UInt64` length to `Int` with bounds checking (`<= 0x7FFFFFFF`).
+fn u64_to_int_checked(v : UInt64) -> Result[Int, Error] {
+  if v > 2147483647UL {
+    return Err(Error::LengthOverflow)
+  }
+  Ok(v.to_int())
+}
+
+///| Saturating addition on `UInt64`.
+fn u64_saturating_add(a : UInt64, b : UInt64) -> UInt64 {
+  let max : UInt64 = 0xFFFFFFFFFFFFFFFFUL
+  if a > max - b {
+    max
+  } else {
+    a + b
+  }
+}
+
+///| Saturating subtraction on `UInt64`.
+fn u64_saturating_sub(a : UInt64, b : UInt64) -> UInt64 {
+  if a < b {
+    0UL
+  } else {
+    a - b
+  }
+}
+
+///| Checked addition on non-negative `Int` lengths.
+fn int_checked_add(a : Int, b : Int) -> Option[Int] {
+  if a < 0 || b < 0 || a > 2147483647 - b {
+    None
+  } else {
+    Some(a + b)
+  }
+}
+
+///| Checked multiplication on non-negative `Int` lengths.
+fn int_checked_mul(a : Int, b : Int) -> Option[Int] {
+  if a < 0 || b < 0 {
+    return None
+  }
+  if a == 0 || b == 0 {
+    return Some(0)
+  }
+  if a > 2147483647 / b {
+    None
+  } else {
+    Some(a * b)
+  }
+}
+
+///| Append a slice `src[start..end]` into `dst`.
+fn append_bytes_slice(
+  dst : Array[Byte],
+  src : Bytes,
+  start : Int,
+  end : Int,
+) -> Unit {
+  let mut i = start
+  while i < end {
+    dst.push(src[i])
+    i += 1
+  }
+}
+
+///| Append all bytes of `src` into `dst`.
+fn append_bytes(dst : Array[Byte], src : Bytes) -> Unit {
+  append_bytes_slice(dst, src, 0, src.length())
+}
+
+///| Build a `Bytes` from an `Array[Byte]`.
+fn bytes_from_array(arr : Array[Byte]) -> Bytes {
+  let n = arr.length()
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = arr[i]
+    i += 1
+  }
+  out
+}
+
+///| Build a `Bytes` from a `FixedArray[Byte]`.
+fn bytes_from_fixed_array(arr : FixedArray[Byte]) -> Bytes {
+  let n = arr.length()
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = arr[i]
+    i += 1
+  }
+  out
+}
+
+///| Copy `src[start..end]` into a new `Bytes`.
+fn bytes_slice(src : Bytes, start : Int, end : Int) -> Bytes {
+  let n = end - start
+  if n <= 0 {
+    return Bytes::new(0)
+  }
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = src[start + i]
+    i += 1
+  }
+  out
+}
+
+///| Concatenate two `Bytes` buffers.
+fn bytes_concat(a : Bytes, b : Bytes) -> Bytes {
+  let la = a.length()
+  let lb = b.length()
+  let out = Bytes::new(la + lb)
+  let mut i = 0
+  while i < la {
+    out[i] = a[i]
+    i += 1
+  }
+  let mut j = 0
+  while j < lb {
+    out[la + j] = b[j]
+    j += 1
+  }
+  out
+}
+
+///| Check whether `data[offset..]` starts with `prefix`.
+fn bytes_starts_with_at(data : Bytes, offset : Int, prefix : Bytes) -> Bool {
+  let plen = prefix.length()
+  if offset < 0 || offset + plen > data.length() {
+    return false
+  }
+  let mut i = 0
+  while i < plen {
+    if data[offset + i] != prefix[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+///| Check whether `data` starts with `prefix`.
+fn bytes_starts_with(data : Bytes, prefix : Bytes) -> Bool {
+  bytes_starts_with_at(data, 0, prefix)
+}
+
+///| Compare `a[a_start..a_start + len]` with `b[b_start..b_start + len]`.
+fn bytes_eq_range(
+  a : Bytes,
+  a_start : Int,
+  b : Bytes,
+  b_start : Int,
+  len : Int,
+) -> Bool {
+  if a_start + len > a.length() || b_start + len > b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < len {
+    if a[a_start + i] != b[b_start + i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+///| Compare two `Bytes` for exact byte equality.
+pub fn bytes_eq(a : Bytes, b : Bytes) -> Bool {
+  let la = a.length()
+  if la != b.length() {
+    return false
+  }
+  bytes_eq_range(a, 0, b, 0, la)
+}
+
+///| Find the first occurrence of `needle` in `haystack[from..]`.
+///| Returns the absolute index in `haystack`, or `None`.
+fn bytes_find_from(haystack : Bytes, needle : Bytes, from : Int) -> Option[Int] {
+  let hlen = haystack.length()
+  let nlen = needle.length()
+  if nlen == 0 {
+    if from <= hlen {
+      return Some(from)
+    }
+    return None
+  }
+  if from < 0 || from + nlen > hlen {
+    return None
+  }
+  let first = needle[0]
+  let limit = hlen - nlen
+  let mut pos = from
+  while pos <= limit {
+    if haystack[pos] == first {
+      let mut k = 1
+      while k < nlen && haystack[pos + k] == needle[k] {
+        k += 1
+      }
+      if k == nlen {
+        return Some(pos)
+      }
+    }
+    pos += 1
+  }
+  None
+}
+
+///| Find the first occurrence of byte `needle` in `haystack[from..]`.
+fn bytes_find_byte_from(
+  haystack : Bytes,
+  needle : Byte,
+  from : Int,
+) -> Option[Int] {
+  let hlen = haystack.length()
+  let mut pos = from
+  while pos < hlen {
+    if haystack[pos] == needle {
+      return Some(pos)
+    }
+    pos += 1
+  }
+  None
+}
+
+///| Encode an ASCII string into `Bytes`.
+fn ascii_bytes(s : String) -> Bytes {
+  s.to_bytes()
+}
+
+let ascii_chars : FixedArray[Char] = [
+  ' ', '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.',
+  '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=',
+  '>', '?', '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L',
+  'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[',
+  '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+  'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y',
+  'z', '{', '|', '}', '~',
+]
+
+let hex_upper_chars : FixedArray[Char] = [
+  '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
+]
+
+///| Encode arbitrary `Bytes` into an injective `String` key for `Map[String, Bool]`.
+fn bytes_to_map_key(b : Bytes) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  let len = b.length()
+  while i < len {
+    let v = b[i].to_int()
+    if v >= 33 && v <= 126 && v != 37 {
+      sb.write_char(ascii_chars[v - 32])
+    } else {
+      sb.write_char('%')
+      sb.write_char(hex_upper_chars[(v >> 4) & 15])
+      sb.write_char(hex_upper_chars[v & 15])
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+///| Decode UTF-8 bytes lossily, replacing invalid sequences with U+FFFD (matching Rust `String::from_utf8_lossy`).
+fn bytes_to_utf8_lossy(b : Bytes) -> String {
+  let out : Array[Byte] = []
+  let len = b.length()
+  let mut i = 0
+  let push_rep = fn() -> Unit {
+    out.push((0xEF).to_byte())
+    out.push((0xBF).to_byte())
+    out.push((0xBD).to_byte())
+  }
+  while i < len {
+    let b0 = b[i].to_int()
+    if b0 < 0x80 {
+      out.push(b[i])
+      i += 1
+    } else if b0 >= 0xC2 && b0 <= 0xDF {
+      if i + 1 < len && (b[i + 1].to_int() & 0xC0) == 0x80 {
+        out.push(b[i])
+        out.push(b[i + 1])
+        i += 2
+      } else {
+        push_rep()
+        i += 1
+      }
+    } else if b0 >= 0xE0 && b0 <= 0xEF {
+      if i + 1 < len {
+        let b1 = b[i + 1].to_int()
+        let ok1 = if b0 == 0xE0 {
+          b1 >= 0xA0 && b1 <= 0xBF
+        } else if b0 == 0xED {
+          b1 >= 0x80 && b1 <= 0x9F
+        } else {
+          (b1 & 0xC0) == 0x80
+        }
+        if ok1 {
+          if i + 2 < len && (b[i + 2].to_int() & 0xC0) == 0x80 {
+            out.push(b[i])
+            out.push(b[i + 1])
+            out.push(b[i + 2])
+            i += 3
+          } else {
+            push_rep()
+            i += 2
+          }
+        } else {
+          push_rep()
+          i += 1
+        }
+      } else {
+        push_rep()
+        i += 1
+      }
+    } else if b0 >= 0xF0 && b0 <= 0xF4 {
+      if i + 1 < len {
+        let b1 = b[i + 1].to_int()
+        let ok1 = if b0 == 0xF0 {
+          b1 >= 0x90 && b1 <= 0xBF
+        } else if b0 == 0xF4 {
+          b1 >= 0x80 && b1 <= 0x8F
+        } else {
+          (b1 & 0xC0) == 0x80
+        }
+        if ok1 {
+          if i + 2 < len && (b[i + 2].to_int() & 0xC0) == 0x80 {
+            if i + 3 < len && (b[i + 3].to_int() & 0xC0) == 0x80 {
+              out.push(b[i])
+              out.push(b[i + 1])
+              out.push(b[i + 2])
+              out.push(b[i + 3])
+              i += 4
+            } else {
+              push_rep()
+              i += 3
+            }
+          } else {
+            push_rep()
+            i += 2
+          }
+        } else {
+          push_rep()
+          i += 1
+        }
+      } else {
+        push_rep()
+        i += 1
+      }
+    } else {
+      push_rep()
+      i += 1
+    }
+  }
+  bytes_from_array(out).to_string()
+}
+
+///| Little-endian and big-endian integer helpers.
+fn write_u16_le(v : Int, out : Array[Byte]) -> Unit {
+  out.push((v & 0xFF).to_byte())
+  out.push(((v >> 8) & 0xFF).to_byte())
+}
+
+fn write_u32_le(v : UInt, out : Array[Byte]) -> Unit {
+  out.push((v & 0xFFU).to_int().to_byte())
+  out.push(((v >> 8) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 16) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 24) & 0xFFU).to_int().to_byte())
+}
+
+fn write_u64_le(v : UInt64, out : Array[Byte]) -> Unit {
+  let mut x = v
+  let mut i = 0
+  while i < 8 {
+    out.push((x & 0xFFUL).to_int().to_byte())
+    x = x >> 8
+    i += 1
+  }
+}
+
+fn write_u32_be(v : UInt, out : Array[Byte]) -> Unit {
+  out.push(((v >> 24) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 16) & 0xFFU).to_int().to_byte())
+  out.push(((v >> 8) & 0xFFU).to_int().to_byte())
+  out.push((v & 0xFFU).to_int().to_byte())
+}
+
+fn read_u16_le(b : Bytes, pos : Int) -> Int {
+  b[pos].to_int() | (b[pos + 1].to_int() << 8)
+}
+
+fn read_u16_be(b : Bytes, pos : Int) -> Int {
+  (b[pos].to_int() << 8) | b[pos + 1].to_int()
+}
+
+fn read_u32_le(b : Bytes, pos : Int) -> UInt {
+  b[pos].to_int().to_uint()
+  | (b[pos + 1].to_int().to_uint() << 8)
+  | (b[pos + 2].to_int().to_uint() << 16)
+  | (b[pos + 3].to_int().to_uint() << 24)
+}
+
+fn read_u32_be(b : Bytes, pos : Int) -> UInt {
+  (b[pos].to_int().to_uint() << 24)
+  | (b[pos + 1].to_int().to_uint() << 16)
+  | (b[pos + 2].to_int().to_uint() << 8)
+  | b[pos + 3].to_int().to_uint()
+}
+
+fn read_u64_le(b : Bytes, pos : Int) -> UInt64 {
+  b[pos].to_int().to_int64().to_uint64()
+  | (b[pos + 1].to_int().to_int64().to_uint64() << 8)
+  | (b[pos + 2].to_int().to_int64().to_uint64() << 16)
+  | (b[pos + 3].to_int().to_int64().to_uint64() << 24)
+  | (b[pos + 4].to_int().to_int64().to_uint64() << 32)
+  | (b[pos + 5].to_int().to_int64().to_uint64() << 40)
+  | (b[pos + 6].to_int().to_int64().to_uint64() << 48)
+  | (b[pos + 7].to_int().to_int64().to_uint64() << 56)
+}
+
+fn read_u64_be(b : Bytes, pos : Int) -> UInt64 {
+  (b[pos].to_int().to_int64().to_uint64() << 56)
+  | (b[pos + 1].to_int().to_int64().to_uint64() << 48)
+  | (b[pos + 2].to_int().to_int64().to_uint64() << 40)
+  | (b[pos + 3].to_int().to_int64().to_uint64() << 32)
+  | (b[pos + 4].to_int().to_int64().to_uint64() << 24)
+  | (b[pos + 5].to_int().to_int64().to_uint64() << 16)
+  | (b[pos + 6].to_int().to_int64().to_uint64() << 8)
+  | b[pos + 7].to_int().to_int64().to_uint64()
+}
