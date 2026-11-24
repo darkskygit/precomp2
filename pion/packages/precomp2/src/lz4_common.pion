@@ -1,0 +1,435 @@
+///| Byte-exact LZ4HC compressor dispatch, shared helpers, sequence writer, and LZ4 block decompressor.
+
+let lz4_min_match : Int = 4
+
+let lz4_mf_limit : Int = 12
+
+let lz4_last_literals : Int = 5
+
+let lz4_max_input_size : Int = 0x7E000000
+
+let lz4_run_mask : Int = 15
+
+let lz4_ml_mask : Int = 15
+
+///| `LZ4_compressBound`.
+pub fn compress_bound(len : Int) -> Int {
+  if len < 0 || len > lz4_max_input_size {
+    0
+  } else {
+    len + len / 255 + 16
+  }
+}
+
+///| A liblz4 release class and compression level reproduced byte-for-byte.
+pub enum Compressor {
+  V1_10_0_L12
+  V1_9_1_L12
+  R131_L16
+}
+
+///| All supported compressors, newest release first.
+pub fn Compressor::all() -> Array[Compressor] {
+  [Compressor::V1_10_0_L12, Compressor::V1_9_1_L12, Compressor::R131_L16]
+}
+
+///| Decode a compressor id from its wire byte.
+pub fn Compressor::from_u8(id : Byte) -> Result[Compressor, Error] {
+  match id.to_int() {
+    3 => Ok(Compressor::V1_10_0_L12)
+    2 => Ok(Compressor::V1_9_1_L12)
+    4 => Ok(Compressor::R131_L16)
+    _ => Err(Error::InvalidSegment("unknown lz4 compressor id"))
+  }
+}
+
+///| Wire byte discriminant written into PCF2 UnityFS segment metadata.
+pub fn Compressor::to_u8(self : Compressor) -> Byte {
+  match self {
+    Compressor::V1_10_0_L12 => (3).to_byte()
+    Compressor::V1_9_1_L12 => (2).to_byte()
+    Compressor::R131_L16 => (4).to_byte()
+  }
+}
+
+///| Equality comparison for `Compressor`.
+pub fn compressor_eq(a : Compressor, b : Compressor) -> Bool {
+  a.to_u8() == b.to_u8()
+}
+
+///| liblz4 release string for this compressor class.
+pub fn Compressor::release(self : Compressor) -> String {
+  match self {
+    Compressor::V1_10_0_L12 => "1.10.0"
+    Compressor::V1_9_1_L12 => "1.9.1"
+    Compressor::R131_L16 => "r131"
+  }
+}
+
+///| Compression level passed to `LZ4_compress_HC`.
+pub fn Compressor::level(self : Compressor) -> Int {
+  match self {
+    Compressor::V1_10_0_L12 | Compressor::V1_9_1_L12 => 12
+    Compressor::R131_L16 => 16
+  }
+}
+
+///| Compress `src` byte-for-byte identically to `LZ4_compress_HC` with `dst_capacity`.
+///| Returns `None` when the output does not fit or input exceeds `lz4_max_input_size`.
+pub fn Compressor::compress(
+  self : Compressor,
+  src : Bytes,
+  dst_capacity : Int,
+) -> Option[Bytes] {
+  let slen = src.length()
+  if slen > lz4_max_input_size {
+    return None
+  }
+  let bound = compress_bound(slen)
+  let limit = if dst_capacity < bound { Some(dst_capacity) } else { None }
+  match self {
+    Compressor::V1_10_0_L12 => lz4_optimal_compress(src, limit, true, true)
+    Compressor::V1_9_1_L12 => lz4_optimal_compress(src, limit, false, false)
+    Compressor::R131_L16 => lz4_hashchain_compress(src, limit, 32768)
+  }
+}
+
+///| Knuth multiplicative hash, 15 bits.
+fn lz4_hash(v : UInt) -> Int {
+  ((v * 2654435761U) >> 17).to_int()
+}
+
+///| Hash 4 bytes at `src[pos..pos+4]`.
+fn lz4_hash4(src : Bytes, pos : Int) -> Int {
+  lz4_hash(read_u32_le(src, pos))
+}
+
+///| Index (0..7) of the lowest non-zero byte in a non-zero `UInt64`.
+fn lz4_first_diff_byte(diff : UInt64) -> Int {
+  let mut x = diff
+  let mut n = 0
+  if (x & 0xFFFFFFFFUL) == 0UL {
+    n += 4
+    x = x >> 32
+  }
+  if (x & 0xFFFFUL) == 0UL {
+    n += 2
+    x = x >> 16
+  }
+  if (x & 0xFFUL) == 0UL {
+    n += 1
+  }
+  n
+}
+
+///| Length of common prefix of `src[a..limit]` and `src[b..]` (`b < a`).
+fn lz4_common_prefix(src : Bytes, a : Int, b : Int, limit : Int) -> Int {
+  let mut n = 0
+  while a + n + 8 <= limit {
+    let x = read_u64_le(src, a + n)
+    let y = read_u64_le(src, b + n)
+    if x != y {
+      return n + lz4_first_diff_byte(x ^ y)
+    }
+    n += 8
+  }
+  while a + n < limit && src[a + n] == src[b + n] {
+    n += 1
+  }
+  n
+}
+
+///| Broadcast a single byte to all 8 lanes of a `UInt64`.
+fn lz4_splat64(b : Byte) -> UInt64 {
+  let v = b.to_int().to_int64().to_uint64()
+  let v2 = v | (v << 8)
+  let v4 = v2 | (v2 << 16)
+  v4 | (v4 << 32)
+}
+
+///| Broadcast a single byte to all 4 lanes of a `UInt`.
+fn lz4_splat32(b : Byte) -> UInt {
+  let v = b.to_int().to_uint()
+  let v2 = v | (v << 8)
+  v2 | (v2 << 16)
+}
+
+///| Run length of `byte` in `src[from..to]`.
+fn lz4_run_forward(src : Bytes, from : Int, to : Int, byte : Byte) -> Int {
+  let word = lz4_splat64(byte)
+  let mut p = from
+  while p + 8 <= to {
+    let diff = read_u64_le(src, p) ^ word
+    if diff != 0UL {
+      return p - from + lz4_first_diff_byte(diff)
+    }
+    p += 8
+  }
+  while p < to && src[p] == byte {
+    p += 1
+  }
+  p - from
+}
+
+///| Run length of `byte` ending at `src[..to]`, not before `low`.
+fn lz4_run_backward(src : Bytes, to : Int, low : Int, byte : Byte) -> Int {
+  let mut p = to
+  while p > low && src[p - 1] == byte {
+    p -= 1
+  }
+  to - p
+}
+
+///| A match of `len` bytes at `start` repeating `source` (`source < start`).
+struct Lz4Match {
+  mut start : Int
+  mut source : Int
+  mut len : Int
+}
+
+///| LZ4 block sequence writer with liblz4's conservative output-limit checks.
+///| `use_div255`: true for optimal parser (`len / 255`), false for r131 (`len >> 8`).
+struct Lz4SequenceWriter {
+  src : Bytes
+  out : FixedArray[Byte]
+  mut pos : Int
+  mut anchor : Int
+  has_limit : Bool
+  limit : Int
+  use_div255 : Bool
+}
+
+fn Lz4SequenceWriter::new(
+  src : Bytes,
+  limit_opt : Option[Int],
+  use_div255 : Bool,
+) -> Lz4SequenceWriter {
+  let bound = compress_bound(src.length())
+  let alloc = if bound > 16 { bound + 16 } else { 32 }
+  let (has_limit, limit) = match limit_opt {
+    Some(l) => (true, l)
+    None => (false, 0)
+  }
+  Lz4SequenceWriter::{
+    src,
+    out: FixedArray::make(alloc, (0).to_byte()),
+    pos: 0,
+    anchor: 0,
+    has_limit,
+    limit,
+    use_div255,
+  }
+}
+
+fn Lz4SequenceWriter::estimate(self : Lz4SequenceWriter, len : Int) -> Int {
+  if self.use_div255 {
+    len / 255
+  } else {
+    len >> 8
+  }
+}
+
+fn Lz4SequenceWriter::exceeds(self : Lz4SequenceWriter, needed : Int) -> Bool {
+  self.has_limit && needed > self.limit
+}
+
+fn Lz4SequenceWriter::push_length(
+  self : Lz4SequenceWriter,
+  rest_in : Int,
+) -> Unit {
+  let mut rest = rest_in
+  while rest >= 255 {
+    self.out[self.pos] = (255).to_byte()
+    self.pos += 1
+    rest -= 255
+  }
+  self.out[self.pos] = rest.to_byte()
+  self.pos += 1
+}
+
+///| Emit literals `[anchor, start)` followed by a match `(offset, len)`.
+///| Returns `false` on output overflow.
+fn Lz4SequenceWriter::sequence(
+  self : Lz4SequenceWriter,
+  start : Int,
+  offset : Int,
+  len : Int,
+) -> Bool {
+  let literals = start - self.anchor
+  let token = self.pos
+  self.out[token] = (0).to_byte()
+  self.pos += 1
+  if self.exceeds(
+    self.pos + self.estimate(literals) + literals + 2 + 1 + lz4_last_literals,
+  ) {
+    return false
+  }
+  if literals >= lz4_run_mask {
+    self.out[token] = (lz4_run_mask << 4).to_byte()
+    self.push_length(literals - lz4_run_mask)
+  } else {
+    self.out[token] = (literals << 4).to_byte()
+  }
+  let mut i = self.anchor
+  let mut op = self.pos
+  while i < start {
+    self.out[op] = self.src[i]
+    i += 1
+    op += 1
+  }
+  self.out[op] = (offset & 0xFF).to_byte()
+  self.out[op + 1] = ((offset >> 8) & 0xFF).to_byte()
+  self.pos = op + 2
+  let ml_code = len - lz4_min_match
+  if self.exceeds(self.pos + self.estimate(ml_code) + 1 + lz4_last_literals) {
+    return false
+  }
+  if ml_code >= lz4_ml_mask {
+    self.out[token] = (self.out[token].to_int() | lz4_ml_mask).to_byte()
+    self.push_length(ml_code - lz4_ml_mask)
+  } else {
+    self.out[token] = (self.out[token].to_int() | ml_code).to_byte()
+  }
+  self.anchor = start + len
+  true
+}
+
+///| Emit trailing literals and return the encoded block, or `None` on overflow.
+fn Lz4SequenceWriter::finish(self : Lz4SequenceWriter) -> Option[Bytes] {
+  let slen = self.src.length()
+  let literals = slen - self.anchor
+  let extra = (literals + 255 - lz4_run_mask) / 255
+  if self.exceeds(self.pos + 1 + extra + literals) {
+    return None
+  }
+  if literals >= lz4_run_mask {
+    self.out[self.pos] = (lz4_run_mask << 4).to_byte()
+    self.pos += 1
+    self.push_length(literals - lz4_run_mask)
+  } else {
+    self.out[self.pos] = (literals << 4).to_byte()
+    self.pos += 1
+  }
+  let mut i = self.anchor
+  let mut op = self.pos
+  while i < slen {
+    self.out[op] = self.src[i]
+    i += 1
+    op += 1
+  }
+  self.pos = op
+  let res : FixedArray[Byte] = FixedArray::make(self.pos, (0).to_byte())
+  let mut k = 0
+  while k < self.pos {
+    res[k] = self.out[k]
+    k += 1
+  }
+  Some(bytes_from_fixed_array(res))
+}
+
+///| Pure-Pion LZ4 block decompressor matching `lz4_flex::block::decompress` with strict bounds checks.
+pub fn lz4_decompress(
+  compressed : Bytes,
+  uncompressed_size : Int,
+) -> Result[Bytes, Error] {
+  if uncompressed_size < 0 {
+    return Err(Error::InvalidSegment("negative lz4 uncompressed size"))
+  }
+  let src_len = compressed.length()
+  if src_len == 0 {
+    return Err(Error::InvalidSegment("empty lz4 block"))
+  }
+  let out : FixedArray[Byte] = FixedArray::make(
+    uncompressed_size,
+    (0).to_byte(),
+  )
+  let mut ip = 0
+  let mut op = 0
+  while true {
+    if ip >= src_len {
+      return Err(Error::InvalidSegment("lz4 unexpected eof after match"))
+    }
+    let token = compressed[ip].to_int()
+    ip += 1
+    let mut lit_len = token >> 4
+    if lit_len == 15 {
+      while true {
+        if ip >= src_len {
+          return Err(Error::InvalidSegment("lz4 truncated literal length"))
+        }
+        let b = compressed[ip].to_int()
+        ip += 1
+        if b > uncompressed_size - lit_len {
+          return Err(Error::InvalidSegment("lz4 literal length overflow"))
+        }
+        lit_len += b
+        if b != 255 {
+          break
+        }
+      }
+    }
+    if lit_len > src_len - ip {
+      return Err(Error::InvalidSegment("lz4 literal out of input bounds"))
+    }
+    if lit_len > uncompressed_size - op {
+      return Err(Error::InvalidSegment("lz4 literal exceeds output size"))
+    }
+    let mut i = 0
+    while i < lit_len {
+      out[op + i] = compressed[ip + i]
+      i += 1
+    }
+    ip += lit_len
+    op += lit_len
+    if ip == src_len {
+      break
+    }
+    if 2 > src_len - ip {
+      return Err(Error::InvalidSegment("lz4 truncated match offset"))
+    }
+    let offset = compressed[ip].to_int() | (compressed[ip + 1].to_int() << 8)
+    ip += 2
+    if offset == 0 || offset > op {
+      return Err(Error::InvalidSegment("lz4 invalid match offset"))
+    }
+    let mut match_len = (token & 15) + 4
+    if (token & 15) == 15 {
+      while true {
+        if ip >= src_len {
+          return Err(Error::InvalidSegment("lz4 truncated match length"))
+        }
+        let b = compressed[ip].to_int()
+        ip += 1
+        if b > uncompressed_size - match_len {
+          return Err(Error::InvalidSegment("lz4 match length overflow"))
+        }
+        match_len += b
+        if b != 255 {
+          break
+        }
+      }
+    }
+    if match_len > uncompressed_size - op {
+      return Err(Error::InvalidSegment("lz4 match exceeds output size"))
+    }
+    let mut match_src = op - offset
+    let mut m = 0
+    while m < match_len {
+      out[op] = out[match_src]
+      op += 1
+      match_src += 1
+      m += 1
+    }
+  }
+  if op == uncompressed_size {
+    Ok(bytes_from_fixed_array(out))
+  } else {
+    let trimmed : FixedArray[Byte] = FixedArray::make(op, (0).to_byte())
+    let mut k = 0
+    while k < op {
+      trimmed[k] = out[k]
+      k += 1
+    }
+    Ok(bytes_from_fixed_array(trimmed))
+  }
+}

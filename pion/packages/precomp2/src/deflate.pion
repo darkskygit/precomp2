@@ -1,0 +1,328 @@
+///| Raw DEFLATE, zlib, and gzip codecs using `preflate` and `flate` checksums.
+
+import "flate"
+
+fn adler32(data : Bytes) -> UInt {
+  flate::adler32(data)
+}
+
+fn crc32(data : Bytes) -> UInt {
+  flate::crc32(data)
+}
+
+fn encode_deflate(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Pcf2Segment], Error] {
+  if input.length() == 0 {
+    return Ok(None)
+  }
+  let pf = match preflate_analyze(input) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  let (deflate_len, corrections, plain) = match parse_preflate_output(pf) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  if deflate_len != input.length().to_int64().to_uint64() {
+    return Ok(None)
+  }
+  let (payload_kind, payload) = match
+  choose_payload(plain, input.length(), config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let data = build_preflate_data(corrections, payload)
+  let meta = bytes_from_array([(0).to_byte(), payload_kind])
+  Ok(
+    Some(Pcf2Segment::{
+      kind: SegmentKind::Dflt.to_u8(),
+      flags: (0).to_byte(),
+      orig_len: input.length().to_int64().to_uint64(),
+      meta,
+      data,
+    }),
+  )
+}
+
+fn encode_zlib(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Pcf2Segment], Error] {
+  let ilen = input.length()
+  if ilen < 6 {
+    return Ok(None)
+  }
+  let cmf = input[0].to_int()
+  let flg = input[1].to_int()
+  if (cmf & 0x0F) != 8 || (cmf >> 4) > 7 {
+    return Ok(None)
+  }
+  let check = (cmf << 8) | flg
+  if check % 31 != 0 || (flg & 0x20) != 0 {
+    return Ok(None)
+  }
+  let deflate = bytes_slice(input, 2, ilen - 4)
+  let pf = match preflate_analyze(deflate) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  let (deflate_len, corrections, plain) = match parse_preflate_output(pf) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  if deflate_len != deflate.length().to_int64().to_uint64() {
+    return Ok(None)
+  }
+  let expected_adler = read_u32_be(input, ilen - 4)
+  if adler32(plain) != expected_adler {
+    return Ok(None)
+  }
+  let (payload_kind, payload) = match
+  choose_payload(plain, ilen, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let data = build_preflate_data(corrections, payload)
+  let meta : Array[Byte] = []
+  meta.push((0).to_byte())
+  meta.push(payload_kind)
+  meta.push(input[0])
+  meta.push(input[1])
+  append_bytes_slice(meta, input, ilen - 4, ilen)
+  Ok(
+    Some(Pcf2Segment::{
+      kind: SegmentKind::Zlib.to_u8(),
+      flags: (0).to_byte(),
+      orig_len: ilen.to_int64().to_uint64(),
+      meta: bytes_from_array(meta),
+      data,
+    }),
+  )
+}
+
+fn parse_gzip_header(input : Bytes) -> Result[(Int, Bytes), Error] {
+  let ilen = input.length()
+  if ilen < 10 {
+    return Err(Error::InvalidSegment("gzip header too short"))
+  }
+  let flags = input[3].to_int()
+  let mut offset = 10
+  if (flags & 0x04) != 0 {
+    if 2 > ilen - offset {
+      return Err(Error::InvalidSegment("gzip extra"))
+    }
+    let xlen = read_u16_le(input, offset)
+    if xlen > ilen - offset - 2 {
+      return Err(Error::InvalidSegment("gzip header bounds"))
+    }
+    offset += 2 + xlen
+  }
+  if (flags & 0x08) != 0 {
+    while offset < ilen && input[offset] != (0).to_byte() {
+      offset += 1
+    }
+    offset += 1
+  }
+  if (flags & 0x10) != 0 {
+    while offset < ilen && input[offset] != (0).to_byte() {
+      offset += 1
+    }
+    offset += 1
+  }
+  if (flags & 0x02) != 0 {
+    offset += 2
+  }
+  if offset > ilen {
+    return Err(Error::InvalidSegment("gzip header bounds"))
+  }
+  Ok((offset, bytes_slice(input, 0, offset)))
+}
+
+fn encode_gzip(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Pcf2Segment], Error] {
+  let ilen = input.length()
+  if ilen < 18 || input[0] != (0x1F).to_byte() || input[1] != (0x8B).to_byte() {
+    return Ok(None)
+  }
+  let (header_len, header_bytes) = match parse_gzip_header(input) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if ilen < header_len + 8 {
+    return Ok(None)
+  }
+  let deflate = bytes_slice(input, header_len, ilen - 8)
+  let pf = match preflate_analyze(deflate) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  let (deflate_len, corrections, plain) = match parse_preflate_output(pf) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  if deflate_len != deflate.length().to_int64().to_uint64() {
+    return Ok(None)
+  }
+  let crc_expected = read_u32_le(input, ilen - 8)
+  let isize_expected = read_u32_le(input, ilen - 4)
+  if crc32(plain) != crc_expected || isize_expected != plain.length().to_uint() {
+    return Ok(None)
+  }
+  let (payload_kind, payload) = match
+  choose_payload(plain, ilen, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let data = build_preflate_data(corrections, payload)
+  let meta : Array[Byte] = []
+  meta.push((0).to_byte())
+  meta.push(payload_kind)
+  write_varint(header_bytes.length().to_int64().to_uint64(), meta)
+  append_bytes(meta, header_bytes)
+  append_bytes_slice(meta, input, ilen - 8, ilen)
+  Ok(
+    Some(Pcf2Segment::{
+      kind: SegmentKind::Gzip.to_u8(),
+      flags: (0).to_byte(),
+      orig_len: ilen.to_int64().to_uint64(),
+      meta: bytes_from_array(meta),
+      data,
+    }),
+  )
+}
+
+fn decode_deflate_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  let (meta_version, payload_kind, _) = match parse_meta_header(segment.meta) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if meta_version != (0).to_byte() {
+    return Err(Error::InvalidSegment("deflate meta_version"))
+  }
+  let (corrections, payload) = match parse_preflate_data(segment.data) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let plain = match
+  decode_payload(payload_kind, payload, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let deflate = match preflate_reencode(corrections, plain) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match budget.consume(deflate.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(deflate)
+}
+
+fn decode_zlib_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  let (meta_version, payload_kind, rest) = match
+  parse_meta_header(segment.meta) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if meta_version != (0).to_byte() || rest.length() < 6 {
+    return Err(Error::InvalidSegment("zlib meta"))
+  }
+  if rest.length() > 6 {
+    return Err(Error::InvalidSegment("zlib meta trailing"))
+  }
+  let (corrections, payload) = match parse_preflate_data(segment.data) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let plain = match
+  decode_payload(payload_kind, payload, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let deflate = match preflate_reencode(corrections, plain) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let out : Array[Byte] = []
+  append_bytes_slice(out, rest, 0, 2)
+  append_bytes(out, deflate)
+  append_bytes_slice(out, rest, 2, 6)
+  let result = bytes_from_array(out)
+  match budget.consume(result.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(result)
+}
+
+fn decode_gzip_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  let (meta_version, payload_kind, rest) = match
+  parse_meta_header(segment.meta) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if meta_version != (0).to_byte() {
+    return Err(Error::InvalidSegment("gzip meta_version"))
+  }
+  let (header_len_u, p1) = match read_varint_slice(rest, 0) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let header_len = match u64_to_int_checked(header_len_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let avail = rest.length() - p1
+  if avail < 8 || header_len > avail - 8 {
+    return Err(Error::InvalidSegment("gzip meta bounds"))
+  }
+  let (corrections, payload) = match parse_preflate_data(segment.data) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let plain = match
+  decode_payload(payload_kind, payload, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let deflate = match preflate_reencode(corrections, plain) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let out : Array[Byte] = []
+  append_bytes_slice(out, rest, p1, p1 + header_len)
+  append_bytes(out, deflate)
+  append_bytes_slice(out, rest, p1 + header_len, p1 + header_len + 8)
+  let result = bytes_from_array(out)
+  match budget.consume(result.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(result)
+}

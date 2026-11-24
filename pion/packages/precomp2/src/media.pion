@@ -1,0 +1,210 @@
+///| JPEG / Motion-JPEG lossless codec using `lepton` and standard MJPG DHT tables.
+
+import "lepton"
+
+let mjpg_dht_len : Int = 420
+
+let mjpg_dht : Bytes = bytes_from_array([
+  (0xFF).to_byte(), (0xC4).to_byte(), (0x01).to_byte(), (0xA2).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x01).to_byte(), (0x05).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x01).to_byte(),
+  (0x02).to_byte(), (0x03).to_byte(), (0x04).to_byte(), (0x05).to_byte(), (0x06).to_byte(), (0x07).to_byte(), (0x08).to_byte(), (0x09).to_byte(), (0x0A).to_byte(), (0x0B).to_byte(), (0x01).to_byte(), (0x00).to_byte(), (0x03).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x01).to_byte(), (0x00).to_byte(),
+  (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x01).to_byte(), (0x02).to_byte(), (0x03).to_byte(), (0x04).to_byte(), (0x05).to_byte(), (0x06).to_byte(), (0x07).to_byte(), (0x08).to_byte(), (0x09).to_byte(), (0x0A).to_byte(), (0x0B).to_byte(), (0x10).to_byte(), (0x00).to_byte(), (0x02).to_byte(), (0x01).to_byte(), (0x03).to_byte(), (0x03).to_byte(), (0x02).to_byte(),
+  (0x04).to_byte(), (0x03).to_byte(), (0x05).to_byte(), (0x05).to_byte(), (0x04).to_byte(), (0x04).to_byte(), (0x00).to_byte(), (0x00).to_byte(), (0x01).to_byte(), (0x7D).to_byte(), (0x01).to_byte(), (0x02).to_byte(), (0x03).to_byte(), (0x00).to_byte(), (0x04).to_byte(), (0x11).to_byte(), (0x05).to_byte(), (0x12).to_byte(), (0x21).to_byte(), (0x31).to_byte(), (0x41).to_byte(), (0x06).to_byte(), (0x13).to_byte(),
+  (0x51).to_byte(), (0x61).to_byte(), (0x07).to_byte(), (0x22).to_byte(), (0x71).to_byte(), (0x14).to_byte(), (0x32).to_byte(), (0x81).to_byte(), (0x91).to_byte(), (0xA1).to_byte(), (0x08).to_byte(), (0x23).to_byte(), (0x42).to_byte(), (0xB1).to_byte(), (0xC1).to_byte(), (0x15).to_byte(), (0x52).to_byte(), (0xD1).to_byte(), (0xF0).to_byte(), (0x24).to_byte(), (0x33).to_byte(), (0x62).to_byte(), (0x72).to_byte(),
+  (0x82).to_byte(), (0x09).to_byte(), (0x0A).to_byte(), (0x16).to_byte(), (0x17).to_byte(), (0x18).to_byte(), (0x19).to_byte(), (0x1A).to_byte(), (0x25).to_byte(), (0x26).to_byte(), (0x27).to_byte(), (0x28).to_byte(), (0x29).to_byte(), (0x2A).to_byte(), (0x34).to_byte(), (0x35).to_byte(), (0x36).to_byte(), (0x37).to_byte(), (0x38).to_byte(), (0x39).to_byte(), (0x3A).to_byte(), (0x43).to_byte(), (0x44).to_byte(),
+  (0x45).to_byte(), (0x46).to_byte(), (0x47).to_byte(), (0x48).to_byte(), (0x49).to_byte(), (0x4A).to_byte(), (0x53).to_byte(), (0x54).to_byte(), (0x55).to_byte(), (0x56).to_byte(), (0x57).to_byte(), (0x58).to_byte(), (0x59).to_byte(), (0x5A).to_byte(), (0x63).to_byte(), (0x64).to_byte(), (0x65).to_byte(), (0x66).to_byte(), (0x67).to_byte(), (0x68).to_byte(), (0x69).to_byte(), (0x6A).to_byte(), (0x73).to_byte(),
+  (0x74).to_byte(), (0x75).to_byte(), (0x76).to_byte(), (0x77).to_byte(), (0x78).to_byte(), (0x79).to_byte(), (0x7A).to_byte(), (0x83).to_byte(), (0x84).to_byte(), (0x85).to_byte(), (0x86).to_byte(), (0x87).to_byte(), (0x88).to_byte(), (0x89).to_byte(), (0x8A).to_byte(), (0x92).to_byte(), (0x93).to_byte(), (0x94).to_byte(), (0x95).to_byte(), (0x96).to_byte(), (0x97).to_byte(), (0x98).to_byte(), (0x99).to_byte(),
+  (0x9A).to_byte(), (0xA2).to_byte(), (0xA3).to_byte(), (0xA4).to_byte(), (0xA5).to_byte(), (0xA6).to_byte(), (0xA7).to_byte(), (0xA8).to_byte(), (0xA9).to_byte(), (0xAA).to_byte(), (0xB2).to_byte(), (0xB3).to_byte(), (0xB4).to_byte(), (0xB5).to_byte(), (0xB6).to_byte(), (0xB7).to_byte(), (0xB8).to_byte(), (0xB9).to_byte(), (0xBA).to_byte(), (0xC2).to_byte(), (0xC3).to_byte(), (0xC4).to_byte(), (0xC5).to_byte(),
+  (0xC6).to_byte(), (0xC7).to_byte(), (0xC8).to_byte(), (0xC9).to_byte(), (0xCA).to_byte(), (0xD2).to_byte(), (0xD3).to_byte(), (0xD4).to_byte(), (0xD5).to_byte(), (0xD6).to_byte(), (0xD7).to_byte(), (0xD8).to_byte(), (0xD9).to_byte(), (0xDA).to_byte(), (0xE1).to_byte(), (0xE2).to_byte(), (0xE3).to_byte(), (0xE4).to_byte(), (0xE5).to_byte(), (0xE6).to_byte(), (0xE7).to_byte(), (0xE8).to_byte(), (0xE9).to_byte(),
+  (0xEA).to_byte(), (0xF1).to_byte(), (0xF2).to_byte(), (0xF3).to_byte(), (0xF4).to_byte(), (0xF5).to_byte(), (0xF6).to_byte(), (0xF7).to_byte(), (0xF8).to_byte(), (0xF9).to_byte(), (0xFA).to_byte(), (0x11).to_byte(), (0x00).to_byte(), (0x02).to_byte(), (0x01).to_byte(), (0x02).to_byte(), (0x04).to_byte(), (0x04).to_byte(), (0x03).to_byte(), (0x04).to_byte(), (0x07).to_byte(), (0x05).to_byte(), (0x04).to_byte(),
+  (0x04).to_byte(), (0x00).to_byte(), (0x01).to_byte(), (0x02).to_byte(), (0x77).to_byte(), (0x00).to_byte(), (0x01).to_byte(), (0x02).to_byte(), (0x03).to_byte(), (0x11).to_byte(), (0x04).to_byte(), (0x05).to_byte(), (0x21).to_byte(), (0x31).to_byte(), (0x06).to_byte(), (0x12).to_byte(), (0x41).to_byte(), (0x51).to_byte(), (0x07).to_byte(), (0x61).to_byte(), (0x71).to_byte(), (0x13).to_byte(), (0x22).to_byte(),
+  (0x32).to_byte(), (0x81).to_byte(), (0x08).to_byte(), (0x14).to_byte(), (0x42).to_byte(), (0x91).to_byte(), (0xA1).to_byte(), (0xB1).to_byte(), (0xC1).to_byte(), (0x09).to_byte(), (0x23).to_byte(), (0x33).to_byte(), (0x52).to_byte(), (0xF0).to_byte(), (0x15).to_byte(), (0x62).to_byte(), (0x72).to_byte(), (0xD1).to_byte(), (0x0A).to_byte(), (0x16).to_byte(), (0x24).to_byte(), (0x34).to_byte(), (0xE1).to_byte(),
+  (0x25).to_byte(), (0xF1).to_byte(), (0x17).to_byte(), (0x18).to_byte(), (0x19).to_byte(), (0x1A).to_byte(), (0x26).to_byte(), (0x27).to_byte(), (0x28).to_byte(), (0x29).to_byte(), (0x2A).to_byte(), (0x35).to_byte(), (0x36).to_byte(), (0x37).to_byte(), (0x38).to_byte(), (0x39).to_byte(), (0x3A).to_byte(), (0x43).to_byte(), (0x44).to_byte(), (0x45).to_byte(), (0x46).to_byte(), (0x47).to_byte(), (0x48).to_byte(),
+  (0x49).to_byte(), (0x4A).to_byte(), (0x53).to_byte(), (0x54).to_byte(), (0x55).to_byte(), (0x56).to_byte(), (0x57).to_byte(), (0x58).to_byte(), (0x59).to_byte(), (0x5A).to_byte(), (0x63).to_byte(), (0x64).to_byte(), (0x65).to_byte(), (0x66).to_byte(), (0x67).to_byte(), (0x68).to_byte(), (0x69).to_byte(), (0x6A).to_byte(), (0x73).to_byte(), (0x74).to_byte(), (0x75).to_byte(), (0x76).to_byte(), (0x77).to_byte(),
+  (0x78).to_byte(), (0x79).to_byte(), (0x7A).to_byte(), (0x82).to_byte(), (0x83).to_byte(), (0x84).to_byte(), (0x85).to_byte(), (0x86).to_byte(), (0x87).to_byte(), (0x88).to_byte(), (0x89).to_byte(), (0x8A).to_byte(), (0x92).to_byte(), (0x93).to_byte(), (0x94).to_byte(), (0x95).to_byte(), (0x96).to_byte(), (0x97).to_byte(), (0x98).to_byte(), (0x99).to_byte(), (0x9A).to_byte(), (0xA2).to_byte(), (0xA3).to_byte(),
+  (0xA4).to_byte(), (0xA5).to_byte(), (0xA6).to_byte(), (0xA7).to_byte(), (0xA8).to_byte(), (0xA9).to_byte(), (0xAA).to_byte(), (0xB2).to_byte(), (0xB3).to_byte(), (0xB4).to_byte(), (0xB5).to_byte(), (0xB6).to_byte(), (0xB7).to_byte(), (0xB8).to_byte(), (0xB9).to_byte(), (0xBA).to_byte(), (0xC2).to_byte(), (0xC3).to_byte(), (0xC4).to_byte(), (0xC5).to_byte(), (0xC6).to_byte(), (0xC7).to_byte(), (0xC8).to_byte(),
+  (0xC9).to_byte(), (0xCA).to_byte(), (0xD2).to_byte(), (0xD3).to_byte(), (0xD4).to_byte(), (0xD5).to_byte(), (0xD6).to_byte(), (0xD7).to_byte(), (0xD8).to_byte(), (0xD9).to_byte(), (0xDA).to_byte(), (0xE2).to_byte(), (0xE3).to_byte(), (0xE4).to_byte(), (0xE5).to_byte(), (0xE6).to_byte(), (0xE7).to_byte(), (0xE8).to_byte(), (0xE9).to_byte(), (0xEA).to_byte(), (0xF2).to_byte(), (0xF3).to_byte(), (0xF4).to_byte(),
+  (0xF5).to_byte(), (0xF6).to_byte(), (0xF7).to_byte(), (0xF8).to_byte(), (0xF9).to_byte(), (0xFA).to_byte(),
+])
+
+///| Check whether a JPEG header contains a DHT (0xFFC4) segment before SOS/EOI.
+pub fn jpeg_has_dht(jpeg : Bytes) -> Bool {
+  let jlen = jpeg.length()
+  if jlen < 4 || jpeg[0] != (0xFF).to_byte() || jpeg[1] != (0xD8).to_byte() {
+    return false
+  }
+  let mut pos = 2
+  while pos + 1 < jlen {
+    if jpeg[pos] != (0xFF).to_byte() {
+      pos += 1
+      continue
+    }
+    while pos < jlen && jpeg[pos] == (0xFF).to_byte() {
+      pos += 1
+    }
+    if pos >= jlen {
+      break
+    }
+    let marker = jpeg[pos].to_int()
+    pos += 1
+    if marker == 0xD9 || marker == 0xDA {
+      break
+    }
+    if marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7) {
+      continue
+    }
+    if pos + 1 >= jlen {
+      break
+    }
+    let seg_len = read_u16_be(jpeg, pos)
+    if seg_len < 2 || pos + seg_len > jlen {
+      break
+    }
+    if marker == 0xC4 {
+      return true
+    }
+    pos += seg_len
+  }
+  false
+}
+
+fn find_ffda_insert_pos(jpeg : Bytes) -> Option[Int] {
+  let jlen = jpeg.length()
+  let mut found_ff = false
+  let mut i = 0
+  while i < jlen {
+    let b = jpeg[i].to_int()
+    if found_ff {
+      if b == 0xDA {
+        if i - 1 >= 0 {
+          return Some(i - 1)
+        }
+        return None
+      }
+      found_ff = false
+    } else {
+      found_ff = b == 0xFF
+    }
+    i += 1
+  }
+  None
+}
+
+fn insert_mjpg_dht(jpeg : Bytes) -> Option[Bytes] {
+  if jpeg.length() < 4 ||
+  jpeg[0] != (0xFF).to_byte() ||
+  jpeg[1] != (0xD8).to_byte() {
+    return None
+  }
+  let insert_pos = match find_ffda_insert_pos(jpeg) {
+    Some(p) => p
+    None => return None
+  }
+  let out : Array[Byte] = []
+  append_bytes_slice(out, jpeg, 0, insert_pos)
+  append_bytes(out, mjpg_dht)
+  append_bytes_slice(out, jpeg, insert_pos, jpeg.length())
+  Some(bytes_from_array(out))
+}
+
+fn remove_mjpg_dht(jpeg : Bytes) -> Option[Bytes] {
+  let jlen = jpeg.length()
+  if jlen < mjpg_dht_len + 4 ||
+  jpeg[0] != (0xFF).to_byte() ||
+  jpeg[1] != (0xD8).to_byte() {
+    return None
+  }
+  let insert_pos = match find_ffda_insert_pos(jpeg) {
+    Some(p) => p
+    None => return None
+  }
+  if insert_pos < mjpg_dht_len {
+    return None
+  }
+  let start = insert_pos - mjpg_dht_len
+  if !bytes_eq_range(jpeg, start, mjpg_dht, 0, mjpg_dht_len) {
+    return None
+  }
+  let out : Array[Byte] = []
+  append_bytes_slice(out, jpeg, 0, start)
+  append_bytes_slice(out, jpeg, insert_pos, jlen)
+  Some(bytes_from_array(out))
+}
+
+fn encode_jpg(input : Bytes) -> Result[Option[Pcf2Segment], Error] {
+  if input.length() < 4 ||
+  input[0] != (0xFF).to_byte() ||
+  input[1] != (0xD8).to_byte() {
+    return Ok(None)
+  }
+  let mut mjpg_used = false
+  let mut jpeg = input
+  let lep_res = if jpeg_has_dht(jpeg) {
+    lepton::encode(jpeg)
+  } else {
+    match lepton::encode(jpeg) {
+      Ok(v) => Ok(v)
+      Err(_) =>
+      match insert_mjpg_dht(jpeg) {
+        Some(with_dht) => {
+          mjpg_used = true
+          jpeg = with_dht
+          lepton::encode(jpeg)
+        }
+        None => return Ok(None)
+      }
+    }
+  }
+  let lepton_bytes = match lep_res {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  let restored = match lepton::decode(lepton_bytes) {
+    Ok(v) => v
+    Err(_) => return Ok(None)
+  }
+  if !bytes_eq(restored, jpeg) {
+    return Ok(None)
+  }
+  let meta = bytes_from_array([
+    (1).to_byte(),
+    if mjpg_used { (1).to_byte() } else { (0).to_byte() },
+  ])
+  Ok(
+    Some(Pcf2Segment::{
+      kind: SegmentKind::Jpg.to_u8(),
+      flags: (0).to_byte(),
+      orig_len: input.length().to_int64().to_uint64(),
+      meta,
+      data: lepton_bytes,
+    }),
+  )
+}
+
+fn decode_jpg_segment(
+  segment : Pcf2Segment,
+  budget : DecodeBudget,
+  config : DecodeConfig,
+) -> Result[Bytes, Error] {
+  if segment.meta.length() < 2 {
+    return Err(Error::InvalidSegment("jpg meta"))
+  }
+  if segment.meta[0] != (1).to_byte() {
+    return Err(Error::InvalidSegment("jpg meta_version"))
+  }
+  let mjpg_used = segment.meta[1] != (0).to_byte()
+  let mut jpeg = match lepton::decode(segment.data) {
+    Ok(v) => v
+    Err(msg) => return Err(Error::Other("lepton decode failed: \{msg}"))
+  }
+  if mjpg_used {
+    match remove_mjpg_dht(jpeg) {
+      Some(stripped) => jpeg = stripped
+      None => return Err(Error::InvalidSegment("jpg mjpg dht"))
+    }
+  }
+  match budget.consume(jpeg.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(jpeg)
+}

@@ -1,4 +1,281 @@
 ///| Pure-Pion reversible preprocessing library for compressed and container data.
 
-///| PCF2 container version emitted by writers.
-pub let pcf2_version : Int = 2
+///| Configuration for `encode_bytes` and `encode_bytes_with_stats`.
+pub struct EncodeConfig {
+  pub max_depth : Int
+  pub max_expand_ratio : Double
+  pub max_total_output : UInt64
+  pub enable_png_webp : Bool
+  pub enable_pdf_predictor : Bool
+  pub enable_pdf_dct : Bool
+  pub enable_pdf_ascii : Bool
+  pub enable_pdf_images : Bool
+  pub max_pdf_filters : Int
+}
+
+///| Default encoding configuration matching Rust `EncodeConfig::default()`.
+pub fn EncodeConfig::default() -> EncodeConfig {
+  EncodeConfig::{
+    max_depth: 4,
+    max_expand_ratio: 16.0,
+    max_total_output: 4294967296UL,
+    enable_png_webp: false,
+    enable_pdf_predictor: false,
+    enable_pdf_dct: true,
+    enable_pdf_ascii: true,
+    enable_pdf_images: true,
+    max_pdf_filters: 16,
+  }
+}
+
+///| Configuration for `decode_bytes` and `decode_image_for_display`.
+pub struct DecodeConfig {
+  pub max_depth : Int
+  pub max_total_output : UInt64
+  pub recover : Bool
+}
+
+///| Default decoding configuration matching Rust `DecodeConfig::default()`.
+pub fn DecodeConfig::default() -> DecodeConfig {
+  DecodeConfig::{ max_depth: 4, max_total_output: 4294967296UL, recover: false }
+}
+
+let pdf_magic : Bytes = "%PDF".to_bytes()
+
+let gif87a_magic : Bytes = "GIF87a".to_bytes()
+
+let gif89a_magic : Bytes = "GIF89a".to_bytes()
+
+///| Encode `input` into a reversible PCF2 container.
+pub fn encode_bytes(
+  input : Bytes,
+  config : EncodeConfig,
+) -> Result[Bytes, Error] {
+  match encode_bytes_with_stats(input, config) {
+    Ok((bytes, _)) => Ok(bytes)
+    Err(e) => Err(e)
+  }
+}
+
+///| Encode `input` into a reversible PCF2 container and return top-level PDF statistics.
+pub fn encode_bytes_with_stats(
+  input : Bytes,
+  config : EncodeConfig,
+) -> Result[(Bytes, PdfStats), Error] {
+  let budget = EncodeBudget::new()
+  let stats = PdfStats::default()
+  let segments = if bytes_starts_with(input, pdf_magic) {
+    match encode_pdf_with_stats(input, config, 0, budget, stats) {
+      Ok(Some(segs)) => segs
+      Ok(None) => []
+      Err(e) => return Err(e)
+    }
+  } else {
+    match encode_segments(input, config, 0, budget) {
+      Ok(segs) => segs
+      Err(e) => return Err(e)
+    }
+  }
+  let file = Pcf2File::from_segments(segments)
+  match file.encode() {
+    Ok(out) => Ok((out, stats))
+    Err(e) => Err(e)
+  }
+}
+
+///| Decode a PCF2 container back to the original byte-exact input.
+pub fn decode_bytes(
+  input : Bytes,
+  config : DecodeConfig,
+) -> Result[Bytes, Error] {
+  if config.recover {
+    return decode_bytes_recover(input, config)
+  }
+  let budget = DecodeBudget::new()
+  decode_stream(input, config, 0, budget)
+}
+
+///| Extract complete image bytes for fast preview without reconstructing PNG IDAT.
+pub fn decode_image_for_display(
+  input : Bytes,
+  config : DecodeConfig,
+) -> Result[Option[Bytes], Error] {
+  let file = match Pcf2File::decode(input) {
+    Ok(f) => f
+    Err(e) => return Err(e)
+  }
+  let segs = file.segments
+  let n = segs.length()
+  let mut i = 0
+  while i < n {
+    match SegmentKind::from_u8(segs[i].kind) {
+      None => return Err(Error::InvalidSegment("unknown segment kind"))
+      Some(_) => ()
+    }
+    i += 1
+  }
+  if n == 3 &&
+  segs[0].kind == SegmentKind::Lit.to_u8() &&
+  segs[1].kind == SegmentKind::PngIdat.to_u8() &&
+  segs[2].kind == SegmentKind::Lit.to_u8() {
+    return extract_png_display(segs, config)
+  }
+  let mut all_lit = true
+  let mut j = 0
+  while j < n {
+    if segs[j].kind != SegmentKind::Lit.to_u8() {
+      all_lit = false
+      break
+    }
+    j += 1
+  }
+  let jpeg_image = n == 1 && segs[0].kind == SegmentKind::Jpg.to_u8()
+  if !all_lit && !jpeg_image {
+    return Ok(None)
+  }
+  let image_buf : Array[Byte] = []
+  let budget = DecodeBudget::new()
+  let mut k = 0
+  while k < n {
+    let seg = segs[k]
+    let bytes = match decode_segment(seg, config, 0, budget) {
+      Ok(b) => b
+      Err(e) => return Err(e)
+    }
+    if bytes.length().to_int64().to_uint64() != seg.orig_len {
+      return Err(Error::InvalidSegment("image original length"))
+    }
+    append_bytes(image_buf, bytes)
+    k += 1
+  }
+  let image = bytes_from_array(image_buf)
+  let is_img = bytes_starts_with(image, png_signature) ||
+  (image.length() >= 2 &&
+    image[0] == (0xFF).to_byte() &&
+    image[1] == (0xD8).to_byte()) ||
+  bytes_starts_with(image, gif87a_magic) ||
+  bytes_starts_with(image, gif89a_magic) ||
+  (image.length() >= 12 &&
+    bytes_starts_with(image, riff_magic) &&
+    bytes_starts_with_at(image, 8, webp_magic))
+  if is_img {
+    Ok(Some(image))
+  } else {
+    Ok(None)
+  }
+}
+
+fn encode_segments(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Array[Pcf2Segment], Error] {
+  match encode_unityfs(input, config, budget) {
+    Ok(Some(segs)) => return Ok(segs)
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_png(input, config, depth, budget) {
+    Ok(Some(segs)) => return Ok(segs)
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_gzip(input, config, depth, budget) {
+    Ok(Some(seg)) => return Ok([seg])
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_zlib(input, config, depth, budget) {
+    Ok(Some(seg)) => return Ok([seg])
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_deflate(input, config, depth, budget) {
+    Ok(Some(seg)) => return Ok([seg])
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_jpg(input) {
+    Ok(Some(seg)) => return Ok([seg])
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_base64(input, config, depth, budget) {
+    Ok(Some(seg)) => return Ok([seg])
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_bzip2(input, config, depth, budget) {
+    Ok(Some(seg)) => return Ok([seg])
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_zip(input, config, depth, budget) {
+    Ok(Some(segs)) => return Ok(segs)
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_pdf(input, config, depth, budget) {
+    Ok(Some(segs)) => return Ok(segs)
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  match encode_swf(input, config, depth, budget) {
+    Ok(Some(segs)) => return Ok(segs)
+    Err(e) => return Err(e)
+    Ok(None) => ()
+  }
+  Ok([Pcf2Segment::lit(input)])
+}
+
+fn decode_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  match SegmentKind::from_u8(segment.kind) {
+    Some(SegmentKind::Lit) => {
+      match budget.consume(segment.data.length(), config) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      Ok(segment.data)
+    }
+    Some(SegmentKind::Nested) => {
+      if depth >= config.max_depth {
+        return Err(Error::Other("nested depth exceeded"))
+      }
+      let nested = match decode_stream(segment.data, config, depth + 1, budget) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match budget.consume(nested.length(), config) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      Ok(nested)
+    }
+    Some(SegmentKind::Dflt) =>
+    decode_deflate_segment(segment, config, depth, budget)
+    Some(SegmentKind::Zlib) =>
+    decode_zlib_segment(segment, config, depth, budget)
+    Some(SegmentKind::Gzip) =>
+    decode_gzip_segment(segment, config, depth, budget)
+    Some(SegmentKind::PngIdat) =>
+    decode_png_segment(segment, config, depth, budget)
+    Some(SegmentKind::Jpg) => decode_jpg_segment(segment, budget, config)
+    Some(SegmentKind::Base64) =>
+    decode_base64_segment(segment, config, depth, budget)
+    Some(SegmentKind::Bzip2) =>
+    decode_bzip2_segment(segment, config, depth, budget)
+    Some(SegmentKind::PdfFlate) =>
+    decode_pdf_flate_segment(segment, config, depth, budget)
+    Some(SegmentKind::PdfStream) =>
+    decode_pdf_stream(segment, config, depth, budget)
+    Some(SegmentKind::UnityFs) =>
+    decode_unityfs_segment(segment, config, budget)
+    None => Err(Error::InvalidSegment("unknown segment kind"))
+  }
+}

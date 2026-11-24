@@ -1,0 +1,231 @@
+///| PDF physical stream range scanner and indirect reference resolution.
+
+fn pdf_stream_end(data : Bytes, end : Int) -> Option[Int] {
+  let parser = PdfParser::{ data, pos: end }
+  if parser.word(kw_endstream) && parser.word(kw_endobj) {
+    Some(parser.pos)
+  } else {
+    None
+  }
+}
+
+fn pdf_unresolved_end(data : Bytes, start : Int) -> Option[Int] {
+  let mut pos = start
+  while true {
+    match bytes_find_from(data, kw_endstream, pos) {
+      None => return None
+      Some(found) => {
+        if found > start && pdf_whitespace(data[found - 1]) {
+          match pdf_stream_end(data, found) {
+            Some(end) => return Some(end)
+            None => ()
+          }
+        }
+        pos = found + 9
+      }
+    }
+  }
+  None
+}
+
+fn pdf_obj_key(id : UInt64, gen : UInt64) -> String {
+  "\{id}:\{gen}"
+}
+
+fn pdf_resolve(
+  value : PdfValue,
+  objects : Map[String, PdfValue],
+  depth : Int,
+) -> Option[PdfValue] {
+  if depth > 16 {
+    return None
+  }
+  match value {
+    PdfValue::Ref(id, gen) =>
+    match objects.get(pdf_obj_key(id, gen)) {
+      Some(target) => pdf_resolve(target, objects, depth + 1)
+      None => None
+    }
+    _ => Some(value)
+  }
+}
+
+fn pdf_should_resolve_key(k : Bytes) -> Bool {
+  bytes_eq(k, "Filter".to_bytes()) ||
+  bytes_eq(k, kw_decode_parms) ||
+  bytes_eq(k, "Width".to_bytes()) ||
+  bytes_eq(k, "Height".to_bytes()) ||
+  bytes_eq(k, "BitsPerComponent".to_bytes()) ||
+  bytes_eq(k, "ColorSpace".to_bytes())
+}
+
+fn pdf_resolve_dict(
+  dict : PdfValue,
+  objects : Map[String, PdfValue],
+) -> PdfValue {
+  match dict {
+    PdfValue::Dict(items) => {
+      let out : Array[(Bytes, PdfValue)] = []
+      let mut i = 0
+      while i < items.length() {
+        let (k, v) = items[i]
+        let mut rv = v
+        if pdf_should_resolve_key(k) {
+          match pdf_resolve(v, objects, 0) {
+            Some(resolved) => rv = resolved
+            None => ()
+          }
+        }
+        if bytes_eq(k, kw_decode_parms) {
+          match rv {
+            PdfValue::Array(params) => {
+              let resolved_params : Array[PdfValue] = []
+              let mut pi = 0
+              while pi < params.length() {
+                match pdf_resolve(params[pi], objects, 0) {
+                  Some(rp) => resolved_params.push(rp)
+                  None => resolved_params.push(params[pi])
+                }
+                pi += 1
+              }
+              rv = PdfValue::Array(resolved_params)
+            }
+            _ => ()
+          }
+        }
+        out.push((k, rv))
+        i += 1
+      }
+      PdfValue::Dict(out)
+    }
+    _ => dict
+  }
+}
+
+fn pdf_scan_streams(data : Bytes) -> Array[PdfStreamRange] {
+  let len = data.length()
+  let parser = PdfParser::{ data, pos: 0 }
+  let objects : Map[String, PdfValue] = Map::new()
+  let pending : Array[(Int, PdfValue)] = []
+  while parser.pos < len {
+    parser.skip()
+    let start = parser.pos
+    let header_opt : Option[(UInt64, UInt64)] = match parser.number() {
+      Some(id) =>
+      match parser.number() {
+        Some(gen) => if parser.word(kw_obj) { Some((id, gen)) } else { None }
+        None => None
+      }
+      None => None
+    }
+    let (obj_id, obj_gen) = match header_opt {
+      Some(pair) => pair
+      None => {
+        parser.pos = start
+        match parser.value(0) {
+          Some(_) => ()
+          None =>
+          if start < len {
+            parser.pos = start + 1
+          } else {
+            break
+          }
+        }
+        continue
+      }
+    }
+    let parsed_val = match parser.value(0) {
+      Some(v) => v
+      None => {
+        parser.pos = start + 1
+        continue
+      }
+    }
+    let is_dict = match parsed_val {
+      PdfValue::Dict(_) => true
+      _ => false
+    }
+    if is_dict && parser.word(kw_stream) {
+      let sstart = if parser.pos + 1 < len &&
+      data[parser.pos] == (0x0D).to_byte() &&
+      data[parser.pos + 1] == (0x0A).to_byte() {
+        parser.pos + 2
+      } else if parser.pos < len &&
+      (data[parser.pos] == (0x0A).to_byte() ||
+        data[parser.pos] == (0x0D).to_byte()) {
+        parser.pos + 1
+      } else {
+        break
+      }
+      let direct_end = match parsed_val.get(kw_length) {
+        Some(PdfValue::Int(n)) =>
+        if n <= 2147483647UL {
+          match int_checked_add(sstart, n.to_int()) {
+            Some(e) => if e <= len { Some(e) } else { None }
+            None => None
+          }
+        } else {
+          None
+        }
+        _ => None
+      }
+      let after_opt = match direct_end {
+        Some(e) =>
+        match pdf_stream_end(data, e) {
+          Some(a) => Some(a)
+          None => pdf_unresolved_end(data, sstart)
+        }
+        None => pdf_unresolved_end(data, sstart)
+      }
+      pending.push((sstart, parsed_val))
+      match after_opt {
+        Some(after) => parser.pos = after
+        None => break
+      }
+    } else if parser.word(kw_endobj) {
+      let key = pdf_obj_key(obj_id, obj_gen)
+      match objects.get(key) {
+        Some(_) => objects.set(key, PdfValue::Other)
+        None => objects.set(key, parsed_val)
+      }
+    }
+  }
+  let result : Array[PdfStreamRange] = []
+  let mut previous_end = 0
+  let mut pi = 0
+  while pi < pending.length() {
+    let (sstart, dict) = pending[pi]
+    pi += 1
+    let length_opt = match dict.get(kw_length) {
+      Some(v) =>
+      match pdf_resolve(v, objects, 0) {
+        Some(resolved) => resolved.int()
+        None => None
+      }
+      None => None
+    }
+    let end = match length_opt {
+      Some(n) =>
+      if n <= 2147483647UL {
+        match int_checked_add(sstart, n.to_int()) {
+          Some(e) => e
+          None => continue
+        }
+      } else {
+        continue
+      }
+      None => continue
+    }
+    if end > len || sstart < previous_end {
+      continue
+    }
+    match pdf_stream_end(data, end) {
+      None => continue
+      Some(_) => ()
+    }
+    let resolved_dict = pdf_resolve_dict(dict, objects)
+    result.push(PdfStreamRange::{ start: sstart, end, dict: resolved_dict })
+    previous_end = end
+  }
+  result
+}

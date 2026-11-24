@@ -1,0 +1,308 @@
+///| Reversible PDF TIFF2 and PNG 10–15 predictor undo/redo across 1/2/4/8/16-bit samples.
+
+struct PdfPredictor {
+  kind : Byte
+  colors : Int
+  bits : Int
+  columns : Int
+}
+
+fn PdfPredictor::row_bytes(self : PdfPredictor) -> Result[Int, Error] {
+  if self.colors <= 0 ||
+  self.colors > 32 ||
+  self.columns <= 0 ||
+  !(self.bits == 1 ||
+    self.bits == 2 ||
+    self.bits == 4 ||
+    self.bits == 8 ||
+    self.bits == 16) {
+    return Err(Error::InvalidSegment("predictor dimensions"))
+  }
+  let p1 = match int_checked_mul(self.columns, self.colors) {
+    Some(v) => v
+    None => return Err(Error::LengthOverflow)
+  }
+  let p2 = match int_checked_mul(p1, self.bits) {
+    Some(v) => v
+    None => return Err(Error::LengthOverflow)
+  }
+  match int_checked_add(p2, 7) {
+    Some(v) => Ok(v / 8)
+    None => Err(Error::LengthOverflow)
+  }
+}
+
+fn PdfPredictor::from_params(params : PdfValue) -> Result[PdfPredictor, Error] {
+  let get_or = fn(name : Bytes, def : UInt64) -> UInt64 {
+    match params.get(name) {
+      Some(PdfValue::Int(n)) => n
+      _ => def
+    }
+  }
+  let kind_u = get_or("Predictor".to_bytes(), 1UL)
+  if kind_u > 255UL {
+    return Err(Error::InvalidSegment("predictor"))
+  }
+  let kind = kind_u.to_int().to_byte()
+  let colors = match u64_to_int_checked(get_or("Colors".to_bytes(), 1UL)) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let bits = match
+  u64_to_int_checked(get_or("BitsPerComponent".to_bytes(), 8UL)) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let columns = match u64_to_int_checked(get_or("Columns".to_bytes(), 1UL)) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let p = PdfPredictor::{ kind, colors, bits, columns }
+  match p.row_bytes() {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let k = kind.to_int()
+  if !(k == 1 || k == 2 || (k >= 10 && k <= 15)) {
+    return Err(Error::InvalidSegment("predictor kind"))
+  }
+  Ok(p)
+}
+
+fn pdf_pred_value(tag : Int, a : Int, b : Int, c : Int) -> Int {
+  if tag == 0 {
+    0
+  } else if tag == 1 {
+    a
+  } else if tag == 2 {
+    b
+  } else if tag == 3 {
+    (a + b) >> 1
+  } else {
+    paeth_predictor(a.to_byte(), b.to_byte(), c.to_byte()).to_int()
+  }
+}
+
+fn pdf_get_sample_arr(
+  data : FixedArray[Byte],
+  base : Int,
+  index : Int,
+  bits : Int,
+) -> Int {
+  let byte = base + index * bits / 8
+  if bits == 16 {
+    (data[byte].to_int() << 8) | data[byte + 1].to_int()
+  } else {
+    let shift = 8 - bits - index * bits % 8
+    (data[byte].to_int() >> shift) & ((1 << bits) - 1)
+  }
+}
+
+fn pdf_get_sample_bytes(
+  data : Bytes,
+  base : Int,
+  index : Int,
+  bits : Int,
+) -> Int {
+  let byte = base + index * bits / 8
+  if bits == 16 {
+    (data[byte].to_int() << 8) | data[byte + 1].to_int()
+  } else {
+    let shift = 8 - bits - index * bits % 8
+    (data[byte].to_int() >> shift) & ((1 << bits) - 1)
+  }
+}
+
+fn pdf_set_sample_arr(
+  data : FixedArray[Byte],
+  base : Int,
+  index : Int,
+  bits : Int,
+  value : Int,
+) -> Unit {
+  let byte = base + index * bits / 8
+  if bits == 16 {
+    data[byte] = ((value >> 8) & 0xFF).to_byte()
+    data[byte + 1] = (value & 0xFF).to_byte()
+  } else {
+    let shift = 8 - bits - index * bits % 8
+    let mask = ((1 << bits) - 1) << shift
+    let cur = data[byte].to_int()
+    data[byte] = ((cur & (0xFF ^ mask)) | ((value << shift) & mask)).to_byte()
+  }
+}
+
+fn PdfPredictor::undo(
+  self : PdfPredictor,
+  data : Bytes,
+) -> Result[(Bytes, Bytes), Error] {
+  let row = match self.row_bytes() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let is_png = self.kind.to_int() >= 10
+  let stride = match int_checked_add(row, if is_png { 1 } else { 0 }) {
+    Some(v) => v
+    None => return Err(Error::LengthOverflow)
+  }
+  let dlen = data.length()
+  if dlen % stride != 0 {
+    return Err(Error::InvalidSegment("predictor row length"))
+  }
+  let rows = dlen / stride
+  let pixels : FixedArray[Byte] = FixedArray::make(rows * row, (0).to_byte())
+  let tags : Array[Byte] = []
+  let bpp = (self.colors * self.bits + 7) / 8
+  let total_samples = self.columns * self.colors
+  let mut y = 0
+  while y < rows {
+    let enc_base = y * stride
+    let pix_base = y * row
+    if is_png {
+      let tag_b = data[enc_base]
+      let tag = tag_b.to_int()
+      if tag > 4 {
+        return Err(Error::InvalidSegment("png row filter"))
+      }
+      tags.push(tag_b)
+      let mut x = 0
+      while x < row {
+        let raw = data[enc_base + 1 + x].to_int()
+        let a = if x >= bpp { pixels[pix_base + x - bpp].to_int() } else { 0 }
+        let b = if y > 0 { pixels[pix_base - row + x].to_int() } else { 0 }
+        let c = if y > 0 && x >= bpp {
+          pixels[pix_base - row + x - bpp].to_int()
+        } else {
+          0
+        }
+        pixels[pix_base + x] = ((raw + pdf_pred_value(tag, a, b, c)) & 0xFF).to_byte()
+        x += 1
+      }
+    } else {
+      let mut x = 0
+      while x < row {
+        pixels[pix_base + x] = data[enc_base + x]
+        x += 1
+      }
+      if self.kind.to_int() == 2 {
+        let mut i = self.colors
+        while i < total_samples {
+          let cur = pdf_get_sample_arr(pixels, pix_base, i, self.bits)
+          let prev = pdf_get_sample_arr(
+            pixels,
+            pix_base,
+            i - self.colors,
+            self.bits,
+          )
+          let sum = (cur + prev) & 0xFFFF
+          pdf_set_sample_arr(pixels, pix_base, i, self.bits, sum)
+          i += 1
+        }
+      }
+    }
+    y += 1
+  }
+  let meta : Array[Byte] = []
+  meta.push(self.kind)
+  pdf_write_num(self.colors, meta)
+  pdf_write_num(self.bits, meta)
+  pdf_write_num(self.columns, meta)
+  pdf_write_blob(bytes_from_array(tags), meta)
+  Ok((bytes_from_fixed_array(pixels), bytes_from_array(meta)))
+}
+
+fn pdf_predictor_redo(
+  pixels : Bytes,
+  meta : Bytes,
+  limit : Int,
+) -> Result[Bytes, Error] {
+  if meta.length() == 0 {
+    return Err(Error::InvalidSegment("predictor metadata"))
+  }
+  let kind_b = meta[0]
+  let kind = kind_b.to_int()
+  if !(kind == 1 || kind == 2 || (kind >= 10 && kind <= 15)) {
+    return Err(Error::InvalidSegment("predictor kind"))
+  }
+  let (colors, p1) = match pdf_read_num(meta, 1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (bits, p2) = match pdf_read_num(meta, p1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (columns, p3) = match pdf_read_num(meta, p2) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (tags, p4) = match pdf_read_blob(meta, p3) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let p = PdfPredictor::{ kind: kind_b, colors, bits, columns }
+  let row = match p.row_bytes() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let plen = pixels.length()
+  let tlen = tags.length()
+  if p4 != meta.length() ||
+  plen % row != 0 ||
+  (kind >= 10 && tlen != plen / row) ||
+  (kind < 10 && tlen != 0) ||
+  plen > limit ||
+  tlen > limit - plen {
+    return Err(Error::InvalidSegment("predictor data length"))
+  }
+  let rows = plen / row
+  let is_png = kind >= 10
+  let stride = row + (if is_png { 1 } else { 0 })
+  let out : FixedArray[Byte] = FixedArray::make(rows * stride, (0).to_byte())
+  let bpp = (colors * bits + 7) / 8
+  let total_samples = columns * colors
+  let mut y = 0
+  while y < rows {
+    let pix_base = y * row
+    let out_base = y * stride
+    if is_png {
+      let tag_b = tags[y]
+      let tag = tag_b.to_int()
+      if tag > 4 {
+        return Err(Error::InvalidSegment("png row filter"))
+      }
+      out[out_base] = tag_b
+      let mut x = 0
+      while x < row {
+        let cur = pixels[pix_base + x].to_int()
+        let a = if x >= bpp { pixels[pix_base + x - bpp].to_int() } else { 0 }
+        let b = if y > 0 { pixels[pix_base - row + x].to_int() } else { 0 }
+        let c = if y > 0 && x >= bpp {
+          pixels[pix_base - row + x - bpp].to_int()
+        } else {
+          0
+        }
+        out[out_base + 1 + x] = ((cur - pdf_pred_value(tag, a, b, c)) & 0xFF).to_byte()
+        x += 1
+      }
+    } else {
+      let mut x = 0
+      while x < row {
+        out[out_base + x] = pixels[pix_base + x]
+        x += 1
+      }
+      if kind == 2 {
+        let mut i = colors
+        while i < total_samples {
+          let cur = pdf_get_sample_bytes(pixels, pix_base, i, bits)
+          let prev = pdf_get_sample_bytes(pixels, pix_base, i - colors, bits)
+          let diff = (cur - prev) & 0xFFFF
+          pdf_set_sample_arr(out, out_base, i, bits, diff)
+          i += 1
+        }
+      }
+    }
+    y += 1
+  }
+  Ok(bytes_from_fixed_array(out))
+}

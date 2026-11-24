@@ -1,0 +1,40 @@
+///| Error types returned by precomp2 encoding, decoding, and framing operations.
+
+pub enum Error {
+  InvalidHeader(String)
+  InvalidSegment(String)
+  VarintTooLong
+  VarintOverflow
+  LengthOverflow
+  SizeMismatch(UInt64, UInt64)
+  Other(String)
+}
+
+///| Format an `Error` as a human-readable message.
+pub fn Error::to_string(self : Error) -> String {
+  match self {
+    Error::InvalidHeader(msg) => "invalid header: \{msg}"
+    Error::InvalidSegment(msg) => "invalid segment: \{msg}"
+    Error::VarintTooLong => "varint too long"
+    Error::VarintOverflow => "varint overflow"
+    Error::LengthOverflow => "length overflow"
+    Error::SizeMismatch(expected, actual) =>
+    "original size mismatch: expected \{expected}, got \{actual}"
+    Error::Other(msg) => msg
+  }
+}
+
+///| Structural equality for `Error`.
+pub fn error_eq(a : Error, b : Error) -> Bool {
+  match (a, b) {
+    (Error::InvalidHeader(x), Error::InvalidHeader(y)) => x == y
+    (Error::InvalidSegment(x), Error::InvalidSegment(y)) => x == y
+    (Error::VarintTooLong, Error::VarintTooLong) => true
+    (Error::VarintOverflow, Error::VarintOverflow) => true
+    (Error::LengthOverflow, Error::LengthOverflow) => true
+    (Error::SizeMismatch(e1, a1), Error::SizeMismatch(e2, a2)) =>
+    e1 == e2 && a1 == a2
+    (Error::Other(x), Error::Other(y)) => x == y
+    _ => false
+  }
+}

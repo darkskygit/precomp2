@@ -1,0 +1,350 @@
+///| Reversible PDF ASCIIHexDecode and ASCII85Decode filter codecs.
+
+let hex_digits_lower : Bytes = "0123456789abcdef".to_bytes()
+
+let ascii_hex_term : Bytes = ">".to_bytes()
+
+let ascii_a85_term : Bytes = "~>".to_bytes()
+
+fn pdf_ascii_hex_digit(b : Byte) -> Result[Int, Error] {
+  match pdf_hex_nibble(b) {
+    Some(v) => Ok(v)
+    None => Err(Error::InvalidSegment("asciihex digit"))
+  }
+}
+
+fn pdf_ascii_significant_bytes(
+  binary : Bytes,
+  hex : Bool,
+  len : Int,
+  zeros : Array[Int],
+) -> Result[Array[Byte], Error] {
+  let out : Array[Byte] = []
+  let blen = binary.length()
+  if hex {
+    let dbl = match int_checked_mul(blen, 2) {
+      Some(v) => v
+      None => return Err(Error::InvalidSegment("asciihex length"))
+    }
+    if zeros.length() != 0 || (len != dbl && len + 1 != dbl) {
+      return Err(Error::InvalidSegment("asciihex length"))
+    }
+    let mut i = 0
+    while i < blen {
+      let b = binary[i].to_int()
+      out.push(hex_digits_lower[b >> 4])
+      if out.length() < len {
+        out.push(hex_digits_lower[b & 15])
+      }
+      i += 1
+    }
+    return Ok(out)
+  }
+  let mut zero_idx = 0
+  let mut chunk_idx = 0
+  let mut pos = 0
+  while pos < blen {
+    let rem = blen - pos
+    let clen = if rem < 4 { rem } else { 4 }
+    if zero_idx < zeros.length() && zeros[zero_idx] == chunk_idx {
+      if clen != 4 ||
+      binary[pos] != (0).to_byte() ||
+      binary[pos + 1] != (0).to_byte() ||
+      binary[pos + 2] != (0).to_byte() ||
+      binary[pos + 3] != (0).to_byte() {
+        return Err(Error::InvalidSegment("ascii85 zero tuple"))
+      }
+      out.push((0x7A).to_byte()) // 'z'
+      zero_idx += 1
+      pos += 4
+      chunk_idx += 1
+      continue
+    }
+    let b0 = binary[pos].to_int().to_uint()
+    let b1 = if clen > 1 { binary[pos + 1].to_int().to_uint() } else { 0U }
+    let b2 = if clen > 2 { binary[pos + 2].to_int().to_uint() } else { 0U }
+    let b3 = if clen > 3 { binary[pos + 3].to_int().to_uint() } else { 0U }
+    let mut word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    let chars : FixedArray[Byte] = FixedArray::make(5, (0).to_byte())
+    let mut k = 4
+    while k >= 0 {
+      chars[k] = ((word % 85U).to_int() + 33).to_byte()
+      word = word / 85U
+      k -= 1
+    }
+    let mut j = 0
+    while j < clen + 1 {
+      out.push(chars[j])
+      j += 1
+    }
+    pos += clen
+    chunk_idx += 1
+  }
+  if out.length() != len {
+    return Err(Error::InvalidSegment("ascii85 length"))
+  }
+  Ok(out)
+}
+
+fn pdf_ascii_unpack(input : Bytes, hex : Bool) -> Result[(Bytes, Bytes), Error] {
+  let marker = if hex { ascii_hex_term } else { ascii_a85_term }
+  let end = match bytes_find_from(input, marker, 0) {
+    Some(p) => p
+    None => return Err(Error::InvalidSegment("ascii terminator"))
+  }
+  let significant : Array[Byte] = []
+  let gaps : Array[(Int, Int, Int)] = []
+  let mut pos = 0
+  while pos < end {
+    if pdf_whitespace(input[pos]) {
+      let start = pos
+      while pos < end && pdf_whitespace(input[pos]) {
+        pos += 1
+      }
+      gaps.push((significant.length(), start, pos))
+    } else {
+      significant.push(input[pos])
+      pos += 1
+    }
+  }
+  let slen = significant.length()
+  let binary : Array[Byte] = []
+  let zeros : Array[Int] = []
+  if hex {
+    let mut i = 0
+    while i < slen {
+      let hi = match pdf_ascii_hex_digit(significant[i]) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let lo = if i + 1 < slen {
+        match pdf_ascii_hex_digit(significant[i + 1]) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+      } else {
+        0
+      }
+      binary.push(((hi << 4) | lo).to_byte())
+      i += 2
+    }
+  } else {
+    let mut i = 0
+    while i < slen {
+      if significant[i] == (0x7A).to_byte() {
+        // 'z'
+        zeros.push(binary.length() / 4)
+        binary.push((0).to_byte())
+        binary.push((0).to_byte())
+        binary.push((0).to_byte())
+        binary.push((0).to_byte())
+        i += 1
+      } else {
+        let rem = slen - i
+        let count = if rem < 5 { rem } else { 5 }
+        if count == 1 {
+          return Err(Error::InvalidSegment("ascii85 final group"))
+        }
+        let mut word : UInt64 = 0UL
+        let mut j = 0
+        while j < 5 {
+          let c = if j < count { significant[i + j].to_int() } else { 117 } // 'u'
+          if c < 33 || c > 117 {
+            return Err(Error::InvalidSegment("ascii85 digit"))
+          }
+          word = word * 85UL + (c - 33).to_int64().to_uint64()
+          j += 1
+        }
+        if word > 0xFFFFFFFFUL {
+          return Err(Error::InvalidSegment("ascii85 overflow"))
+        }
+        let w = word.to_uint()
+        let out_bytes = count - 1
+        if out_bytes >= 1 {
+          binary.push(((w >> 24) & 0xFFU).to_int().to_byte())
+        }
+        if out_bytes >= 2 {
+          binary.push(((w >> 16) & 0xFFU).to_int().to_byte())
+        }
+        if out_bytes >= 3 {
+          binary.push(((w >> 8) & 0xFFU).to_int().to_byte())
+        }
+        if out_bytes >= 4 {
+          binary.push((w & 0xFFU).to_int().to_byte())
+        }
+        i += count
+      }
+    }
+  }
+  let bin_bytes = bytes_from_array(binary)
+  let canonical = match
+  pdf_ascii_significant_bytes(bin_bytes, hex, slen, zeros) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let patches : Array[(Int, Byte)] = []
+  let mut pi = 0
+  while pi < slen {
+    if significant[pi] != canonical[pi] {
+      patches.push((pi, significant[pi]))
+    }
+    pi += 1
+  }
+  let meta : Array[Byte] = []
+  pdf_write_num(slen, meta)
+  pdf_write_num(zeros.length(), meta)
+  let mut zi = 0
+  while zi < zeros.length() {
+    pdf_write_num(zeros[zi], meta)
+    zi += 1
+  }
+  pdf_write_num(patches.length(), meta)
+  let mut qi = 0
+  while qi < patches.length() {
+    let (idx, b) = patches[qi]
+    pdf_write_num(idx, meta)
+    meta.push(b)
+    qi += 1
+  }
+  pdf_write_num(gaps.length(), meta)
+  let mut gi = 0
+  while gi < gaps.length() {
+    let (idx, gs, ge) = gaps[gi]
+    pdf_write_num(idx, meta)
+    pdf_write_blob(bytes_slice(input, gs, ge), meta)
+    gi += 1
+  }
+  pdf_write_blob(bytes_slice(input, end, input.length()), meta)
+  Ok((bin_bytes, bytes_from_array(meta)))
+}
+
+fn pdf_ascii_repack(
+  binary : Bytes,
+  meta : Bytes,
+  hex : Bool,
+  limit : Int,
+) -> Result[Bytes, Error] {
+  let mlen = meta.length()
+  let mut pos = 0
+  let (significant_len, p1) = match pdf_read_num(meta, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = p1
+  if significant_len > limit {
+    return Err(Error::InvalidSegment("ascii length"))
+  }
+  let (zcount, p2) = match pdf_read_num(meta, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = p2
+  if zcount > mlen {
+    return Err(Error::InvalidSegment("ascii zero count"))
+  }
+  let zeros : Array[Int] = []
+  let mut zi = 0
+  while zi < zcount {
+    let (zv, np) = match pdf_read_num(meta, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if zi > 0 && zeros[zi - 1] >= zv {
+      return Err(Error::InvalidSegment("ascii zero index"))
+    }
+    zeros.push(zv)
+    pos = np
+    zi += 1
+  }
+  if zcount > 0 && zeros[zcount - 1] >= binary.length() / 4 {
+    return Err(Error::InvalidSegment("ascii zero index"))
+  }
+  let significant = match
+  pdf_ascii_significant_bytes(binary, hex, significant_len, zeros) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (pcount, p3) = match pdf_read_num(meta, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = p3
+  if pcount > mlen {
+    return Err(Error::InvalidSegment("ascii patches"))
+  }
+  let mut pi = 0
+  while pi < pcount {
+    let (idx, np) = match pdf_read_num(meta, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    pos = np
+    if pos >= mlen {
+      return Err(Error::InvalidSegment("ascii patch"))
+    }
+    let b = meta[pos]
+    pos += 1
+    if idx >= significant.length() {
+      return Err(Error::InvalidSegment("ascii patch index"))
+    }
+    significant[idx] = b
+    pi += 1
+  }
+  let (gcount, p4) = match pdf_read_num(meta, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = p4
+  if gcount > mlen {
+    return Err(Error::InvalidSegment("ascii gaps"))
+  }
+  let out : Array[Byte] = []
+  let mut cursor = 0
+  let sig_len = significant.length()
+  let mut gi = 0
+  while gi < gcount {
+    let (idx, np) = match pdf_read_num(meta, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    pos = np
+    if idx < cursor || idx > sig_len {
+      return Err(Error::InvalidSegment("ascii gap index"))
+    }
+    let (gap, np2) = match pdf_read_blob(meta, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    pos = np2
+    let span = idx - cursor
+    if span > limit - out.length() || gap.length() > limit - out.length() - span {
+      return Err(Error::InvalidSegment("ascii output limit"))
+    }
+    let mut k = cursor
+    while k < idx {
+      out.push(significant[k])
+      k += 1
+    }
+    append_bytes(out, gap)
+    cursor = idx
+    gi += 1
+  }
+  let (suffix, p5) = match pdf_read_blob(meta, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = p5
+  let tail_span = sig_len - cursor
+  if pos != mlen ||
+  tail_span > limit - out.length() ||
+  suffix.length() > limit - out.length() - tail_span {
+    return Err(Error::InvalidSegment("ascii output size"))
+  }
+  let mut k = cursor
+  while k < sig_len {
+    out.push(significant[k])
+    k += 1
+  }
+  append_bytes(out, suffix)
+  Ok(bytes_from_array(out))
+}

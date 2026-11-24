@@ -1,0 +1,82 @@
+///| Stream decoding and magic-scanning recovery for PCF2 containers.
+
+fn decode_stream_with_len(
+  input : Bytes,
+  offset : Int,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[(Bytes, Int), Error] {
+  let decoder = match Pcf2Decoder::new_at(input, offset) {
+    Ok(d) => d
+    Err(e) => return Err(e)
+  }
+  let header = decoder.header
+  let out : Array[Byte] = []
+  let mut total : UInt64 = 0UL
+  while total < header.original_size {
+    let seg = match decoder.next_segment() {
+      Ok(Some(s)) => s
+      Ok(None) => return Err(Error::SizeMismatch(header.original_size, total))
+      Err(e) => return Err(e)
+    }
+    total = u64_saturating_add(total, seg.orig_len)
+    if total > header.original_size {
+      return Err(Error::SizeMismatch(header.original_size, total))
+    }
+    let data = match decode_segment(seg, config, depth, budget) {
+      Ok(d) => d
+      Err(e) => return Err(e)
+    }
+    let actual_len = data.length().to_int64().to_uint64()
+    if actual_len != seg.orig_len {
+      return Err(Error::SizeMismatch(seg.orig_len, actual_len))
+    }
+    append_bytes(out, data)
+  }
+  Ok((bytes_from_array(out), decoder.pos - offset))
+}
+
+fn decode_stream(
+  input : Bytes,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  match decode_stream_with_len(input, 0, config, depth, budget) {
+    Ok((out, _)) => Ok(out)
+    Err(e) => Err(e)
+  }
+}
+
+fn decode_bytes_recover(
+  input : Bytes,
+  config : DecodeConfig,
+) -> Result[Bytes, Error] {
+  let out : Array[Byte] = []
+  let mut offset = 0
+  let budget = DecodeBudget::new()
+  let inner_cfg = DecodeConfig::{
+    max_depth: config.max_depth,
+    max_total_output: config.max_total_output,
+    recover: false,
+  }
+  while true {
+    match bytes_find_from(input, pcf2_magic, offset) {
+      None => break
+      Some(start) =>
+      match decode_stream_with_len(input, start, inner_cfg, 0, budget) {
+        Ok((decoded, consumed)) => {
+          append_bytes(out, decoded)
+          let step = if consumed > 1 { consumed } else { 1 }
+          offset = start + step
+        }
+        Err(_) => offset = start + 1
+      }
+    }
+  }
+  if out.length() == 0 {
+    return Err(Error::InvalidHeader("no recoverable PCF2 container"))
+  }
+  Ok(bytes_from_array(out))
+}

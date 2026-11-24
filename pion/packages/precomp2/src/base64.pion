@@ -1,0 +1,349 @@
+///| Base64 block codec preserving headers and per-line CRLF wrapping.
+
+import "base64"
+
+struct Base64Block {
+  header : Bytes
+  line_case : Byte
+  line_lengths : Array[Int]
+  decoded : Bytes
+  decoded_len : Int
+}
+
+let crlf : Bytes = "\r\n".to_bytes()
+
+let crlfcrlf : Bytes = "\r\n\r\n".to_bytes()
+
+fn parse_base64_block(input : Bytes) -> Option[Base64Block] {
+  let ilen = input.length()
+  let mut cursor = 0
+  let header = match bytes_find_from(input, crlfcrlf, 0) {
+    Some(pos) => {
+      cursor = pos + 4
+      bytes_slice(input, 0, pos + 4)
+    }
+    None => Bytes::new(0)
+  }
+  let line_lengths : Array[Int] = []
+  let encoded : Array[Byte] = []
+  while cursor < ilen {
+    if input[cursor] == (0x2D).to_byte() {
+      // '-'
+      break
+    }
+    let line_end = match bytes_find_from(input, crlf, cursor) {
+      Some(pos) => pos
+      None => return None
+    }
+    let line_len = line_end - cursor
+    if line_len == 0 || line_len > 255 {
+      return None
+    }
+    line_lengths.push(line_len)
+    append_bytes_slice(encoded, input, cursor, line_end)
+    cursor = line_end + 2
+  }
+  let nlines = line_lengths.length()
+  if nlines == 0 || cursor != ilen {
+    return None
+  }
+  let decoded = match base64::decode_bytes(bytes_from_array(encoded)) {
+    Ok(d) => d
+    Err(_) => return None
+  }
+  let first_len = line_lengths[0]
+  let mut all_same = true
+  let mut prefix_same = true
+  let mut i = 1
+  while i < nlines {
+    if line_lengths[i] != first_len {
+      all_same = false
+      if i < nlines - 1 {
+        prefix_same = false
+      }
+    }
+    i += 1
+  }
+  let line_case = if all_same {
+    (0).to_byte()
+  } else if nlines > 1 && prefix_same {
+    (1).to_byte()
+  } else {
+    (2).to_byte()
+  }
+  Some(Base64Block::{
+    header,
+    line_case,
+    line_lengths,
+    decoded,
+    decoded_len: decoded.length(),
+  })
+}
+
+fn encode_base64(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Pcf2Segment], Error] {
+  let block = match parse_base64_block(input) {
+    Some(b) => b
+    None => return Ok(None)
+  }
+  let (payload_kind, payload) = match
+  choose_payload(block.decoded, input.length(), config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let meta : Array[Byte] = []
+  meta.push((0).to_byte())
+  meta.push(payload_kind)
+  write_varint(block.header.length().to_int64().to_uint64(), meta)
+  append_bytes(meta, block.header)
+  meta.push(block.line_case)
+  write_varint(block.line_lengths.length().to_int64().to_uint64(), meta)
+  let lc = block.line_case.to_int()
+  if lc == 0 {
+    meta.push(block.line_lengths[0].to_byte())
+  } else if lc == 1 {
+    meta.push(block.line_lengths[0].to_byte())
+    meta.push(block.line_lengths[block.line_lengths.length() - 1].to_byte())
+  } else if lc == 2 {
+    let mut i = 0
+    while i < block.line_lengths.length() {
+      meta.push(block.line_lengths[i].to_byte())
+      i += 1
+    }
+  } else {
+    return Ok(None)
+  }
+  write_varint(block.decoded_len.to_int64().to_uint64(), meta)
+  Ok(
+    Some(Pcf2Segment::{
+      kind: SegmentKind::Base64.to_u8(),
+      flags: (0).to_byte(),
+      orig_len: input.length().to_int64().to_uint64(),
+      meta: bytes_from_array(meta),
+      data: payload,
+    }),
+  )
+}
+
+fn decode_base64_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  let mlen = segment.meta.length()
+  if mlen < 2 {
+    return Err(Error::InvalidSegment("base64 meta"))
+  }
+  let meta_version = segment.meta[0]
+  let payload_kind = segment.meta[1]
+  if meta_version != (0).to_byte() {
+    return Err(Error::InvalidSegment("base64 meta_version"))
+  }
+  let (header_len_u, p1) = match read_varint_slice(segment.meta, 2) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let header_len = match u64_to_int_checked(header_len_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if header_len > mlen - p1 {
+    return Err(Error::InvalidSegment("base64 header bounds"))
+  }
+  let header = bytes_slice(segment.meta, p1, p1 + header_len)
+  let mut offset = p1 + header_len
+  if offset >= mlen {
+    return Err(Error::InvalidSegment("base64 line_case"))
+  }
+  let line_case = segment.meta[offset].to_int()
+  offset += 1
+  let (line_count_u, p2) = match read_varint_slice(segment.meta, offset) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let line_count = match u64_to_int_checked(line_count_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  offset = p2
+  if line_count == 0 {
+    return Err(Error::InvalidSegment("base64 line_count"))
+  }
+  let mut uniform_len = 0
+  let mut last_len = 0
+  let mut explicit_offset = 0
+  if line_case == 0 {
+    if offset >= mlen {
+      return Err(Error::InvalidSegment("base64 line_len_0"))
+    }
+    uniform_len = segment.meta[offset].to_int()
+    last_len = uniform_len
+    offset += 1
+  } else if line_case == 1 {
+    if mlen - offset < 2 {
+      return Err(Error::InvalidSegment("base64 line_len_1"))
+    }
+    uniform_len = segment.meta[offset].to_int()
+    last_len = segment.meta[offset + 1].to_int()
+    offset += 2
+  } else if line_case == 2 {
+    if line_count > mlen - offset {
+      return Err(Error::InvalidSegment("base64 line_len_list"))
+    }
+    explicit_offset = offset
+    offset += line_count
+  } else {
+    return Err(Error::InvalidSegment("base64 line_case"))
+  }
+  let decoded_len = if offset < mlen {
+    let (dl_u, _) = match read_varint_slice(segment.meta, offset) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    match u64_to_int_checked(dl_u) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+  } else {
+    segment.data.length()
+  }
+  let rem_budget = u64_saturating_sub(
+    config.max_total_output,
+    budget.total_output,
+  )
+  let dec_u64 = decoded_len.to_int64().to_uint64()
+  let preflight_elen = ((dec_u64 + 2UL) / 3UL) * 4UL
+  let preflight_base = u64_saturating_add(
+    header.length().to_int64().to_uint64(),
+    preflight_elen,
+  )
+  if preflight_base > rem_budget {
+    return Err(Error::Other("decode output exceeds budget"))
+  }
+  let payload = match
+  decode_payload(payload_kind, segment.data, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if decoded_len != payload.length() {
+    return Err(Error::InvalidSegment("base64 decoded_len mismatch"))
+  }
+  let rem_budget_after = u64_saturating_sub(
+    config.max_total_output,
+    budget.total_output,
+  )
+  if preflight_base > rem_budget_after {
+    return Err(Error::Other("decode output exceeds budget"))
+  }
+  let elen_u64 = preflight_elen
+  let mut emitted_lines = 0
+  if line_case == 0 || line_case == 1 {
+    if elen_u64 == 0UL {
+      emitted_lines = 0
+    } else if uniform_len == 0 {
+      let lc_u64 = line_count.to_int64().to_uint64()
+      let crlf_bytes = lc_u64 * 2UL
+      if u64_saturating_add(preflight_base, crlf_bytes) > rem_budget_after {
+        return Err(Error::Other("decode output exceeds budget"))
+      }
+      if line_case == 0 {
+        return Err(Error::InvalidSegment("base64 line lengths mismatch"))
+      }
+      if elen_u64 > last_len.to_int64().to_uint64() {
+        return Err(Error::InvalidSegment("base64 line lengths mismatch"))
+      }
+      emitted_lines = line_count
+    } else {
+      let uniform_u64 = uniform_len.to_int64().to_uint64()
+      let lc_u64 = line_count.to_int64().to_uint64()
+      let needed_u64 = (elen_u64 + uniform_u64 - 1UL) / uniform_u64
+      if line_case == 0 {
+        let sim_lines_u64 = if needed_u64 < lc_u64 { needed_u64 } else { lc_u64 }
+        let covered = sim_lines_u64 * uniform_u64
+        if covered < elen_u64 {
+          return Err(Error::InvalidSegment("base64 line lengths mismatch"))
+        }
+        emitted_lines = sim_lines_u64.to_int()
+      } else {
+        let prefix_u64 = lc_u64 - 1UL
+        if needed_u64 <= prefix_u64 {
+          emitted_lines = needed_u64.to_int()
+        } else {
+          let prefix_cov = prefix_u64 * uniform_u64
+          let total_cov = u64_saturating_add(
+            prefix_cov,
+            last_len.to_int64().to_uint64(),
+          )
+          if total_cov < elen_u64 {
+            return Err(Error::InvalidSegment("base64 line lengths mismatch"))
+          }
+          emitted_lines = line_count
+        }
+      }
+    }
+  } else {
+    let mut sim_cursor = 0UL
+    let mut li = 0
+    while li < line_count {
+      if sim_cursor >= elen_u64 {
+        break
+      }
+      let l = segment.meta[explicit_offset + li].to_int().to_int64().to_uint64()
+      let rem_enc = elen_u64 - sim_cursor
+      sim_cursor = if l > rem_enc { elen_u64 } else { sim_cursor + l }
+      emitted_lines += 1
+      li += 1
+    }
+    if sim_cursor != elen_u64 {
+      return Err(Error::InvalidSegment("base64 line lengths mismatch"))
+    }
+  }
+  let total_out_u64 = u64_saturating_add(
+    preflight_base,
+    emitted_lines.to_int64().to_uint64() * 2UL,
+  )
+  if total_out_u64 > rem_budget_after {
+    return Err(Error::Other("decode output exceeds budget"))
+  }
+  match u64_to_int_checked(total_out_u64) {
+    Ok(_) => ()
+    Err(e) => return Err(e)
+  }
+  let encoded = base64::encode(payload).to_bytes()
+  let elen = encoded.length()
+  let out : Array[Byte] = []
+  append_bytes(out, header)
+  let mut cursor = 0
+  let mut li = 0
+  while li < emitted_lines {
+    if cursor >= elen {
+      break
+    }
+    let l = if line_case == 0 {
+      uniform_len
+    } else if line_case == 1 {
+      if li + 1 == line_count { last_len } else { uniform_len }
+    } else {
+      segment.meta[explicit_offset + li].to_int()
+    }
+    let end = if l > elen - cursor { elen } else { cursor + l }
+    append_bytes_slice(out, encoded, cursor, end)
+    append_bytes(out, crlf)
+    cursor = end
+    li += 1
+  }
+  if cursor != elen {
+    return Err(Error::InvalidSegment("base64 line lengths mismatch"))
+  }
+  let result = bytes_from_array(out)
+  match budget.consume(result.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(result)
+}

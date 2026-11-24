@@ -1,0 +1,272 @@
+///| Legacy PdfFlate (tag 0x09) decoder with predictor and BMP payload support.
+
+struct PdfDecodeParms {
+  predictor : Byte
+  colors : Byte
+  bpc : Byte
+  columns : UInt
+}
+
+struct PdfBmpMeta {
+  mode : Byte
+  width : UInt
+  height : UInt
+}
+
+fn pdf_predictor_bpp(params : PdfDecodeParms) -> Result[Int, Error] {
+  if params.colors == (0).to_byte() ||
+  params.bpc == (0).to_byte() ||
+  params.columns == 0U {
+    return Err(Error::InvalidSegment("pdf predictor params"))
+  }
+  let bpc = params.bpc.to_int()
+  if bpc % 8 != 0 {
+    return Err(Error::InvalidSegment("pdf predictor bpc"))
+  }
+  let bytes_per_sample = bpc / 8
+  let colors = params.colors.to_int()
+  match int_checked_mul(colors, bytes_per_sample) {
+    Some(v) => Ok(v)
+    None => Err(Error::InvalidSegment("pdf predictor bpp"))
+  }
+}
+
+fn pdf_predictor_row_bytes(params : PdfDecodeParms) -> Result[Int, Error] {
+  let bpp = match pdf_predictor_bpp(params) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if params.columns > 0x7FFFFFFFU {
+    return Err(Error::InvalidSegment("pdf predictor columns"))
+  }
+  match int_checked_mul(params.columns.to_int(), bpp) {
+    Some(v) => Ok(v)
+    None => Err(Error::InvalidSegment("pdf predictor row"))
+  }
+}
+
+fn encode_pdf_predictor(
+  data : Bytes,
+  params : PdfDecodeParms,
+) -> Result[Bytes, Error] {
+  let pred = params.predictor.to_int()
+  if pred == 1 {
+    return Ok(data)
+  }
+  if pred < 10 || pred > 14 {
+    return Err(Error::InvalidSegment("pdf predictor"))
+  }
+  let filter = pred - 10
+  let bpp = match pdf_predictor_bpp(params) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let row_bytes = match pdf_predictor_row_bytes(params) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if row_bytes == 0 || data.length() % row_bytes != 0 {
+    return Err(Error::InvalidSegment("pdf predictor size"))
+  }
+  let rows = data.length() / row_bytes
+  let out : FixedArray[Byte] = FixedArray::make(rows * row_bytes, (0).to_byte())
+  let mut row = 0
+  while row < rows {
+    let base = row * row_bytes
+    let prev_base = (row - 1) * row_bytes
+    let mut col = 0
+    while col < row_bytes {
+      let cur = data[base + col].to_int()
+      let left = if col >= bpp { data[base + col - bpp].to_int() } else { 0 }
+      let up = if row > 0 { data[prev_base + col].to_int() } else { 0 }
+      let up_left = if row > 0 && col >= bpp {
+        data[prev_base + col - bpp].to_int()
+      } else {
+        0
+      }
+      let p = pdf_pred_value(filter, left, up, up_left)
+      out[base + col] = ((cur - p) & 0xFF).to_byte()
+      col += 1
+    }
+    row += 1
+  }
+  Ok(bytes_from_fixed_array(out))
+}
+
+fn decode_pdf_bmp_payload(
+  payload : Bytes,
+  meta : PdfBmpMeta,
+) -> Result[Bytes, Error] {
+  let mode = meta.mode.to_int()
+  let bpp = if mode == 1 {
+    1
+  } else if mode == 2 {
+    3
+  } else {
+    return Err(Error::InvalidSegment("pdf bmp mode"))
+  }
+  let header_size = 14 + 40 + (if mode == 1 { 1024 } else { 0 })
+  if payload.length() < header_size {
+    return Err(Error::InvalidSegment("pdf bmp payload"))
+  }
+  if meta.width > 0x7FFFFFFFU || meta.height > 0x7FFFFFFFU {
+    return Err(Error::InvalidSegment("pdf bmp height"))
+  }
+  let row_bytes = match int_checked_mul(meta.width.to_int(), bpp) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("pdf bmp size"))
+  }
+  let padded_row_bytes = match int_checked_add(row_bytes, 3) {
+    Some(v) => v & 0x7FFFFFFC
+    None => return Err(Error::InvalidSegment("pdf bmp size"))
+  }
+  let h = meta.height.to_int()
+  let data_size = match int_checked_mul(padded_row_bytes, h) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("pdf bmp size"))
+  }
+  if data_size > payload.length() - header_size {
+    return Err(Error::InvalidSegment("pdf bmp payload"))
+  }
+  if row_bytes == 0 || h == 0 {
+    return Ok(Bytes::new(0))
+  }
+  let out : Array[Byte] = []
+  let mut cursor = header_size
+  let mut row = 0
+  while row < h {
+    append_bytes_slice(out, payload, cursor, cursor + row_bytes)
+    cursor += padded_row_bytes
+    row += 1
+  }
+  Ok(bytes_from_array(out))
+}
+
+fn decode_pdf_flate_segment(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  let mlen = segment.meta.length()
+  if mlen < 4 {
+    return Err(Error::InvalidSegment("pdf meta"))
+  }
+  if segment.meta[0] != (0).to_byte() {
+    return Err(Error::InvalidSegment("pdf meta_version"))
+  }
+  let compression = segment.meta[1].to_int()
+  let payload_kind = segment.meta[2]
+  let transform = segment.meta[3].to_int()
+  let mut offset = 4
+  let mut has_zlib = false
+  let mut zheader = Bytes::new(0)
+  let mut zfooter = Bytes::new(0)
+  if compression == 1 {
+    if 6 > mlen - offset {
+      return Err(Error::InvalidSegment("pdf zlib meta"))
+    }
+    has_zlib = true
+    zheader = bytes_slice(segment.meta, offset, offset + 2)
+    zfooter = bytes_slice(segment.meta, offset + 2, offset + 6)
+    offset += 6
+  } else if compression != 0 {
+    return Err(Error::InvalidSegment("pdf compression"))
+  }
+  let mut predictor_meta : Option[PdfDecodeParms] = None
+  if transform == 1 {
+    if 3 > mlen - offset {
+      return Err(Error::InvalidSegment("pdf predictor meta"))
+    }
+    let predictor = segment.meta[offset]
+    let colors = segment.meta[offset + 1]
+    let bpc = segment.meta[offset + 2]
+    offset += 3
+    let (cols_u, np) = match read_varint_slice(segment.meta, offset) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    offset = np
+    predictor_meta = Some(PdfDecodeParms::{
+      predictor,
+      colors,
+      bpc,
+      columns: cols_u.to_uint(),
+    })
+  }
+  let mut bmp_meta : Option[PdfBmpMeta] = None
+  if transform == 2 {
+    if offset >= mlen {
+      return Err(Error::InvalidSegment("pdf bmp meta"))
+    }
+    let mode = segment.meta[offset]
+    offset += 1
+    let (w_u, p1) = match read_varint_slice(segment.meta, offset) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let (h_u, p2) = match read_varint_slice(segment.meta, p1) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    offset = p2
+    bmp_meta = Some(PdfBmpMeta::{
+      mode,
+      width: w_u.to_uint(),
+      height: h_u.to_uint(),
+    })
+  }
+  if offset != mlen {
+    return Err(Error::InvalidSegment("pdf meta trailing"))
+  }
+  let (corrections, raw_payload) = match parse_preflate_data(segment.data) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let payload = match
+  decode_payload(payload_kind, raw_payload, config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let plain = if transform == 0 {
+    payload
+  } else if transform == 1 {
+    let params = match predictor_meta {
+      Some(p) => p
+      None => return Err(Error::InvalidSegment("pdf predictor meta"))
+    }
+    match encode_pdf_predictor(payload, params) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+  } else if transform == 2 {
+    let bm = match bmp_meta {
+      Some(m) => m
+      None => return Err(Error::InvalidSegment("pdf bmp meta"))
+    }
+    match decode_pdf_bmp_payload(payload, bm) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+  } else {
+    return Err(Error::InvalidSegment("pdf transform"))
+  }
+  let deflate = match preflate_reencode(corrections, plain) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let out : Array[Byte] = []
+  if has_zlib {
+    append_bytes(out, zheader)
+    append_bytes(out, deflate)
+    append_bytes(out, zfooter)
+  } else {
+    append_bytes(out, deflate)
+  }
+  let result = bytes_from_array(out)
+  match budget.consume(result.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(result)
+}

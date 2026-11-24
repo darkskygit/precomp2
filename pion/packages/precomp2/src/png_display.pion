@@ -1,0 +1,368 @@
+///| PNG display metadata extraction and WebP VP8X/ICCP muxing for fast previews.
+
+import "flate"
+import "webp"
+
+let png_signature : Bytes = bytes_from_array([
+  (0x89).to_byte(),
+  (0x50).to_byte(),
+  (0x4E).to_byte(),
+  (0x47).to_byte(),
+  (0x0D).to_byte(),
+  (0x0A).to_byte(),
+  (0x1A).to_byte(),
+  (0x0A).to_byte(),
+])
+
+let chunk_ihdr : Bytes = "IHDR".to_bytes()
+
+let chunk_idat : Bytes = "IDAT".to_bytes()
+
+let chunk_iend : Bytes = "IEND".to_bytes()
+
+let chunk_cicp : Bytes = "cICP".to_bytes()
+
+let chunk_iccp : Bytes = "iCCP".to_bytes()
+
+let riff_magic : Bytes = "RIFF".to_bytes()
+
+let webp_magic : Bytes = "WEBP".to_bytes()
+
+let rgb_space : Bytes = "RGB ".to_bytes()
+
+let acsp_sig : Bytes = "acsp".to_bytes()
+
+struct PngDisplayMetadata {
+  ihdr : PngIhdr
+  icc : Option[Bytes]
+}
+
+fn parse_png_metadata(
+  input : Bytes,
+) -> Result[Option[PngDisplayMetadata], Error] {
+  if !bytes_starts_with(input, png_signature) {
+    return Ok(None)
+  }
+  let ilen = input.length()
+  let mut offset = 8
+  let mut ihdr : Option[PngIhdr] = None
+  let mut icc : Option[Bytes] = None
+  let mut cicp = false
+  let mut ended = false
+  while offset < ilen {
+    if offset + 8 > ilen {
+      return Err(Error::InvalidSegment("png chunk header"))
+    }
+    let len_u = read_u32_be(input, offset)
+    if len_u > 0x7FFFFFFFU {
+      return Err(Error::LengthOverflow)
+    }
+    let clen = len_u.to_int()
+    let end = match int_checked_add(offset, 12) {
+      Some(v) =>
+      match int_checked_add(v, clen) {
+        Some(e) => e
+        None => return Err(Error::LengthOverflow)
+      }
+      None => return Err(Error::LengthOverflow)
+    }
+    if end > ilen {
+      return Err(Error::InvalidSegment("png chunk bounds"))
+    }
+    let crc_calc = flate::crc32_update_slice(
+      0U,
+      input,
+      offset + 4,
+      offset + 8 + clen,
+    )
+    let crc_stored = read_u32_be(input, offset + 8 + clen)
+    if crc_calc != crc_stored {
+      return Err(Error::InvalidSegment("png chunk crc"))
+    }
+    let is_ihdr = bytes_starts_with_at(input, offset + 4, chunk_ihdr)
+    match ihdr {
+      None =>
+      if !is_ihdr {
+        return Err(Error::InvalidSegment("png missing ihdr"))
+      }
+      Some(_) => ()
+    }
+    if is_ihdr {
+      match ihdr {
+        Some(_) => return Err(Error::InvalidSegment("png duplicate ihdr"))
+        None => ()
+      }
+      let data = bytes_slice(input, offset + 8, offset + 8 + clen)
+      let parsed = match PngIhdr::parse(data) {
+        Some(p) => p
+        None => return Err(Error::InvalidSegment("png ihdr"))
+      }
+      if !parsed.is_webp_compatible() {
+        return Ok(None)
+      }
+      ihdr = Some(parsed)
+    } else if bytes_starts_with_at(input, offset + 4, chunk_cicp) {
+      cicp = true
+    } else if bytes_starts_with_at(input, offset + 4, chunk_iccp) {
+      match icc {
+        None => icc = Some(bytes_slice(input, offset + 8, offset + 8 + clen))
+        Some(_) => ()
+      }
+    } else if bytes_starts_with_at(input, offset + 4, chunk_iend) {
+      if clen != 0 || end != ilen {
+        return Err(Error::InvalidSegment("png iend"))
+      }
+      ended = true
+    }
+    offset = end
+  }
+  if !ended {
+    return Err(Error::InvalidSegment("png missing iend"))
+  }
+  let parsed_ihdr = match ihdr {
+    Some(h) => h
+    None => return Err(Error::InvalidSegment("png missing ihdr"))
+  }
+  if cicp {
+    icc = None
+  }
+  Ok(Some(PngDisplayMetadata::{ ihdr: parsed_ihdr, icc }))
+}
+
+fn decode_png_icc(
+  compressed : Bytes,
+  max_profile_size : UInt64,
+) -> Result[Option[Bytes], Error] {
+  let name_end = match bytes_find_byte_from(compressed, (0).to_byte(), 0) {
+    Some(pos) => pos
+    None => return Ok(None)
+  }
+  if name_end < 1 ||
+  name_end > 79 ||
+  name_end + 2 > compressed.length() ||
+  compressed[name_end + 1] != (0).to_byte() {
+    return Ok(None)
+  }
+  let zlib_slice = bytes_slice(compressed, name_end + 2, compressed.length())
+  let limit_int = if max_profile_size > 2147483647UL {
+    2147483647
+  } else {
+    max_profile_size.to_int()
+  }
+  let profile = match flate::zlib_decompress_with_limit(zlib_slice, limit_int) {
+    Ok(p) => p
+    Err(flate::FlateError::OutputLimitExceeded(_)) =>
+    return Err(Error::Other("png icc exceeds budget"))
+    Err(_) => return Ok(None)
+  }
+  // Reject trailing bytes after the zlib trailer: dropping 1 byte must fail to inflate.
+  let zlen = zlib_slice.length()
+  if zlen < 6 {
+    return Ok(None)
+  }
+  match
+  flate::zlib_decompress_with_limit(
+    bytes_slice(zlib_slice, 0, zlen - 1),
+    limit_int,
+  ) {
+    Ok(_) => return Ok(None)
+    Err(_) => ()
+  }
+  if profile.length().to_int64().to_uint64() > max_profile_size {
+    return Err(Error::Other("png icc exceeds budget"))
+  }
+  if profile.length() < 132 ||
+  !bytes_starts_with_at(profile, 16, rgb_space) ||
+  !bytes_starts_with_at(profile, 36, acsp_sig) ||
+  read_u32_be(profile, 0) != profile.length().to_uint() {
+    return Ok(None)
+  }
+  Ok(Some(profile))
+}
+
+fn write_webp_chunk(
+  out : Array[Byte],
+  kind : Bytes,
+  data : Bytes,
+) -> Result[Unit, Error] {
+  append_bytes(out, kind)
+  write_u32_le(data.length().to_uint(), out)
+  append_bytes(out, data)
+  if data.length() % 2 != 0 {
+    out.push((0).to_byte())
+  }
+  Ok(())
+}
+
+fn extract_png_display(
+  segments : Array[Pcf2Segment],
+  config : DecodeConfig,
+) -> Result[Option[Bytes], Error] {
+  let metadata_buf : Array[Byte] = []
+  let mut carrier : Option[Bytes] = None
+  let mut parsed : Option[PngWebpMeta] = None
+  let mut i = 0
+  while i < segments.length() {
+    let seg = segments[i]
+    if seg.kind == SegmentKind::Lit.to_u8() {
+      append_bytes(metadata_buf, seg.data)
+    } else if seg.kind == SegmentKind::PngIdat.to_u8() {
+      match carrier {
+        Some(_) => return Err(Error::InvalidSegment("png display segment layout"))
+        None => ()
+      }
+      let meta = match parse_png_meta(seg) {
+        Ok(m) => m
+        Err(e) => return Err(e)
+      }
+      let (_, payload) = match parse_preflate_data(seg.data) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if meta.png_payload_kind == (0).to_byte() {
+        return Ok(None)
+      }
+      let dec = match
+      decode_payload(
+        meta.payload_kind,
+        payload,
+        config,
+        0,
+        DecodeBudget::new(),
+      ) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      carrier = Some(dec)
+      parsed = meta.webp_meta
+    } else {
+      return Err(Error::InvalidSegment("png display segment layout"))
+    }
+    i += 1
+  }
+  let carrier_bytes = match carrier {
+    Some(c) => c
+    None => return Ok(None)
+  }
+  let plan = match parse_png_metadata(bytes_from_array(metadata_buf)) {
+    Ok(Some(p)) => p
+    Ok(None) => return Ok(None)
+    Err(e) => return Err(e)
+  }
+  let meta = match parsed {
+    Some(m) => m
+    None => return Err(Error::InvalidSegment("png webp meta"))
+  }
+  if meta.width != plan.ihdr.width ||
+  meta.height != plan.ihdr.height ||
+  meta.color_type != plan.ihdr.color_type {
+    return Err(Error::InvalidSegment("png display dimensions"))
+  }
+  let mut fi = 0
+  while fi < meta.filters.length() {
+    if meta.filters[fi].to_int() > 4 {
+      return Err(Error::InvalidSegment("png display dimensions"))
+    }
+    fi += 1
+  }
+  let features = match webp::probe_header(carrier_bytes) {
+    Ok(f) => f
+    Err(_) => return Err(Error::InvalidSegment("webp header"))
+  }
+  if features.width.to_uint() != meta.width ||
+  features.height.to_uint() != meta.height ||
+  features.has_animation {
+    return Err(Error::InvalidSegment("png webp size"))
+  }
+  let clen = carrier_bytes.length()
+  if clen < 12 ||
+  !bytes_starts_with(carrier_bytes, riff_magic) ||
+  !bytes_starts_with_at(carrier_bytes, 8, webp_magic) ||
+  read_u32_le(carrier_bytes, 4) + 8U != clen.to_uint() {
+    return Err(Error::InvalidSegment("webp riff"))
+  }
+  let mut offset = 12
+  while offset < clen {
+    if offset + 8 > clen {
+      return Err(Error::InvalidSegment("webp chunk"))
+    }
+    let chunk_len_u = read_u32_le(carrier_bytes, offset + 4)
+    if chunk_len_u > 0x7FFFFFFFU {
+      return Err(Error::LengthOverflow)
+    }
+    let chunk_len = chunk_len_u.to_int()
+    let pad = chunk_len % 2
+    let next = match int_checked_add(offset, 8) {
+      Some(v1) =>
+      match int_checked_add(v1, chunk_len) {
+        Some(v2) =>
+        match int_checked_add(v2, pad) {
+          Some(v3) => v3
+          None => return Err(Error::LengthOverflow)
+        }
+        None => return Err(Error::LengthOverflow)
+      }
+      None => return Err(Error::LengthOverflow)
+    }
+    if next > clen {
+      return Err(Error::InvalidSegment("webp chunk bounds"))
+    }
+    offset = next
+  }
+  let budget = DecodeBudget::new()
+  match budget.consume(clen, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let icc = match plan.icc {
+    Some(compressed) =>
+    match decode_png_icc(compressed, config.max_total_output) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    None => None
+  }
+  let icc_bytes = match icc {
+    Some(b) => b
+    None => return Ok(Some(carrier_bytes))
+  }
+  let extra_len = match int_checked_add(icc_bytes.length(), 26 + icc_bytes.length() % 2) {
+    Some(v) => v
+    None => return Err(Error::LengthOverflow)
+  }
+  match budget.consume(extra_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let out : Array[Byte] = []
+  append_bytes(out, riff_magic)
+  out.push((0).to_byte())
+  out.push((0).to_byte())
+  out.push((0).to_byte())
+  out.push((0).to_byte())
+  append_bytes(out, webp_magic)
+  let vp8x_flag = 0x20 | (if features.has_alpha { 0x10 } else { 0 })
+  let wm1 = meta.width - 1U
+  let hm1 = meta.height - 1U
+  let vp8x = bytes_from_array([
+    vp8x_flag.to_byte(),
+    (0).to_byte(),
+    (0).to_byte(),
+    (0).to_byte(),
+    (wm1 & 0xFFU).to_int().to_byte(),
+    ((wm1 >> 8) & 0xFFU).to_int().to_byte(),
+    ((wm1 >> 16) & 0xFFU).to_int().to_byte(),
+    (hm1 & 0xFFU).to_int().to_byte(),
+    ((hm1 >> 8) & 0xFFU).to_int().to_byte(),
+    ((hm1 >> 16) & 0xFFU).to_int().to_byte(),
+  ])
+  let _ = write_webp_chunk(out, "VP8X".to_bytes(), vp8x)
+  let _ = write_webp_chunk(out, "ICCP".to_bytes(), icc_bytes)
+  append_bytes_slice(out, carrier_bytes, 12, clen)
+  let riff_size = (out.length() - 8).to_uint()
+  out[4] = (riff_size & 0xFFU).to_int().to_byte()
+  out[5] = ((riff_size >> 8) & 0xFFU).to_int().to_byte()
+  out[6] = ((riff_size >> 16) & 0xFFU).to_int().to_byte()
+  out[7] = ((riff_size >> 24) & 0xFFU).to_int().to_byte()
+  Ok(Some(bytes_from_array(out)))
+}

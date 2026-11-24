@@ -1,0 +1,111 @@
+///| Bridge between precomp2 codecs and the `preflate` package.
+
+import "preflate"
+
+let preflate_plain_text_limit : Int = 2147483647
+
+fn parse_preflate_output(buf : Bytes) -> Result[(UInt64, Bytes, Bytes), Error] {
+  let blen = buf.length()
+  let (deflate_len, p1) = match read_varint_slice(buf, 0) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (corr_len_u, p2) = match read_varint_slice(buf, p1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let corr_len = match u64_to_int_checked(corr_len_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if corr_len > blen - p2 {
+    return Err(Error::InvalidSegment("preflate corrections bounds"))
+  }
+  let corrections = bytes_slice(buf, p2, p2 + corr_len)
+  let p3 = p2 + corr_len
+  let (plain_len_u, p4) = match read_varint_slice(buf, p3) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let plain_len = match u64_to_int_checked(plain_len_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if plain_len > blen - p4 {
+    return Err(Error::InvalidSegment("preflate plain bounds"))
+  }
+  let plain = bytes_slice(buf, p4, p4 + plain_len)
+  Ok((deflate_len, corrections, plain))
+}
+
+fn build_preflate_data(corrections : Bytes, payload : Bytes) -> Bytes {
+  let out : Array[Byte] = []
+  write_varint(corrections.length().to_int64().to_uint64(), out)
+  append_bytes(out, corrections)
+  write_varint(payload.length().to_int64().to_uint64(), out)
+  append_bytes(out, payload)
+  bytes_from_array(out)
+}
+
+fn parse_preflate_data(data : Bytes) -> Result[(Bytes, Bytes), Error] {
+  let dlen = data.length()
+  let (corr_len_u, p1) = match read_varint_slice(data, 0) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let corr_len = match u64_to_int_checked(corr_len_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if corr_len > dlen - p1 {
+    return Err(Error::InvalidSegment("corrections bounds"))
+  }
+  let corrections = bytes_slice(data, p1, p1 + corr_len)
+  let p2 = p1 + corr_len
+  let (pay_len_u, p3) = match read_varint_slice(data, p2) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let pay_len = match u64_to_int_checked(pay_len_u) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if pay_len > dlen - p3 {
+    return Err(Error::InvalidSegment("payload bounds"))
+  }
+  let payload = bytes_slice(data, p3, p3 + pay_len)
+  Ok((corrections, payload))
+}
+
+fn preflate_analyze(deflate : Bytes) -> Result[Bytes, Error] {
+  preflate_analyze_limited(deflate, preflate_plain_text_limit)
+}
+
+fn preflate_analyze_limited(
+  deflate : Bytes,
+  limit : Int,
+) -> Result[Bytes, Error] {
+  let capped = if limit < preflate_plain_text_limit {
+    limit
+  } else {
+    preflate_plain_text_limit
+  }
+  let res = match preflate::analyze_limited(deflate, capped) {
+    Ok(r) => r
+    Err(msg) => return Err(Error::Other("preflate_analyze failed: \{msg}"))
+  }
+  let out : Array[Byte] = []
+  write_varint(res.compressed_size.to_int64().to_uint64(), out)
+  write_varint(res.corrections.length().to_int64().to_uint64(), out)
+  append_bytes(out, res.corrections)
+  write_varint(res.plain.length().to_int64().to_uint64(), out)
+  append_bytes(out, res.plain)
+  Ok(bytes_from_array(out))
+}
+
+fn preflate_reencode(corrections : Bytes, plain : Bytes) -> Result[Bytes, Error] {
+  match preflate::reencode(corrections, plain) {
+    Ok(b) => Ok(b)
+    Err(msg) => Err(Error::Other("preflate_reencode failed: \{msg}"))
+  }
+}

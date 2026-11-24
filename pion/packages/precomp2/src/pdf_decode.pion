@@ -1,0 +1,174 @@
+///| PdfStream (tag 0x0a) decoder and step statistics counter.
+
+fn decode_pdf_stream(
+  segment : Pcf2Segment,
+  config : DecodeConfig,
+  depth : Int,
+  budget : DecodeBudget,
+) -> Result[Bytes, Error] {
+  if depth > config.max_depth ||
+  segment.meta.length() == 0 ||
+  segment.meta[0] != (0).to_byte() {
+    return Err(Error::InvalidSegment("pdf stream version"))
+  }
+  let mut pos = 1
+  let (count, p1) = match pdf_read_num(segment.meta, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  pos = p1
+  if count == 0 || count > 65 {
+    return Err(Error::InvalidSegment("pdf step count"))
+  }
+  let steps : Array[PdfStep] = []
+  let mut i = 0
+  while i < count {
+    if pos >= segment.meta.length() {
+      return Err(Error::InvalidSegment("pdf step"))
+    }
+    let kind = segment.meta[pos]
+    pos += 1
+    let (len, np1) = match pdf_read_num(segment.meta, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let (smeta, np2) = match pdf_read_blob(segment.meta, np1) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    pos = np2
+    steps.push(PdfStep::{ kind, original_len: len, meta: smeta })
+    i += 1
+  }
+  if pos != segment.meta.length() {
+    return Err(Error::InvalidSegment("pdf step trailing bytes"))
+  }
+  let mut bytes = segment.data
+  let mut si = steps.length() - 1
+  while si >= 0 {
+    let st = steps[si]
+    si -= 1
+    let rem_budget = u64_saturating_sub(
+      config.max_total_output,
+      budget.total_output,
+    )
+    if st.original_len.to_int64().to_uint64() > rem_budget {
+      return Err(Error::InvalidSegment("pdf output budget"))
+    }
+    let output = if st.kind == pdf_op_hex || st.kind == pdf_op_a85 {
+      match
+      pdf_ascii_repack(bytes, st.meta, st.kind == pdf_op_hex, st.original_len) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    } else if st.kind == pdf_op_flate {
+      let (header, fp1) = match pdf_read_blob(st.meta, 0) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let (tail, fp2) = match pdf_read_blob(st.meta, fp1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let (corrections, fp3) = match pdf_read_blob(st.meta, fp2) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      if fp3 != st.meta.length() || header.length() != 2 || tail.length() < 4 {
+        return Err(Error::InvalidSegment("pdf flate metadata"))
+      }
+      let data = match preflate_reencode(corrections, bytes) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      let total_flate = match int_checked_add(header.length(), data.length()) {
+        Some(v) =>
+        match int_checked_add(v, tail.length()) {
+          Some(v2) => v2
+          None => return Err(Error::LengthOverflow)
+        }
+        None => return Err(Error::LengthOverflow)
+      }
+      if total_flate != st.original_len {
+        return Err(Error::InvalidSegment("pdf flate length"))
+      }
+      let out : Array[Byte] = []
+      append_bytes(out, header)
+      append_bytes(out, data)
+      append_bytes(out, tail)
+      bytes_from_array(out)
+    } else if st.kind == pdf_op_predictor {
+      match pdf_predictor_redo(bytes, st.meta, st.original_len) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    } else if st.kind == pdf_op_jpeg {
+      let jpeg_seg = Pcf2Segment::{
+        kind: SegmentKind::Jpg.to_u8(),
+        flags: (0).to_byte(),
+        orig_len: st.original_len.to_int64().to_uint64(),
+        meta: st.meta,
+        data: bytes,
+      }
+      match decode_jpg_segment(jpeg_seg, DecodeBudget::new(), config) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    } else if st.kind == pdf_op_webp {
+      match pdf_image_decode(bytes, st.meta, st.original_len) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+    } else {
+      return Err(Error::InvalidSegment("pdf operation"))
+    }
+    if output.length() != st.original_len {
+      return Err(Error::InvalidSegment("pdf reconstructed length"))
+    }
+    match budget.consume(output.length(), config) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    bytes = output
+  }
+  if bytes.length().to_int64().to_uint64() != segment.orig_len {
+    return Err(Error::InvalidSegment("pdf original length"))
+  }
+  Ok(bytes)
+}
+
+fn pdf_count_steps(
+  segment : Pcf2Segment,
+  stats : PdfStats,
+) -> Result[Unit, Error] {
+  let (count, p1) = match pdf_read_num(segment.meta, 1) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let mut pos = p1
+  let mut i = 0
+  while i < count {
+    let kind = segment.meta[pos]
+    pos += 1
+    let (_, np1) = match pdf_read_num(segment.meta, pos) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    let (_, np2) = match pdf_read_blob(segment.meta, np1) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    pos = np2
+    if kind == pdf_op_hex || kind == pdf_op_a85 {
+      stats.ascii += 1
+    } else if kind == pdf_op_flate {
+      stats.flate += 1
+    } else if kind == pdf_op_jpeg {
+      stats.dct += 1
+    } else if kind == pdf_op_webp {
+      stats.images += 1
+    }
+    i += 1
+  }
+  Ok(())
+}

@@ -1,0 +1,340 @@
+///| Physical-range PDF syntax scanner and indirect reference resolver.
+
+enum PdfValue {
+  Int(UInt64)
+  Name(Bytes)
+  Array(Array[PdfValue])
+  Dict(Array[(Bytes, PdfValue)])
+  Ref(UInt64, UInt64)
+  Bool(Bool)
+  Null
+  Other
+}
+
+fn PdfValue::get(self : PdfValue, key : Bytes) -> Option[PdfValue] {
+  match self {
+    PdfValue::Dict(items) => {
+      let mut i = 0
+      while i < items.length() {
+        let (k, v) = items[i]
+        if bytes_eq(k, key) {
+          return Some(v)
+        }
+        i += 1
+      }
+      None
+    }
+    _ => None
+  }
+}
+
+fn PdfValue::int(self : PdfValue) -> Option[UInt64] {
+  match self {
+    PdfValue::Int(n) => Some(n)
+    _ => None
+  }
+}
+
+fn PdfValue::name(self : PdfValue) -> Option[Bytes] {
+  match self {
+    PdfValue::Name(n) => Some(n)
+    _ => None
+  }
+}
+
+struct PdfStreamRange {
+  start : Int
+  end : Int
+  dict : PdfValue
+}
+
+fn pdf_whitespace(b : Byte) -> Bool {
+  let v = b.to_int()
+  v == 0 || v == 9 || v == 10 || v == 12 || v == 13 || v == 32
+}
+
+fn pdf_delimiter(b : Byte) -> Bool {
+  if pdf_whitespace(b) {
+    return true
+  }
+  let v = b.to_int()
+  v == 0x28 ||
+  v == 0x29 ||
+  v == 0x3C ||
+  v == 0x3E ||
+  v == 0x5B ||
+  v == 0x5D ||
+  v == 0x7B ||
+  v == 0x7D ||
+  v == 0x2F ||
+  v == 0x25
+}
+
+fn pdf_hex_nibble(b : Byte) -> Option[Int] {
+  let v = b.to_int()
+  if v >= 0x30 && v <= 0x39 {
+    Some(v - 0x30)
+  } else if v >= 0x61 && v <= 0x66 {
+    Some(v - 0x61 + 10)
+  } else if v >= 0x41 && v <= 0x46 {
+    Some(v - 0x41 + 10)
+  } else {
+    None
+  }
+}
+
+struct PdfParser {
+  data : Bytes
+  mut pos : Int
+}
+
+fn PdfParser::skip(self : PdfParser) -> Unit {
+  let len = self.data.length()
+  while true {
+    while self.pos < len && pdf_whitespace(self.data[self.pos]) {
+      self.pos += 1
+    }
+    if self.pos >= len || self.data[self.pos] != (0x25).to_byte() {
+      break
+    }
+    while self.pos < len {
+      let c = self.data[self.pos].to_int()
+      if c == 0x0A || c == 0x0D {
+        break
+      }
+      self.pos += 1
+    }
+  }
+}
+
+fn PdfParser::word(self : PdfParser, w : Bytes) -> Bool {
+  self.skip()
+  let wlen = w.length()
+  let end = self.pos + wlen
+  if end <= self.data.length() &&
+  bytes_starts_with_at(self.data, self.pos, w) &&
+  (end == self.data.length() || pdf_delimiter(self.data[end])) {
+    self.pos = end
+    true
+  } else {
+    false
+  }
+}
+
+fn PdfParser::number(self : PdfParser) -> Option[UInt64] {
+  self.skip()
+  let len = self.data.length()
+  let start = self.pos
+  let mut acc : UInt64 = 0UL
+  let max_div10 : UInt64 = 1844674407370955161UL
+  let mut overflow = false
+  while self.pos < len {
+    let v = self.data[self.pos].to_int()
+    if v < 0x30 || v > 0x39 {
+      break
+    }
+    let d = (v - 0x30).to_int64().to_uint64()
+    if acc > max_div10 || (acc == max_div10 && d > 5UL) {
+      overflow = true
+    } else {
+      acc = acc * 10UL + d
+    }
+    self.pos += 1
+  }
+  if start == self.pos ||
+  overflow ||
+  (self.pos < len && !pdf_delimiter(self.data[self.pos])) {
+    return None
+  }
+  Some(acc)
+}
+
+let kw_r : Bytes = "R".to_bytes()
+
+let kw_true : Bytes = "true".to_bytes()
+
+let kw_false : Bytes = "false".to_bytes()
+
+let kw_null : Bytes = "null".to_bytes()
+
+let kw_obj : Bytes = "obj".to_bytes()
+
+let kw_stream : Bytes = "stream".to_bytes()
+
+let kw_endstream : Bytes = "endstream".to_bytes()
+
+let kw_endobj : Bytes = "endobj".to_bytes()
+
+let kw_length : Bytes = "Length".to_bytes()
+
+let kw_decode_parms : Bytes = "DecodeParms".to_bytes()
+
+fn PdfParser::value(self : PdfParser, depth : Int) -> Option[PdfValue] {
+  if depth > 32 {
+    return None
+  }
+  self.skip()
+  let len = self.data.length()
+  if self.pos >= len {
+    return None
+  }
+  let b = self.data[self.pos].to_int()
+  if b == 0x2F {
+    // '/'
+    self.pos += 1
+    let name : Array[Byte] = []
+    while self.pos < len {
+      let c = self.data[self.pos]
+      if pdf_delimiter(c) {
+        break
+      }
+      if c == (0x23).to_byte() {
+        // '#'
+        if self.pos + 2 >= len {
+          return None
+        }
+        let hi = match pdf_hex_nibble(self.data[self.pos + 1]) {
+          Some(v) => v
+          None => return None
+        }
+        let lo = match pdf_hex_nibble(self.data[self.pos + 2]) {
+          Some(v) => v
+          None => return None
+        }
+        name.push(((hi << 4) | lo).to_byte())
+        self.pos += 3
+      } else {
+        name.push(c)
+        self.pos += 1
+      }
+    }
+    return Some(PdfValue::Name(bytes_from_array(name)))
+  }
+  if b == 0x5B {
+    // '['
+    self.pos += 1
+    let items : Array[PdfValue] = []
+    while true {
+      self.skip()
+      if self.pos < len && self.data[self.pos] == (0x5D).to_byte() {
+        self.pos += 1
+        break
+      }
+      match self.value(depth + 1) {
+        Some(v) => items.push(v)
+        None => return None
+      }
+    }
+    return Some(PdfValue::Array(items))
+  }
+  if b == 0x3C && self.pos + 1 < len && self.data[self.pos + 1] == (0x3C).to_byte() {
+    // '<<'
+    self.pos += 2
+    let items : Array[(Bytes, PdfValue)] = []
+    let seen : Map[String, Bool] = Map::new()
+    while true {
+      self.skip()
+      if self.pos + 1 < len &&
+      self.data[self.pos] == (0x3E).to_byte() &&
+      self.data[self.pos + 1] == (0x3E).to_byte() {
+        self.pos += 2
+        break
+      }
+      let key = match self.value(depth + 1) {
+        Some(PdfValue::Name(k)) => k
+        _ => return None
+      }
+      let entry_val = match self.value(depth + 1) {
+        Some(v) => v
+        None => return None
+      }
+      // Reject duplicate keys in the same dictionary in O(1).
+      let kstr = bytes_to_map_key(key)
+      match seen.get(kstr) {
+        Some(_) => return None
+        None => seen.set(kstr, true)
+      }
+      items.push((key, entry_val))
+    }
+    return Some(PdfValue::Dict(items))
+  }
+  if b == 0x28 {
+    // '(' literal string
+    self.pos += 1
+    let mut nesting = 1
+    while nesting > 0 {
+      if self.pos >= len {
+        return None
+      }
+      let c = self.data[self.pos].to_int()
+      self.pos += 1
+      if c == 0x5C {
+        // '\\'
+        if self.pos >= len {
+          return None
+        }
+        self.pos += 1
+      } else if c == 0x28 {
+        nesting += 1
+      } else if c == 0x29 {
+        nesting -= 1
+      }
+    }
+    return Some(PdfValue::Other)
+  }
+  if b == 0x3C {
+    // '<' hex string
+    self.pos += 1
+    while true {
+      if self.pos >= len {
+        return None
+      }
+      if self.data[self.pos] == (0x3E).to_byte() {
+        self.pos += 1
+        break
+      }
+      self.pos += 1
+    }
+    return Some(PdfValue::Other)
+  }
+  if b >= 0x30 && b <= 0x39 {
+    let start = self.pos
+    let n = match self.number() {
+      Some(v) => v
+      None => {
+        self.pos = start
+        while self.pos < len && !pdf_delimiter(self.data[self.pos]) {
+          self.pos += 1
+        }
+        return Some(PdfValue::Other)
+      }
+    }
+    let end = self.pos
+    match self.number() {
+      Some(generation) =>
+      if self.word(kw_r) {
+        return Some(PdfValue::Ref(n, generation))
+      }
+      None => ()
+    }
+    self.pos = end
+    return Some(PdfValue::Int(n))
+  }
+  if self.word(kw_true) {
+    return Some(PdfValue::Bool(true))
+  }
+  if self.word(kw_false) {
+    return Some(PdfValue::Bool(false))
+  }
+  if self.word(kw_null) {
+    return Some(PdfValue::Null)
+  }
+  let start = self.pos
+  while self.pos < len && !pdf_delimiter(self.data[self.pos]) {
+    self.pos += 1
+  }
+  if start == self.pos {
+    self.pos += 1
+  }
+  Some(PdfValue::Other)
+}

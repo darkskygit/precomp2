@@ -1,0 +1,325 @@
+///| Byte-exact LZ4HC lazy hash-chain parser (liblz4 r131, level 16).
+
+let lz4_hc_max_offset : Int = 65535
+
+let lz4_hc_empty : UInt = 0xFFFFFFFFU
+
+let lz4_hc_optimal_ml : Int = 18
+
+struct Lz4HashChain {
+  heads : FixedArray[UInt]
+  prev_distance : FixedArray[Int]
+  mut next_to_insert : Int
+  attempts : Int
+}
+
+fn Lz4HashChain::new(attempts : Int) -> Lz4HashChain {
+  Lz4HashChain::{
+    heads: FixedArray::make(32768, lz4_hc_empty),
+    prev_distance: FixedArray::make(65536, 0xFFFF),
+    next_to_insert: 0,
+    attempts,
+  }
+}
+
+fn Lz4HashChain::insert_until(
+  self : Lz4HashChain,
+  src : Bytes,
+  pos : Int,
+) -> Unit {
+  let heads = self.heads
+  let prev = self.prev_distance
+  let mut p = self.next_to_insert
+  while p < pos {
+    let h = lz4_hash4(src, p)
+    let head = heads[h]
+    let dist = if head == lz4_hc_empty {
+      lz4_hc_max_offset
+    } else {
+      let diff = p.to_uint() - head
+      if diff < lz4_hc_max_offset.to_uint() {
+        diff.to_int()
+      } else {
+        lz4_hc_max_offset
+      }
+    }
+    prev[p & 0xFFFF] = dist
+    heads[h] = p.to_uint()
+    p += 1
+  }
+  self.next_to_insert = pos
+}
+
+fn Lz4HashChain::longest_match(
+  self : Lz4HashChain,
+  src : Bytes,
+  pos : Int,
+  limit : Int,
+) -> Option[Lz4Match] {
+  self.insert_until(src, pos)
+  let head = self.heads[lz4_hash4(src, pos)]
+  if head == lz4_hc_empty {
+    return None
+  }
+  let mut cand = head.to_int()
+  let prev = self.prev_distance
+  let pat = read_u32_le(src, pos)
+  let mut rem = self.attempts
+  let mut best_found = false
+  let mut best_source = 0
+  let mut best_len = 0
+  while rem > 0 && cand + lz4_hc_max_offset >= pos {
+    rem -= 1
+    if src[cand + best_len] == src[pos + best_len] &&
+    read_u32_le(src, cand) == pat {
+      let len = lz4_min_match +
+      lz4_common_prefix(src, pos + lz4_min_match, cand + lz4_min_match, limit)
+      if len > best_len {
+        best_found = true
+        best_source = cand
+        best_len = len
+      }
+    }
+    let d = prev[cand & 0xFFFF]
+    if cand < d {
+      break
+    }
+    cand -= d
+  }
+  if best_found {
+    Some(Lz4Match::{ start: pos, source: best_source, len: best_len })
+  } else {
+    None
+  }
+}
+
+fn Lz4HashChain::wider_match(
+  self : Lz4HashChain,
+  src : Bytes,
+  pos : Int,
+  min_start : Int,
+  limit : Int,
+  longest_in : Int,
+) -> Option[Lz4Match] {
+  self.insert_until(src, pos)
+  let head = self.heads[lz4_hash4(src, pos)]
+  if head == lz4_hc_empty {
+    return None
+  }
+  let max_back = pos - min_start
+  let mut longest = longest_in
+  let mut cand = head.to_int()
+  let prev = self.prev_distance
+  let pat = read_u32_le(src, pos)
+  let mut rem = self.attempts
+  let mut best_found = false
+  let mut best_start = 0
+  let mut best_source = 0
+  let mut best_len = 0
+  while rem > 0 && cand + lz4_hc_max_offset >= pos {
+    rem -= 1
+    if src[min_start + longest] == src[cand + (longest - max_back)] &&
+    read_u32_le(src, cand) == pat {
+      let forward = lz4_min_match +
+      lz4_common_prefix(src, pos + lz4_min_match, cand + lz4_min_match, limit)
+      let back_lim = if max_back < cand { max_back } else { cand }
+      let mut back = 0
+      while back < back_lim && src[pos - back - 1] == src[cand - back - 1] {
+        back += 1
+      }
+      if forward + back > longest {
+        longest = forward + back
+        best_found = true
+        best_start = pos - back
+        best_source = cand - back
+        best_len = longest
+      }
+    }
+    let d = prev[cand & 0xFFFF]
+    if cand < d {
+      break
+    }
+    cand -= d
+  }
+  if best_found {
+    Some(Lz4Match::{ start: best_start, source: best_source, len: best_len })
+  } else {
+    None
+  }
+}
+
+fn lz4_hc_wider(
+  finder : Lz4HashChain,
+  src : Bytes,
+  m : Lz4Match,
+  overlap : Int,
+  min_start : Int,
+  match_limit : Int,
+  mf_limit : Int,
+) -> Option[Lz4Match] {
+  let mend = m.start + m.len
+  if mend >= mf_limit {
+    return None
+  }
+  finder.wider_match(src, mend - overlap, min_start, match_limit, m.len)
+}
+
+fn lz4_hc_encode_from(
+  finder : Lz4HashChain,
+  src : Bytes,
+  out : Lz4SequenceWriter,
+  first : Lz4Match,
+  match_limit : Int,
+  mf_limit : Int,
+) -> Option[Int] {
+  let mut m1 = Lz4Match::{
+    start: first.start,
+    source: first.source,
+    len: first.len,
+  }
+  let mut fallback = Lz4Match::{
+    start: first.start,
+    source: first.source,
+    len: first.len,
+  }
+  while true {
+    let mut m2 = match
+    lz4_hc_wider(finder, src, m1, 2, m1.start + 1, match_limit, mf_limit) {
+      Some(v) => v
+      None => {
+        if !out.sequence(m1.start, m1.start - m1.source, m1.len) {
+          return None
+        }
+        return Some(m1.start + m1.len)
+      }
+    }
+    if fallback.start < m1.start && m2.start < m1.start + fallback.len {
+      m1 = Lz4Match::{
+        start: fallback.start,
+        source: fallback.source,
+        len: fallback.len,
+      }
+    }
+    if m2.start - m1.start < 3 {
+      m1 = m2
+      continue
+    }
+    let mut restart_search2 = false
+    while true {
+      if m2.start - m1.start < lz4_hc_optimal_ml {
+        let gap = m2.start - m1.start
+        let a = if m1.len < lz4_hc_optimal_ml {
+          m1.len
+        } else {
+          lz4_hc_optimal_ml
+        }
+        let b = gap + m2.len - lz4_min_match
+        let keep = if a < b { a } else { b }
+        if keep > gap {
+          let skip = keep - gap
+          m2.start += skip
+          m2.source += skip
+          m2.len -= skip
+        }
+      }
+      let m3 = match
+      lz4_hc_wider(finder, src, m2, 3, m2.start, match_limit, mf_limit) {
+        Some(v) => v
+        None => {
+          let gap = m2.start - m1.start
+          if m1.len > gap {
+            m1.len = gap
+          }
+          if !out.sequence(m1.start, m1.start - m1.source, m1.len) {
+            return None
+          }
+          if !out.sequence(m2.start, m2.start - m2.source, m2.len) {
+            return None
+          }
+          return Some(m2.start + m2.len)
+        }
+      }
+      let m1_end = m1.start + m1.len
+      if m3.start < m1_end + 3 {
+        if m3.start >= m1_end {
+          if m2.start < m1_end {
+            let overlap = m1_end - m2.start
+            if m2.len < overlap + lz4_min_match {
+              m2 = Lz4Match::{ start: m3.start, source: m3.source, len: m3.len }
+            } else {
+              m2.start += overlap
+              m2.source += overlap
+              m2.len -= overlap
+            }
+          }
+          if !out.sequence(m1.start, m1.start - m1.source, m1.len) {
+            return None
+          }
+          fallback = m2
+          m1 = m3
+          restart_search2 = true
+          break
+        }
+        m2 = m3
+        continue
+      }
+      if m2.start < m1_end {
+        let gap = m2.start - m1.start
+        if gap < 15 {
+          let a = if m1.len < lz4_hc_optimal_ml {
+            m1.len
+          } else {
+            lz4_hc_optimal_ml
+          }
+          let b = gap + m2.len - lz4_min_match
+          m1.len = if a < b { a } else { b }
+          if m1.len > gap {
+            let skip = m1.len - gap
+            m2.start += skip
+            m2.source += skip
+            m2.len -= skip
+          }
+        } else {
+          m1.len = gap
+        }
+      }
+      if !out.sequence(m1.start, m1.start - m1.source, m1.len) {
+        return None
+      }
+      m1 = m2
+      m2 = m3
+    }
+    if restart_search2 {
+      continue
+    }
+  }
+  None
+}
+
+fn lz4_hashchain_compress(
+  src : Bytes,
+  limit : Option[Int],
+  attempts : Int,
+) -> Option[Bytes] {
+  let out = Lz4SequenceWriter::new(src, limit, false)
+  let finder = Lz4HashChain::new(attempts)
+  let slen = src.length()
+  let match_limit = if slen > lz4_last_literals {
+    slen - lz4_last_literals
+  } else {
+    0
+  }
+  let mf_limit = if slen > lz4_mf_limit { slen - lz4_mf_limit } else { 0 }
+  let mut pos = 1
+  while pos < mf_limit {
+    match finder.longest_match(src, pos, match_limit) {
+      Some(m) =>
+      match lz4_hc_encode_from(finder, src, out, m, match_limit, mf_limit) {
+        Some(next_pos) => pos = next_pos
+        None => return None
+      }
+      None => pos += 1
+    }
+  }
+  out.finish()
+}

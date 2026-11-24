@@ -1,0 +1,303 @@
+///| PNG IHDR parsing, scanline filters, Paeth predictor, and WebP bitmap conversion.
+
+import "webp"
+
+struct PngIhdr {
+  width : UInt
+  height : UInt
+  bit_depth : Byte
+  color_type : Byte
+  compression : Byte
+  filter : Byte
+  interlace : Byte
+}
+
+fn PngIhdr::parse(data : Bytes) -> Option[PngIhdr] {
+  if data.length() != 13 {
+    return None
+  }
+  let width = read_u32_be(data, 0)
+  let height = read_u32_be(data, 4)
+  Some(PngIhdr::{
+    width,
+    height,
+    bit_depth: data[8],
+    color_type: data[9],
+    compression: data[10],
+    filter: data[11],
+    interlace: data[12],
+  })
+}
+
+fn PngIhdr::is_webp_compatible(self : PngIhdr) -> Bool {
+  if self.width == 0U || self.height == 0U {
+    return false
+  }
+  if self.bit_depth != (8).to_byte() {
+    return false
+  }
+  if self.compression != (0).to_byte() ||
+  self.filter != (0).to_byte() ||
+  self.interlace != (0).to_byte() {
+    return false
+  }
+  let ct = self.color_type.to_int()
+  ct == 2 || ct == 6
+}
+
+fn PngIhdr::bytes_per_pixel(self : PngIhdr) -> Result[Int, Error] {
+  png_bytes_per_pixel(self.color_type)
+}
+
+struct PngWebpMeta {
+  color_type : Byte
+  width : UInt
+  height : UInt
+  filters : Bytes
+}
+
+fn png_bytes_per_pixel(color_type : Byte) -> Result[Int, Error] {
+  match color_type.to_int() {
+    2 => Ok(3)
+    6 => Ok(4)
+    _ => Err(Error::InvalidSegment("png color_type"))
+  }
+}
+
+fn png_row_bytes(width : UInt, bpp : Int) -> Result[Int, Error] {
+  if width > 0x7FFFFFFFU {
+    return Err(Error::InvalidSegment("png width"))
+  }
+  match int_checked_mul(width.to_int(), bpp) {
+    Some(v) => Ok(v)
+    None => Err(Error::InvalidSegment("png row overflow"))
+  }
+}
+
+///| PNG Paeth predictor (RFC 2083).
+pub fn paeth_predictor(a_b : Byte, b_b : Byte, c_b : Byte) -> Byte {
+  let a = a_b.to_int()
+  let b = b_b.to_int()
+  let c = c_b.to_int()
+  let p = a + b - c
+  let pa = if p >= a { p - a } else { a - p }
+  let pb = if p >= b { p - b } else { b - p }
+  let pc = if p >= c { p - c } else { c - p }
+  if pa <= pb && pa <= pc {
+    a_b
+  } else if pb <= pc {
+    b_b
+  } else {
+    c_b
+  }
+}
+
+///| Reverse PNG scanline filters (types 0..4), returning `(bitmap, row_filter_types)`.
+pub fn undo_png_filters(
+  filtered : Bytes,
+  width : UInt,
+  height : UInt,
+  bpp : Int,
+) -> Result[(Bytes, Bytes), Error] {
+  let row_bytes = match png_row_bytes(width, bpp) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if height > 0x7FFFFFFFU {
+    return Err(Error::InvalidSegment("png height"))
+  }
+  let h = height.to_int()
+  let stride = match int_checked_add(row_bytes, 1) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("png size overflow"))
+  }
+  let expected = match int_checked_mul(stride, h) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("png size overflow"))
+  }
+  if filtered.length() != expected {
+    return Err(Error::InvalidSegment("png scanline size"))
+  }
+  let total_pixels = match int_checked_mul(row_bytes, h) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("png size overflow"))
+  }
+  let out : FixedArray[Byte] = FixedArray::make(total_pixels, (0).to_byte())
+  let filters : FixedArray[Byte] = FixedArray::make(h, (0).to_byte())
+  let mut row = 0
+  while row < h {
+    let row_start = row * stride
+    let filter = filtered[row_start]
+    let f = filter.to_int()
+    if f > 4 {
+      return Err(Error::InvalidSegment("png filter type"))
+    }
+    filters[row] = filter
+    let out_base = row * row_bytes
+    let prev_base = (row - 1) * row_bytes
+    let mut col = 0
+    while col < row_bytes {
+      let raw = filtered[row_start + 1 + col].to_int()
+      let left = if col >= bpp { out[out_base + col - bpp].to_int() } else { 0 }
+      let up = if row > 0 { out[prev_base + col].to_int() } else { 0 }
+      let up_left = if row > 0 && col >= bpp {
+        out[prev_base + col - bpp].to_int()
+      } else {
+        0
+      }
+      let pred = if f == 0 {
+        0
+      } else if f == 1 {
+        left
+      } else if f == 2 {
+        up
+      } else if f == 3 {
+        (left + up) >> 1
+      } else {
+        paeth_predictor(left.to_byte(), up.to_byte(), up_left.to_byte()).to_int()
+      }
+      out[out_base + col] = ((raw + pred) & 0xFF).to_byte()
+      col += 1
+    }
+    row += 1
+  }
+  Ok((bytes_from_fixed_array(out), bytes_from_fixed_array(filters)))
+}
+
+///| Re-apply PNG scanline filters with explicit per-row `filters`.
+pub fn apply_png_filters_with_types(
+  bitmap : Bytes,
+  width : UInt,
+  height : UInt,
+  bpp : Int,
+  filters : Bytes,
+) -> Result[Bytes, Error] {
+  let row_bytes = match png_row_bytes(width, bpp) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  if height > 0x7FFFFFFFU {
+    return Err(Error::InvalidSegment("png height"))
+  }
+  let h = height.to_int()
+  if filters.length() != h {
+    return Err(Error::InvalidSegment("png filter count"))
+  }
+  let expected_bm = match int_checked_mul(row_bytes, h) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("png bitmap size"))
+  }
+  if bitmap.length() != expected_bm {
+    return Err(Error::InvalidSegment("png bitmap size"))
+  }
+  let stride = match int_checked_add(row_bytes, 1) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("png size overflow"))
+  }
+  let total_out = match int_checked_mul(stride, h) {
+    Some(v) => v
+    None => return Err(Error::InvalidSegment("png size overflow"))
+  }
+  let out : FixedArray[Byte] = FixedArray::make(total_out, (0).to_byte())
+  let mut row = 0
+  while row < h {
+    let filter = filters[row]
+    let f = filter.to_int()
+    if f > 4 {
+      return Err(Error::InvalidSegment("png filter type"))
+    }
+    let out_start = row * stride
+    out[out_start] = filter
+    let in_base = row * row_bytes
+    let prev_base = (row - 1) * row_bytes
+    let mut col = 0
+    while col < row_bytes {
+      let cur = bitmap[in_base + col].to_int()
+      let left = if col >= bpp { bitmap[in_base + col - bpp].to_int() } else { 0 }
+      let up = if row > 0 { bitmap[prev_base + col].to_int() } else { 0 }
+      let up_left = if row > 0 && col >= bpp {
+        bitmap[prev_base + col - bpp].to_int()
+      } else {
+        0
+      }
+      let pred = if f == 0 {
+        0
+      } else if f == 1 {
+        left
+      } else if f == 2 {
+        up
+      } else if f == 3 {
+        (left + up) >> 1
+      } else {
+        paeth_predictor(left.to_byte(), up.to_byte(), up_left.to_byte()).to_int()
+      }
+      out[out_start + 1 + col] = ((cur - pred) & 0xFF).to_byte()
+      col += 1
+    }
+    row += 1
+  }
+  Ok(bytes_from_fixed_array(out))
+}
+
+///| Encode an RGB (color_type=2) or RGBA (color_type=6) bitmap as lossless WebP.
+fn encode_webp_lossless(
+  bitmap : Bytes,
+  width : UInt,
+  height : UInt,
+  color_type : Byte,
+) -> Result[Bytes, Error] {
+  let _ = bitmap
+  let _ = width
+  let _ = height
+  let _ = color_type
+  Err(Error::Other("webp lossless encoder unavailable"))
+}
+
+///| Decode a WebP bitstream into an RGB (color_type=2) or RGBA (color_type=6) bitmap.
+fn decode_webp_bitmap(
+  webp_bytes : Bytes,
+  width : UInt,
+  height : UInt,
+  color_type : Byte,
+) -> Result[Bytes, Error] {
+  let header = match webp::probe_header(webp_bytes) {
+    Ok(h) => h
+    Err(_) => return Err(Error::InvalidSegment("webp header"))
+  }
+  if header.width.to_uint() != width ||
+  header.height.to_uint() != height ||
+  header.has_animation {
+    return Err(Error::InvalidSegment("png webp size"))
+  }
+  let decoded = match
+  webp::decode_with_limits(webp_bytes, webp::DecodeLimits::default()) {
+    Ok(img) => img
+    Err(_) => return Err(Error::Other("webp decode failed"))
+  }
+  if decoded.width.to_uint() != width || decoded.height.to_uint() != height {
+    return Err(Error::InvalidSegment("png webp size"))
+  }
+  let ct = color_type.to_int()
+  if ct == 6 {
+    return Ok(decoded.rgba)
+  }
+  if ct == 2 {
+    let rgba = decoded.rgba
+    let pixels = rgba.length() / 4
+    let out : FixedArray[Byte] = FixedArray::make(pixels * 3, (0).to_byte())
+    let mut i = 0
+    while i < pixels {
+      let s = i * 4
+      if rgba[s + 3] != (255).to_byte() {
+        return Err(Error::InvalidSegment("png webp layout"))
+      }
+      let d = i * 3
+      out[d] = rgba[s]
+      out[d + 1] = rgba[s + 1]
+      out[d + 2] = rgba[s + 2]
+      i += 1
+    }
+    return Ok(bytes_from_fixed_array(out))
+  }
+  Err(Error::InvalidSegment("png color_type"))
+}

@@ -1,0 +1,407 @@
+///| Byte-preserving PDF stream codec (PdfStream tag 0x0a) and statistics.
+
+///| Counters reported by `encode_bytes_with_stats` for top-level PDFs.
+pub struct PdfStats {
+  pub mut streams : Int
+  pub mut transformed : Int
+  pub mut dct : Int
+  pub mut flate : Int
+  pub mut ascii : Int
+  pub mut images : Int
+  pub mut fallback : Int
+}
+
+///| Construct zeroed `PdfStats`.
+pub fn PdfStats::default() -> PdfStats {
+  PdfStats::{
+    streams: 0,
+    transformed: 0,
+    dct: 0,
+    flate: 0,
+    ascii: 0,
+    images: 0,
+    fallback: 0,
+  }
+}
+
+let pdf_op_hex : Byte = (0).to_byte()
+
+let pdf_op_a85 : Byte = (1).to_byte()
+
+let pdf_op_flate : Byte = (2).to_byte()
+
+let pdf_op_predictor : Byte = (3).to_byte()
+
+let pdf_op_jpeg : Byte = (4).to_byte()
+
+let pdf_op_webp : Byte = (5).to_byte()
+
+struct PdfStep {
+  kind : Byte
+  original_len : Int
+  meta : Bytes
+}
+
+fn pdf_write_num(n : Int, out : Array[Byte]) -> Unit {
+  write_varint(n.to_int64().to_uint64(), out)
+}
+
+fn pdf_read_num(data : Bytes, pos : Int) -> Result[(Int, Int), Error] {
+  let (v, next) = match read_varint_slice(data, pos) {
+    Ok(pair) => pair
+    Err(e) => return Err(e)
+  }
+  let n = match u64_to_int_checked(v) {
+    Ok(x) => x
+    Err(e) => return Err(e)
+  }
+  Ok((n, next))
+}
+
+fn pdf_write_blob(bytes : Bytes, out : Array[Byte]) -> Unit {
+  pdf_write_num(bytes.length(), out)
+  append_bytes(out, bytes)
+}
+
+fn pdf_read_blob(data : Bytes, pos : Int) -> Result[(Bytes, Int), Error] {
+  let (len, p1) = match pdf_read_num(data, pos) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let end = match int_checked_add(p1, len) {
+    Some(e) => e
+    None => return Err(Error::LengthOverflow)
+  }
+  if end > data.length() {
+    return Err(Error::InvalidSegment("pdf metadata bounds"))
+  }
+  Ok((bytes_slice(data, p1, end), end))
+}
+
+fn encode_pdf(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Array[Pcf2Segment]], Error] {
+  encode_pdf_with_stats(input, config, depth, budget, PdfStats::default())
+}
+
+fn encode_pdf_with_stats(
+  input : Bytes,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+  stats : PdfStats,
+) -> Result[Option[Array[Pcf2Segment]], Error] {
+  if !bytes_starts_with(input, pdf_magic) {
+    return Ok(None)
+  }
+  let result : Array[Pcf2Segment] = []
+  let mut cursor = 0
+  let streams = pdf_scan_streams(input)
+  let mut si = 0
+  while si < streams.length() {
+    let stream = streams[si]
+    si += 1
+    stats.streams += 1
+    let bytes = bytes_slice(input, stream.start, stream.end)
+    let before = budget.total_output
+    let encoded = pdf_encode_stream(bytes, stream.dict, config, depth, budget)
+    let seg_opt = match encoded {
+      Ok(Some(segment)) => {
+        let dec_cfg = DecodeConfig::{
+          max_depth: config.max_depth,
+          max_total_output: config.max_total_output,
+          recover: false,
+        }
+        match decode_pdf_stream(segment, dec_cfg, depth, DecodeBudget::new()) {
+          Ok(restored) => if bytes_eq(restored, bytes) { Some(segment) } else { None }
+          Err(_) => None
+        }
+      }
+      _ => None
+    }
+    match seg_opt {
+      None => {
+        budget.total_output = before
+        stats.fallback += 1
+      }
+      Some(segment) => {
+        if cursor < stream.start {
+          result.push(Pcf2Segment::lit(bytes_slice(input, cursor, stream.start)))
+        }
+        match pdf_count_steps(segment, stats) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+        result.push(segment)
+        stats.transformed += 1
+        cursor = stream.end
+      }
+    }
+  }
+  if cursor < input.length() {
+    result.push(Pcf2Segment::lit(bytes_slice(input, cursor, input.length())))
+  }
+  Ok(Some(result))
+}
+
+fn pdf_filters(dict : PdfValue) -> Result[Array[(Bytes, PdfValue)], Error] {
+  let names : Array[Bytes] = []
+  match dict.get("Filter".to_bytes()) {
+    None | Some(PdfValue::Null) => ()
+    Some(PdfValue::Name(n)) => names.push(n)
+    Some(PdfValue::Array(items)) => {
+      let mut i = 0
+      while i < items.length() {
+        match items[i].name() {
+          Some(n) => names.push(n)
+          None => return Err(Error::InvalidSegment("pdf filter name"))
+        }
+        i += 1
+      }
+    }
+    _ => return Err(Error::InvalidSegment("pdf filters"))
+  }
+  let params : Array[PdfValue] = []
+  match dict.get(kw_decode_parms) {
+    None | Some(PdfValue::Null) => {
+      let mut i = 0
+      while i < names.length() {
+        params.push(PdfValue::Null)
+        i += 1
+      }
+    }
+    Some(PdfValue::Dict(items)) =>
+    if names.length() == 1 {
+      params.push(PdfValue::Dict(items))
+    } else {
+      return Err(Error::InvalidSegment("pdf filter parameters"))
+    }
+    Some(PdfValue::Array(items)) =>
+    if items.length() == names.length() {
+      let mut i = 0
+      while i < items.length() {
+        params.push(items[i])
+        i += 1
+      }
+    } else {
+      return Err(Error::InvalidSegment("pdf filter parameters"))
+    }
+    _ => return Err(Error::InvalidSegment("pdf filter parameters"))
+  }
+  let mut j = 0
+  while j < params.length() {
+    match params[j] {
+      PdfValue::Null | PdfValue::Dict(_) => ()
+      _ => return Err(Error::InvalidSegment("pdf filter parameter entry"))
+    }
+    j += 1
+  }
+  let out : Array[(Bytes, PdfValue)] = []
+  let mut k = 0
+  while k < names.length() {
+    out.push((names[k], params[k]))
+    k += 1
+  }
+  Ok(out)
+}
+
+fn pdf_unpack_flate(bytes : Bytes, limit : Int) -> Result[(Bytes, Bytes), Error] {
+  let blen = bytes.length()
+  if blen < 6 {
+    return Err(Error::InvalidSegment("pdf zlib header"))
+  }
+  let cmf = bytes[0].to_int()
+  let flg = bytes[1].to_int()
+  if (cmf & 15) != 8 ||
+  (cmf >> 4) > 7 ||
+  (flg & 32) != 0 ||
+  ((cmf << 8) | flg) % 31 != 0 {
+    return Err(Error::InvalidSegment("pdf zlib header"))
+  }
+  let analysis = match
+  preflate_analyze_limited(bytes_slice(bytes, 2, blen), limit) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let (consumed, corrections, plain) = match parse_preflate_output(analysis) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let consumed_int = match u64_to_int_checked(consumed) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let end = match int_checked_add(consumed_int, 2) {
+    Some(v) => v
+    None => return Err(Error::LengthOverflow)
+  }
+  if end > blen || 4 > blen - end {
+    return Err(Error::InvalidSegment("pdf zlib checksum"))
+  }
+  if read_u32_be(bytes, end) != adler32(plain) {
+    return Err(Error::InvalidSegment("pdf zlib checksum"))
+  }
+  let meta : Array[Byte] = []
+  pdf_write_blob(bytes_slice(bytes, 0, 2), meta)
+  pdf_write_blob(bytes_slice(bytes, end, blen), meta)
+  pdf_write_blob(corrections, meta)
+  Ok((plain, bytes_from_array(meta)))
+}
+
+fn pdf_encode_stream(
+  input : Bytes,
+  dict : PdfValue,
+  config : EncodeConfig,
+  depth : Int,
+  budget : EncodeBudget,
+) -> Result[Option[Pcf2Segment], Error] {
+  let filters = match pdf_filters(dict) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  let max_f = if config.max_pdf_filters < 32 {
+    config.max_pdf_filters
+  } else {
+    32
+  }
+  if filters.length() > max_f || depth > config.max_depth {
+    return Ok(None)
+  }
+  let mut bytes = input
+  let steps : Array[PdfStep] = []
+  let mut samples = true
+  let mut fi = 0
+  while fi < filters.length() {
+    let (name, params) = filters[fi]
+    fi += 1
+    let original_len = bytes.length()
+    let is_hex = bytes_eq(name, "ASCIIHexDecode".to_bytes()) ||
+    bytes_eq(name, "AHx".to_bytes())
+    let is_a85 = bytes_eq(name, "ASCII85Decode".to_bytes()) ||
+    bytes_eq(name, "A85".to_bytes())
+    let is_flate = bytes_eq(name, "FlateDecode".to_bytes()) ||
+    bytes_eq(name, "Fl".to_bytes())
+    let is_dct = bytes_eq(name, "DCTDecode".to_bytes()) ||
+    bytes_eq(name, "DCT".to_bytes())
+    let (next, kind, meta) = if is_hex && config.enable_pdf_ascii {
+      let (n, m) = match pdf_ascii_unpack(bytes, true) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      (n, pdf_op_hex, m)
+    } else if is_a85 && config.enable_pdf_ascii {
+      let (n, m) = match pdf_ascii_unpack(bytes, false) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      (n, pdf_op_a85, m)
+    } else if is_flate {
+      let remaining = u64_saturating_sub(
+        config.max_total_output,
+        budget.total_output,
+      )
+      let ratio_cap = (bytes.length().to_double() * config.max_expand_ratio).to_int64().to_uint64()
+      let lim_u = if remaining < ratio_cap { remaining } else { ratio_cap }
+      let lim = if lim_u > 2147483647UL { 2147483647 } else { lim_u.to_int() }
+      let (n, m) = match pdf_unpack_flate(bytes, lim) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      (n, pdf_op_flate, m)
+    } else if is_dct && config.enable_pdf_dct {
+      let jpeg = match encode_jpg(bytes) {
+        Ok(Some(j)) => j
+        Ok(None) => break
+        Err(e) => return Err(e)
+      }
+      if jpeg.data.length() + jpeg.meta.length() >= bytes.length() {
+        break
+      }
+      samples = false
+      (jpeg.data, pdf_op_jpeg, jpeg.meta)
+    } else {
+      samples = false
+      break
+    }
+    match budget.consume(next.length(), config) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    steps.push(PdfStep::{ kind, original_len, meta })
+    bytes = next
+    if kind == pdf_op_jpeg {
+      samples = false
+      break
+    }
+    if kind == pdf_op_flate {
+      let predictor = match PdfPredictor::from_params(params) {
+        Ok(p) => p
+        Err(e) => return Err(e)
+      }
+      if predictor.kind != (1).to_byte() {
+        if !config.enable_pdf_predictor {
+          samples = false
+          break
+        }
+        let p_orig = bytes.length()
+        let (p_next, p_meta) = match predictor.undo(bytes) {
+          Ok(v) => v
+          Err(e) => return Err(e)
+        }
+        steps.push(PdfStep::{
+          kind: pdf_op_predictor,
+          original_len: p_orig,
+          meta: p_meta,
+        })
+        bytes = p_next
+      }
+    }
+  }
+  if samples && config.enable_pdf_images {
+    match pdf_image_encode(bytes, dict) {
+      Ok(Some((encoded, imeta))) => {
+        let cap = if bytes.length() < input.length() {
+          bytes.length()
+        } else {
+          input.length()
+        }
+        if encoded.length() + imeta.length() < cap {
+          steps.push(PdfStep::{
+            kind: pdf_op_webp,
+            original_len: bytes.length(),
+            meta: imeta,
+          })
+          bytes = encoded
+        }
+      }
+      Ok(None) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  if steps.length() == 0 {
+    return Ok(None)
+  }
+  let meta : Array[Byte] = []
+  meta.push((0).to_byte())
+  pdf_write_num(steps.length(), meta)
+  let mut si = 0
+  while si < steps.length() {
+    let st = steps[si]
+    meta.push(st.kind)
+    pdf_write_num(st.original_len, meta)
+    pdf_write_blob(st.meta, meta)
+    si += 1
+  }
+  Ok(
+    Some(Pcf2Segment::{
+      kind: SegmentKind::PdfStream.to_u8(),
+      flags: (0).to_byte(),
+      orig_len: input.length().to_int64().to_uint64(),
+      meta: bytes_from_array(meta),
+      data: bytes,
+    }),
+  )
+}
