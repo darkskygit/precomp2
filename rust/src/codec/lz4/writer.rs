@@ -15,9 +15,10 @@ pub(super) enum LengthEstimate {
   Div255,
 }
 
-/// The output would exceed `dstCapacity` (C returns 0).
+/// Compression stopped: the output would exceed `dstCapacity` (C returns 0),
+/// or it left the expected output.
 #[derive(Debug)]
-pub(super) struct Overflow;
+pub(super) struct Stop;
 
 pub(super) struct SequenceWriter<'a> {
   src: &'a [u8],
@@ -28,16 +29,20 @@ pub(super) struct SequenceWriter<'a> {
   /// bound).
   limit: Option<usize>,
   estimate: LengthEstimate,
+  /// Output the caller hopes to reproduce; writing stops at the first
+  /// sequence that differs from it.
+  expected: Option<&'a [u8]>,
 }
 
 impl<'a> SequenceWriter<'a> {
-  pub fn new(src: &'a [u8], limit: Option<usize>, estimate: LengthEstimate) -> Self {
+  pub fn new(src: &'a [u8], limit: Option<usize>, estimate: LengthEstimate, expected: Option<&'a [u8]>) -> Self {
     SequenceWriter {
       src,
       out: Vec::with_capacity(compress_bound(src.len())),
       anchor: 0,
       limit,
       estimate,
+      expected,
     }
   }
 
@@ -56,6 +61,13 @@ impl<'a> SequenceWriter<'a> {
     self.limit.is_some_and(|cap| needed > cap)
   }
 
+  /// Bytes written from `start` on differ from the expected output.
+  fn diverged(&self, start: usize) -> bool {
+    self
+      .expected
+      .is_some_and(|expected| expected.get(start..self.out.len()) != Some(&self.out[start..]))
+  }
+
   fn push_length(&mut self, mut rest: usize) {
     while rest >= 255 {
       self.out.push(255);
@@ -66,12 +78,12 @@ impl<'a> SequenceWriter<'a> {
 
   /// Literals `[anchor, start)` followed by a match of `len` bytes copied from
   /// `start - offset`.
-  pub fn sequence(&mut self, start: usize, offset: usize, len: usize) -> Result<(), Overflow> {
+  pub fn sequence(&mut self, start: usize, offset: usize, len: usize) -> Result<(), Stop> {
     let literals = start - self.anchor;
     let token = self.out.len();
     self.out.push(0);
     if self.exceeds(self.out.len() + self.estimate(literals) + literals + 2 + 1 + LAST_LITERALS) {
-      return Err(Overflow);
+      return Err(Stop);
     }
     if literals >= RUN_MASK {
       self.out[token] = (RUN_MASK << 4) as u8;
@@ -83,7 +95,7 @@ impl<'a> SequenceWriter<'a> {
     self.out.extend_from_slice(&(offset as u16).to_le_bytes());
     let ml_code = len - MIN_MATCH;
     if self.exceeds(self.out.len() + self.estimate(ml_code) + 1 + LAST_LITERALS) {
-      return Err(Overflow);
+      return Err(Stop);
     }
     if ml_code >= ML_MASK {
       self.out[token] |= ML_MASK as u8;
@@ -92,15 +104,19 @@ impl<'a> SequenceWriter<'a> {
       self.out[token] |= ml_code as u8;
     }
     self.anchor = start + len;
+    if self.diverged(token) {
+      return Err(Stop);
+    }
     Ok(())
   }
 
   /// Emit the trailing literals and return the block.
-  pub fn finish(mut self) -> Result<Vec<u8>, Overflow> {
+  pub fn finish(mut self) -> Result<Vec<u8>, Stop> {
+    let token = self.out.len();
     let literals = self.src.len() - self.anchor;
     let extra = (literals + 255 - RUN_MASK) / 255;
     if self.exceeds(self.out.len() + 1 + extra + literals) {
-      return Err(Overflow);
+      return Err(Stop);
     }
     if literals >= RUN_MASK {
       self.out.push((RUN_MASK << 4) as u8);
@@ -109,6 +125,9 @@ impl<'a> SequenceWriter<'a> {
       self.out.push((literals << 4) as u8);
     }
     self.out.extend_from_slice(&self.src[self.anchor..]);
+    if self.diverged(token) {
+      return Err(Stop);
+    }
     Ok(self.out)
   }
 }

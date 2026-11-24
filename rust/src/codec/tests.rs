@@ -315,10 +315,10 @@ fn preflate_layout_roundtrip() {
   encoder.write_all(data).expect("deflate");
   let deflated = encoder.finish().expect("finish");
 
-  let preflate = preflate_analyze(&deflated).expect("preflate analyze");
-  let (deflate_len, corrections, plain) = parse_preflate_output(&preflate).expect("preflate parse");
-  assert_eq!(deflate_len, deflated.len() as u64);
-  let rebuilt = preflate_reencode(&corrections, &plain).expect("preflate reencode");
+  let analysis = preflate_analyze(&deflated).expect("preflate analyze");
+  assert_eq!(analysis.deflate_len, deflated.len() as u64);
+  assert_eq!(analysis.plain, data);
+  let rebuilt = preflate_reencode(&analysis.corrections, &analysis.plain).expect("preflate reencode");
   assert_eq!(rebuilt, deflated);
 }
 
@@ -457,21 +457,27 @@ fn roundtrip_mjpg_segment() {
 }
 
 #[test]
-fn roundtrip_base64_segment() {
+fn roundtrip_base64_segment_with_uniform_last_short_and_irregular_lines() {
   let payload = b"base64 payload data";
   let encoded_payload = BASE64_ENGINE.encode(payload);
-  let mut base64_bytes = Vec::new();
-  base64_bytes.extend_from_slice(b"Content-Transfer-Encoding: base64\r\n\r\n");
-  for chunk in encoded_payload.as_bytes().chunks(8) {
-    base64_bytes.extend_from_slice(chunk);
-    base64_bytes.extend_from_slice(b"\r\n");
-  }
+  assert_eq!(encoded_payload.len(), 28);
+  for lines in [&[4usize; 7][..], &[8, 8, 8, 4], &[3, 9, 1, 15]] {
+    let mut base64_bytes = Vec::new();
+    base64_bytes.extend_from_slice(b"Content-Transfer-Encoding: base64\r\n\r\n");
+    let mut rest = encoded_payload.as_bytes();
+    for &len in lines {
+      let (line, tail) = rest.split_at(len);
+      base64_bytes.extend_from_slice(line);
+      base64_bytes.extend_from_slice(b"\r\n");
+      rest = tail;
+    }
 
-  let encoded = encode_bytes(&base64_bytes, &EncodeConfig::default()).expect("encode");
-  let segments = decode_segments(&encoded);
-  assert_has_kind(&segments, SegmentKind::Base64);
-  let decoded = decode_bytes(&encoded, &DecodeConfig::default()).expect("decode");
-  assert_eq!(decoded, base64_bytes);
+    let encoded = encode_bytes(&base64_bytes, &EncodeConfig::default()).expect("encode");
+    let segments = decode_segments(&encoded);
+    assert_has_kind(&segments, SegmentKind::Base64);
+    let decoded = decode_bytes(&encoded, &DecodeConfig::default()).expect("decode");
+    assert_eq!(decoded, base64_bytes, "{lines:?}");
+  }
 }
 
 #[test]
@@ -694,6 +700,23 @@ fn display_png_preserves_hidden_rgb_and_original_bytes() {
 }
 
 #[test]
+fn display_png_rejects_idat_orig_len_that_differs_from_its_chunks() {
+  let png = build_png_rgba(3, 1, &[17, 39, 91, 0, 13, 41, 97, 120, 0, 255, 0, 255]);
+  let (pcf, display) = display_png(&png);
+  assert!(display.is_some());
+  let file = Pcf2File::decode(pcf.as_slice()).unwrap();
+  for delta in [-1i64, 1] {
+    let mut segments = file.segments.clone();
+    let idat = segments.iter_mut().find(|s| s.kind == SegmentKind::PngIdat as u8).unwrap();
+    idat.orig_len = idat.orig_len.checked_add_signed(delta).unwrap();
+    let mut forged = Vec::new();
+    Pcf2File::from_segments(segments).encode(&mut forged).unwrap();
+    let err = decode_image_for_display(&forged, &DecodeConfig::default()).unwrap_err();
+    assert!(matches!(err, Error::InvalidSegment("png idat original length")), "{err:?}");
+  }
+}
+
+#[test]
 fn display_png_color_precedence_and_icc_mux() {
   let png = build_png_rgba(1, 1, &[23, 45, 67, 0]);
   let gamma = png_with_chunk(&png, b"gAMA", &45455u32.to_be_bytes());
@@ -865,4 +888,274 @@ fn display_complete_images_and_invalid_containers() {
   let mut corrupt = Vec::new();
   Pcf2File::from_segments(segments).encode(&mut corrupt).unwrap();
   assert!(decode_image_for_display(&corrupt, &DecodeConfig::default()).is_err());
+}
+
+fn varint(value: u64) -> Vec<u8> {
+  let mut out = Vec::new();
+  write_varint_vec(value, &mut out);
+  out
+}
+
+fn segment(kind: SegmentKind, meta: Vec<u8>, data: Vec<u8>) -> Pcf2Segment {
+  Pcf2Segment {
+    kind: kind as u8,
+    flags: 0,
+    orig_len: 0,
+    meta,
+    data,
+  }
+}
+
+/// Base64 meta: version, literal payload, empty header, then `lines`
+/// (line_case, count, lengths) and `decoded_len`.
+fn base64_meta(lines: &[u8], decoded_len: u64) -> Vec<u8> {
+  [&[0u8, 0, 0][..], lines, &varint(decoded_len)].concat()
+}
+
+#[test]
+fn forged_lengths_fail_cleanly_without_allocating_or_panicking() {
+  let huge = 1u64 << 40;
+  let cases = [
+    (
+      "base64 header length",
+      segment(SegmentKind::Base64, [&[0u8, 0][..], &varint(u64::MAX)].concat(), Vec::new()),
+    ),
+    (
+      "bzip2 penalty count",
+      segment(SegmentKind::Bzip2, [&[0u8, 0, b'9'][..], &varint(u64::MAX)].concat(), Vec::new()),
+    ),
+    (
+      "bzip2 penalty entries",
+      segment(SegmentKind::Bzip2, [&[0u8, 0, b'9'][..], &varint(huge)].concat(), Vec::new()),
+    ),
+    (
+      "gzip header length",
+      segment(SegmentKind::Gzip, [&[0u8, 0][..], &varint(u64::MAX)].concat(), Vec::new()),
+    ),
+    (
+      "preflate corrections length",
+      segment(SegmentKind::Dflt, vec![0, 0], varint(u64::MAX)),
+    ),
+    (
+      "preflate payload length",
+      segment(SegmentKind::Dflt, vec![0, 0], [&[0u8][..], &varint(u64::MAX)].concat()),
+    ),
+  ];
+  for (name, segment) in cases {
+    let result = decode_segment(&segment, &DecodeConfig::default(), 0, &mut DecodeBudget::default());
+    assert!(
+      matches!(result, Err(Error::InvalidSegment(_) | Error::LengthOverflow)),
+      "{name}: {result:?}"
+    );
+  }
+}
+
+/// Decodes a literal-payload base64 segment with the given line meta.
+fn decode_base64_lines(lines: &[u8], payload: &[u8], config: &DecodeConfig) -> Result<Vec<u8>> {
+  let segment = segment(SegmentKind::Base64, base64_meta(lines, payload.len() as u64), payload.to_vec());
+  decode_segment(&segment, config, 0, &mut DecodeBudget::default()).map(Cow::into_owned)
+}
+
+/// The line walk of the original decoder: write lines while text remains,
+/// clip the last one, and require the text to be used up.
+fn reference_base64_lines(lengths: &[usize], payload: &[u8]) -> Option<Vec<u8>> {
+  let encoded = BASE64_ENGINE.encode(payload);
+  let mut out = Vec::new();
+  let mut cursor = 0;
+  for &len in lengths {
+    if cursor >= encoded.len() {
+      break;
+    }
+    let end = (cursor + len).min(encoded.len());
+    out.extend_from_slice(&encoded.as_bytes()[cursor..end]);
+    out.extend_from_slice(b"\r\n");
+    cursor = end;
+  }
+  (cursor == encoded.len()).then_some(out)
+}
+
+#[test]
+fn base64_line_layouts_follow_the_reference_decoder() {
+  let huge = varint(1 << 40);
+  // Name, line meta, payload, restored text.
+  type Case<'a> = (&'a str, Vec<u8>, &'a [u8], Option<&'a [u8]>);
+  let cases: [Case; 10] = [
+    // Golden case shared with the Pion decoder: an empty first line.
+    ("empty first line", vec![1, 2, 0, 4], &b"ABC"[..], Some(&b"\r\nQUJD\r\n"[..])),
+    ("empty listed line", vec![2, 2, 0, 4], &b"ABC"[..], Some(&b"\r\nQUJD\r\n"[..])),
+    (
+      "unused uniform lines",
+      [&[0][..], &huge, &[76]].concat(),
+      &b"abc"[..],
+      Some(&b"YWJj\r\n"[..]),
+    ),
+    (
+      "unused lines before last",
+      [&[1][..], &huge, &[76, 4]].concat(),
+      &b"abc"[..],
+      Some(&b"YWJj\r\n"[..]),
+    ),
+    (
+      "empty lines then last",
+      vec![1, 3, 0, 4],
+      &b"abc"[..],
+      Some(&b"\r\n\r\nYWJj\r\n"[..]),
+    ),
+    (
+      "clipped last line",
+      vec![2, 2, 4, 8],
+      &b"abcdef"[..],
+      Some(&b"YWJj\r\nZGVm\r\n"[..]),
+    ),
+    ("empty text", vec![0, 5, 0], &b""[..], Some(&b""[..])),
+    (
+      "empty uniform lines never reach the end",
+      [&[0][..], &huge, &[0]].concat(),
+      &b"abc"[..],
+      None,
+    ),
+    ("short lines", vec![2, 2, 1, 1], &b"abc"[..], None),
+    ("empty lines then short last", vec![1, 3, 0, 3], &b"abc"[..], None),
+  ];
+  for (name, lines, payload, expected) in cases {
+    let result = decode_base64_lines(&lines, payload, &DecodeConfig::default());
+    assert_eq!(result.as_deref().ok(), expected, "{name}: {result:?}");
+  }
+
+  // Seeded differential check against the reference walk for every case.
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  let mut next = |n: u64| {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    (state % n) as usize
+  };
+  for _ in 0..3000 {
+    let payload: Vec<u8> = (0..next(12)).map(|i| i as u8).collect();
+    let count = 1 + next(6);
+    let (lines, lengths) = match next(3) {
+      0 => {
+        let len = next(6);
+        ([&[0][..], &varint(count as u64), &[len as u8]].concat(), vec![len; count])
+      }
+      1 => {
+        let (len, last) = (next(6), next(6));
+        let mut lengths = vec![len; count];
+        lengths[count - 1] = last;
+        ([&[1][..], &varint(count as u64), &[len as u8, last as u8]].concat(), lengths)
+      }
+      _ => {
+        let lengths: Vec<usize> = (0..count).map(|_| next(6)).collect();
+        let bytes: Vec<u8> = lengths.iter().map(|&l| l as u8).collect();
+        ([&[2][..], &varint(count as u64), &bytes].concat(), lengths)
+      }
+    };
+    let result = decode_base64_lines(&lines, &payload, &DecodeConfig::default()).ok();
+    assert_eq!(result, reference_base64_lines(&lengths, &payload), "{lengths:?} {payload:?}");
+  }
+}
+
+#[test]
+fn base64_output_beyond_budget_fails_before_decoding_payload() {
+  let tight = DecodeConfig {
+    max_total_output: 100,
+    ..DecodeConfig::default()
+  };
+  // 300 decoded bytes re-encode to 400; the meta claims them, but the data
+  // is empty, so only an early budget check reports the budget.
+  let meta = base64_meta(&[0, 10, 76], 300);
+  let claimed = segment(SegmentKind::Base64, meta, Vec::new());
+  let err = decode_segment(&claimed, &tight, 0, &mut DecodeBudget::default()).unwrap_err();
+  assert!(
+    matches!(&err, Error::Other(msg) if msg == "decode output exceeds budget"),
+    "{err:?}"
+  );
+  // 2^40 empty lines before the last would need 2^41 output bytes, and twice
+  // a count near 2^63 overflows: both fail without panicking.
+  for count in [1u64 << 40, (u64::MAX >> 1) + 1] {
+    let lines = [&[1][..], &varint(count), &[0, 4]].concat();
+    let result = decode_base64_lines(&lines, b"abc", &DecodeConfig::default());
+    assert!(
+      matches!(&result, Err(Error::Other(_) | Error::LengthOverflow)),
+      "{count}: {result:?}"
+    );
+  }
+  // Under an unlimited budget, an output past `isize::MAX` bytes cannot be
+  // allocated and fails before the payload is decoded.
+  let unlimited = DecodeConfig {
+    max_total_output: u64::MAX,
+    ..DecodeConfig::default()
+  };
+  let meta = base64_meta(&[&[0][..], &varint(1 << 62), &[255]].concat(), 0x7000_0000_0000_0000);
+  let oversized = segment(SegmentKind::Base64, meta, Vec::new());
+  let result = decode_segment(&oversized, &unlimited, 0, &mut DecodeBudget::default());
+  assert!(matches!(result, Err(Error::LengthOverflow)), "{result:?}");
+}
+
+#[test]
+fn bzip2_beyond_encode_budget_stays_literal() {
+  let plain = vec![0u8; 2 << 20];
+  let mut encoder = BzEncoder::new(Vec::new(), Compression::new(9));
+  encoder.write_all(&plain).expect("bzip2");
+  let bomb = encoder.finish().expect("bzip2 finish");
+  for (max_total_output, kind) in [(1 << 20, SegmentKind::Lit), (1 << 32, SegmentKind::Bzip2)] {
+    let config = EncodeConfig {
+      max_total_output,
+      ..EncodeConfig::default()
+    };
+    let encoded = encode_bytes(&bomb, &config).expect("encode");
+    let segments = decode_segments(&encoded);
+    assert!(segments.iter().all(|s| s.kind == kind as u8), "budget {max_total_output}");
+    assert_eq!(decode_bytes(&encoded, &DecodeConfig::default()).expect("decode"), bomb);
+  }
+}
+
+#[tokio::test]
+async fn segment_restoring_a_different_length_than_orig_len_is_rejected() {
+  let payload = [BASE64_ENGINE.encode(b"forged base64 segment length").as_bytes(), b"\r\n"].concat();
+  let encoded = encode_bytes(&payload, &EncodeConfig::default()).expect("encode");
+  let mut file = Pcf2File::decode(encoded.as_slice()).expect("pcf2");
+  assert_eq!(file.segments.len(), 1);
+  assert_eq!(file.segments[0].kind, SegmentKind::Base64 as u8);
+  let orig_len = file.segments[0].orig_len;
+  for forged in [orig_len - 1, orig_len + 1] {
+    file.segments[0].orig_len = forged;
+    let mut forged_bytes = Vec::new();
+    Pcf2File::from_segments(file.segments.clone())
+      .encode(&mut forged_bytes)
+      .expect("encode");
+    let expected = |err: Error| matches!(err, Error::SizeMismatch { expected, actual } if expected == forged && actual == orig_len);
+    assert!(expected(decode_bytes(&forged_bytes, &DecodeConfig::default()).unwrap_err()));
+    let reader = AsyncCursor::new(forged_bytes);
+    assert!(expected(decode_async(reader, &DecodeConfig::default()).await.unwrap_err()));
+  }
+}
+
+#[test]
+fn png_idat_lengths_that_overflow_are_rejected() {
+  let encoded = encode_bytes(PNG_FIXTURE, &EncodeConfig::default()).expect("encode");
+  let segments = decode_segments(&encoded);
+  let png = segments.iter().find(|s| s.kind == SegmentKind::PngIdat as u8).expect("png segment");
+  let idat_len = single_idat_len(png);
+  // Two lengths, each a valid `usize`, whose sum wraps to the real IDAT
+  // length.
+  let mut forged = png.meta[..9].to_vec();
+  forged.extend_from_slice(&varint(2));
+  forged.extend_from_slice(&varint(usize::MAX as u64));
+  forged.extend_from_slice(&varint(idat_len + 1));
+  forged.push(1);
+  forged.extend_from_slice(&[0; 8]);
+  let forged = Pcf2Segment {
+    meta: forged,
+    ..png.clone()
+  };
+  let err = decode_segment(&forged, &DecodeConfig::default(), 0, &mut DecodeBudget::default()).unwrap_err();
+  assert!(matches!(err, Error::InvalidSegment("png idat length mismatch")), "{err:?}");
+}
+
+/// Total IDAT length of a single-chunk PNG segment.
+fn single_idat_len(segment: &Pcf2Segment) -> u64 {
+  let mut offset = 9;
+  assert_eq!(read_varint_slice(&segment.meta, &mut offset).expect("count"), 1);
+  read_varint_slice(&segment.meta, &mut offset).expect("length")
 }

@@ -119,7 +119,16 @@ pub(in crate::codec) fn extract_png_display(segments: &[Pcf2Segment], config: &D
       if meta.png_payload_kind == 0 {
         return Ok(None);
       }
-      carrier = Some(decode_payload(meta.payload_kind, payload, config, 0, &mut DecodeBudget::default())?);
+      // The carrier stands in for the IDAT chunks: they must frame exactly
+      // the bytes the segment claims.
+      let framed = meta
+        .idat_lengths
+        .iter()
+        .try_fold(0u64, |sum, &len| sum.checked_add(len as u64)?.checked_add(12));
+      if framed != Some(segment.orig_len) {
+        return Err(Error::InvalidSegment("png idat original length"));
+      }
+      carrier = Some(decode_payload(meta.payload_kind, payload, config, 0, &mut DecodeBudget::default())?.into_owned());
       parsed = meta.webp_meta;
     } else {
       return Err(Error::InvalidSegment("png display segment layout"));

@@ -78,16 +78,29 @@ impl Compressor {
   /// with an output buffer of `dst_capacity` bytes. Returns `None` where the
   /// C function returns 0 (does not fit / input too large).
   pub fn compress(self, src: &[u8], dst_capacity: usize) -> Option<Vec<u8>> {
+    self.run(src, dst_capacity, None)
+  }
+
+  /// Whether `compress(src, compressed.len())` returns exactly `compressed`.
+  /// Stops at the first sequence that differs, so a mismatch usually costs a
+  /// small fraction of a full compression.
+  pub fn reproduces(self, src: &[u8], compressed: &[u8]) -> bool {
+    self
+      .run(src, compressed.len(), Some(compressed))
+      .is_some_and(|out| out == compressed)
+  }
+
+  fn run(self, src: &[u8], dst_capacity: usize, expected: Option<&[u8]>) -> Option<Vec<u8>> {
     if src.len() > LZ4_MAX_INPUT_SIZE {
       return None;
     }
     // `LZ4_compress_HC` only checks the output size below the worst-case bound.
     let limit = (dst_capacity < compress_bound(src.len())).then_some(dst_capacity);
     match self {
-      Self::V1_10_0_L12 => optimal::compress(src, limit, Quirks::V1_10_0, optimal::LEVEL_12),
-      Self::V1_9_1_L12 => optimal::compress(src, limit, Quirks::V1_9_1, optimal::LEVEL_12),
+      Self::V1_10_0_L12 => optimal::compress(src, limit, expected, Quirks::V1_10_0, optimal::LEVEL_12),
+      Self::V1_9_1_L12 => optimal::compress(src, limit, expected, Quirks::V1_9_1, optimal::LEVEL_12),
       // r131 levels: `1 << (level - 1)` match attempts.
-      Self::R131_L16 => hashchain::compress(src, limit, 1 << 15),
+      Self::R131_L16 => hashchain::compress(src, limit, expected, 1 << 15),
     }
   }
 }
@@ -104,6 +117,20 @@ mod tests {
     }
     for retired_or_unknown in [0, 1, 5] {
       assert!(Compressor::try_from(retired_or_unknown).is_err());
+    }
+  }
+
+  #[test]
+  fn reproduces_only_the_exact_output() {
+    let src: Vec<u8> = (0..20_000u32).map(|i| (i * i / 7 % 251) as u8).collect();
+    for c in Compressor::ALL {
+      let out = c.compress(&src, compress_bound(src.len())).unwrap();
+      assert!(c.reproduces(&src, &out), "{c:?}");
+      let mut changed = [out.clone(), out[..out.len() - 1].to_vec(), [out.as_slice(), &[0]].concat()];
+      changed[0][out.len() / 2] ^= 1;
+      for (i, other) in changed.iter().enumerate() {
+        assert!(!c.reproduces(&src, other), "{c:?} case {i}");
+      }
     }
   }
 }

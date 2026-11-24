@@ -47,6 +47,7 @@ fn check(input: &[u8], limited: bool, compressors: &[Compressor]) {
       input.len()
     );
     assert_eq!(lz4_flex::block::decompress(&full, input.len()).expect("decompress"), input);
+    assert!(rust.reproduces(input, &full), "reproduces ({c_version:?}, len {})", input.len());
     if limited {
       for capacity in [full.len(), full.len() - 1] {
         let rust_out = rust.compress(input, capacity);

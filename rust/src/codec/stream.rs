@@ -1,4 +1,7 @@
-use std::io::{Cursor, Read};
+use std::{
+  borrow::Cow,
+  io::{Cursor, Read},
+};
 
 use memchr::memmem;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -6,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use super::{DecodeConfig, budget::DecodeBudget};
 use crate::{
   error::{Error, Result},
-  pcf2::{PCF2_MAGIC, Pcf2Decoder},
+  pcf2::{PCF2_MAGIC, Pcf2Decoder, Pcf2Segment},
 };
 
 pub(super) async fn read_varint_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64> {
@@ -56,31 +59,7 @@ pub(super) fn decode_bytes_recover(input: &[u8], config: &DecodeConfig) -> Resul
 }
 
 pub(super) fn decode_stream<R: Read>(reader: R, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
-  let mut decoder = Pcf2Decoder::new(reader)?;
-  let header = decoder.header().clone();
-  let mut out = Vec::new();
-  let mut total = 0u64;
-
-  while total < header.original_size {
-    let Some(segment) = decoder.next_segment()? else {
-      return Err(Error::SizeMismatch {
-        expected: header.original_size,
-        actual: total,
-      });
-    };
-    let segment = segment.into_segment()?;
-    total = total.saturating_add(segment.orig_len);
-    if total > header.original_size {
-      return Err(Error::SizeMismatch {
-        expected: header.original_size,
-        actual: total,
-      });
-    }
-    let data = super::decode_segment(&segment, config, depth, budget)?;
-    out.extend_from_slice(&data);
-  }
-
-  Ok(out)
+  decode_segments(&mut Pcf2Decoder::new(reader)?, config, depth, budget)
 }
 
 pub(super) fn decode_stream_with_len(
@@ -90,29 +69,51 @@ pub(super) fn decode_stream_with_len(
   budget: &mut DecodeBudget,
 ) -> Result<(Vec<u8>, usize)> {
   let mut cursor = Cursor::new(input);
-  let mut decoder = Pcf2Decoder::new(&mut cursor)?;
-  let header = decoder.header().clone();
+  let out = decode_segments(&mut Pcf2Decoder::new(&mut cursor)?, config, depth, budget)?;
+  Ok((out, cursor.position() as usize))
+}
+
+/// Decodes segments until the header's `original_size` is reached.
+fn decode_segments<R: Read>(decoder: &mut Pcf2Decoder<R>, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+  let original_size = decoder.header().original_size;
   let mut out = Vec::new();
   let mut total = 0u64;
 
-  while total < header.original_size {
+  while total < original_size {
     let Some(segment) = decoder.next_segment()? else {
       return Err(Error::SizeMismatch {
-        expected: header.original_size,
+        expected: original_size,
         actual: total,
       });
     };
     let segment = segment.into_segment()?;
     total = total.saturating_add(segment.orig_len);
-    if total > header.original_size {
+    if total > original_size {
       return Err(Error::SizeMismatch {
-        expected: header.original_size,
+        expected: original_size,
         actual: total,
       });
     }
-    let data = super::decode_segment(&segment, config, depth, budget)?;
-    out.extend_from_slice(&data);
+    out.extend_from_slice(&decode_segment_checked(&segment, config, depth, budget)?);
   }
 
-  Ok((out, cursor.position() as usize))
+  Ok(out)
+}
+
+/// Decodes one segment and verifies that it restores exactly `orig_len`
+/// bytes, so a forged segment cannot shift the bytes that follow it.
+pub(super) fn decode_segment_checked<'a>(
+  segment: &'a Pcf2Segment,
+  config: &DecodeConfig,
+  depth: u32,
+  budget: &mut DecodeBudget,
+) -> Result<Cow<'a, [u8]>> {
+  let data = super::decode_segment(segment, config, depth, budget)?;
+  if data.len() as u64 != segment.orig_len {
+    return Err(Error::SizeMismatch {
+      expected: segment.orig_len,
+      actual: data.len() as u64,
+    });
+  }
+  Ok(data)
 }

@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{borrow::Cow, io::Cursor};
 
 use super::{
   DecodeConfig, EncodeConfig,
@@ -30,15 +30,17 @@ pub(super) fn choose_payload(
   Ok((0, plain))
 }
 
-pub(super) fn decode_payload(
+/// Restores a payload written by [`choose_payload`]; a literal payload is
+/// borrowed, not copied.
+pub(super) fn decode_payload<'a>(
   payload_kind: u8,
-  payload: Vec<u8>,
+  payload: &'a [u8],
   config: &DecodeConfig,
   depth: u32,
   budget: &mut DecodeBudget,
-) -> Result<Vec<u8>> {
+) -> Result<Cow<'a, [u8]>> {
   if payload_kind == 0 {
-    return Ok(payload);
+    return Ok(Cow::Borrowed(payload));
   }
   if payload_kind != 1 {
     return Err(Error::InvalidSegment("payload_kind"));
@@ -46,5 +48,5 @@ pub(super) fn decode_payload(
   if depth >= config.max_depth {
     return Err(Error::Other("nested depth exceeded".to_string()));
   }
-  super::stream::decode_stream(Cursor::new(&payload), config, depth + 1, budget)
+  super::stream::decode_stream(Cursor::new(payload), config, depth + 1, budget).map(Cow::Owned)
 }

@@ -9,7 +9,7 @@
 use super::{
   common::{LAST_LITERALS, MF_LIMIT, MIN_MATCH, Match},
   finder::{MatchFinder, Quirks},
-  writer::{LengthEstimate, Overflow, SequenceWriter},
+  writer::{LengthEstimate, SequenceWriter, Stop},
 };
 
 /// Size of the price table (`LZ4_OPT_NUM`); also caps `sufficient_len`.
@@ -75,14 +75,14 @@ pub(super) const LEVEL_12: Level = Level {
   full_update: true,
 };
 
-pub(super) fn compress(src: &[u8], limit: Option<usize>, quirks: Quirks, level: Level) -> Option<Vec<u8>> {
+pub(super) fn compress(src: &[u8], limit: Option<usize>, expected: Option<&[u8]>, quirks: Quirks, level: Level) -> Option<Vec<u8>> {
   let mut finder = MatchFinder::new(src, quirks);
-  let mut out = SequenceWriter::new(src, limit, LengthEstimate::Div255);
+  let mut out = SequenceWriter::new(src, limit, LengthEstimate::Div255, expected);
   parse(&mut finder, &mut out, level).ok()?;
   out.finish().ok()
 }
 
-fn parse(finder: &mut MatchFinder, out: &mut SequenceWriter, level: Level) -> Result<(), Overflow> {
+fn parse(finder: &mut MatchFinder, out: &mut SequenceWriter, level: Level) -> Result<(), Stop> {
   let len = finder.len();
   if len < MF_LIMIT {
     return Ok(());

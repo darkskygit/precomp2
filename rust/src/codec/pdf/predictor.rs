@@ -4,6 +4,7 @@
 //! in the last byte of each packed row.
 
 use super::{Error, Result, Value, read_blob, read_num, write_blob, write_num};
+use crate::codec::scanline::{filter_row, unfilter_row};
 
 #[derive(Clone, Copy)]
 pub(super) struct Predictor {
@@ -48,6 +49,9 @@ impl Predictor {
     if !data.len().is_multiple_of(stride) {
       return Err(Error::InvalidSegment("predictor row length"));
     }
+    let bpp = (self.colors * self.bits).div_ceil(8);
+    // `row` comes from the stream dictionary; empty data needs no zero row.
+    let zeros = vec![0; row.min(data.len())];
     let mut pixels = Vec::with_capacity(data.len());
     let mut tags = Vec::new();
     for encoded in data.chunks_exact(stride) {
@@ -59,17 +63,9 @@ impl Predictor {
         }
         tags.push(tag);
         pixels.extend_from_slice(&encoded[1..]);
-        let bpp = (self.colors * self.bits).div_ceil(8);
-        for x in 0..row {
-          let a = if x >= bpp { pixels[start + x - bpp] } else { 0 };
-          let b = if start >= row { pixels[start + x - row] } else { 0 };
-          let c = if start >= row && x >= bpp {
-            pixels[start + x - row - bpp]
-          } else {
-            0
-          };
-          pixels[start + x] = pixels[start + x].wrapping_add(prediction(tag, a, b, c));
-        }
+        let (done, current) = pixels.split_at_mut(start);
+        let prev = if start == 0 { &zeros } else { &done[start - row..] };
+        unfilter_row(tag, current, prev, bpp)?;
       } else {
         pixels.extend_from_slice(encoded);
         if self.kind == 2 {
@@ -112,23 +108,22 @@ pub(super) fn redo(pixels: &[u8], meta: &[u8], limit: usize) -> Result<Vec<u8>> 
   {
     return Err(Error::InvalidSegment("predictor data length"));
   }
+  let bpp = (p.colors * p.bits).div_ceil(8);
+  let zeros = vec![0; row.min(pixels.len())];
   let mut out = Vec::with_capacity(pixels.len() + tags.len());
+  let mut prev = zeros.as_slice();
   for (y, data) in pixels.chunks_exact(row).enumerate() {
+    let start = out.len();
     if kind >= 10 {
       let tag = tags[y];
       if tag > 4 {
         return Err(Error::InvalidSegment("png row filter"));
       }
       out.push(tag);
-      let bpp = (p.colors * p.bits).div_ceil(8);
-      for x in 0..row {
-        let a = if x >= bpp { data[x - bpp] } else { 0 };
-        let b = if y > 0 { pixels[(y - 1) * row + x] } else { 0 };
-        let c = if y > 0 && x >= bpp { pixels[(y - 1) * row + x - bpp] } else { 0 };
-        out.push(data[x].wrapping_sub(prediction(tag, a, b, c)));
-      }
+      out.resize(start + 1 + row, 0);
+      filter_row(tag, data, prev, bpp, &mut out[start + 1..])?;
+      prev = data;
     } else {
-      let start = out.len();
       out.extend_from_slice(data);
       if kind == 2 {
         for i in p.colors..p.columns * p.colors {
@@ -143,26 +138,6 @@ pub(super) fn redo(pixels: &[u8], meta: &[u8], limit: usize) -> Result<Vec<u8>> 
     }
   }
   Ok(out)
-}
-
-fn prediction(tag: u8, a: u8, b: u8, c: u8) -> u8 {
-  match tag {
-    0 => 0,
-    1 => a,
-    2 => b,
-    3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
-    _ => {
-      let p = i32::from(a) + i32::from(b) - i32::from(c);
-      let (pa, pb, pc) = ((p - i32::from(a)).abs(), (p - i32::from(b)).abs(), (p - i32::from(c)).abs());
-      if pa <= pb && pa <= pc {
-        a
-      } else if pb <= pc {
-        b
-      } else {
-        c
-      }
-    }
-  }
 }
 
 fn sample(data: &[u8], index: usize, bits: usize) -> u16 {

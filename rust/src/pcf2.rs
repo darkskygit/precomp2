@@ -408,6 +408,12 @@ impl<'a, R: Read> LimitedReader<'a, R> {
       prefix_pos: 0,
     }
   }
+
+  /// Remaining bytes, saturated to `usize` so that a segment of 4 GiB or
+  /// more on a 32-bit target does not read as empty.
+  fn remaining_usize(&self) -> usize {
+    usize::try_from(self.remaining).unwrap_or(usize::MAX)
+  }
 }
 
 impl<R: Read> Read for LimitedReader<'_, R> {
@@ -419,7 +425,7 @@ impl<R: Read> Read for LimitedReader<'_, R> {
     let mut written = 0;
     if self.prefix_pos < self.prefix.len() {
       let available = self.prefix.len() - self.prefix_pos;
-      let to_copy = available.min(buf.len()).min(self.remaining as usize);
+      let to_copy = available.min(buf.len()).min(self.remaining_usize());
       buf[..to_copy].copy_from_slice(&self.prefix[self.prefix_pos..self.prefix_pos + to_copy]);
       self.prefix_pos += to_copy;
       self.remaining -= to_copy as u64;
@@ -427,7 +433,7 @@ impl<R: Read> Read for LimitedReader<'_, R> {
     }
 
     if written < buf.len() && self.remaining > 0 {
-      let max_len = (buf.len() - written).min(self.remaining as usize);
+      let max_len = (buf.len() - written).min(self.remaining_usize());
       let read = self.reader.read(&mut buf[written..written + max_len])?;
       self.remaining -= read as u64;
       written += read;
@@ -441,7 +447,7 @@ impl<R: Read> Drop for LimitedReader<'_, R> {
   fn drop(&mut self) {
     let mut sink = [0u8; 4096];
     while self.remaining > 0 {
-      let max_len = (self.remaining as usize).min(sink.len());
+      let max_len = self.remaining_usize().min(sink.len());
       match self.read(&mut sink[..max_len]) {
         Ok(0) => break,
         Ok(_) => {}
@@ -547,7 +553,8 @@ mod tests {
     let mut decoder = Pcf2Decoder::new(Cursor::new(buf)).expect("header ok");
     match decoder.next_segment() {
       Ok(_) => panic!("expected error"),
-      Err(err) => assert!(matches!(err, Error::SizeMismatch { .. })),
+      // 32-bit targets reject the length before reading.
+      Err(err) => assert!(matches!(err, Error::SizeMismatch { .. } | Error::LengthOverflow)),
     }
   }
 

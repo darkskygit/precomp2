@@ -51,9 +51,73 @@ fn delimiter(b: u8) -> bool {
 struct Parser<'a> {
   data: &'a [u8],
   pos: usize,
+  /// Literal strings known to run to the end of data, indexed from the first
+  /// position covered; see [`unclosed_strings`].
+  unclosed: Option<(usize, Vec<bool>)>,
+  /// Earliest start of a hex string with no `>` after it.
+  unclosed_hex: Option<usize>,
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
+  fn new(data: &'a [u8], pos: usize) -> Self {
+    Parser {
+      data,
+      pos,
+      unclosed: None,
+      unclosed_hex: None,
+    }
+  }
+
+  /// Skips a literal string opened at `self.pos`; `None` when it never
+  /// closes. Remembers the strings that run to the end, so garbage full of
+  /// unbalanced `(` is scanned once rather than once per parenthesis.
+  fn literal_string(&mut self) -> Option<()> {
+    let start = self.pos;
+    if let Some((from, unclosed)) = &self.unclosed
+      && start >= *from
+      && unclosed[start - from]
+    {
+      return None;
+    }
+    self.pos += 1;
+    let mut nesting = 1usize;
+    while nesting > 0 {
+      let Some(&b) = self.data.get(self.pos) else {
+        if self.unclosed.as_ref().is_none_or(|(from, _)| start < *from) {
+          self.unclosed = Some((start, unclosed_strings(self.data, start)));
+        }
+        return None;
+      };
+      self.pos += 1;
+      match b {
+        // An escape at the very end reaches the EOF branch above.
+        b'\\' => self.pos += 1,
+        b'(' => nesting += 1,
+        b')' => nesting -= 1,
+        _ => (),
+      }
+    }
+    Some(())
+  }
+
+  /// Skips a hex string opened at `self.pos`; `None` when no `>` follows.
+  /// Once one scan finds none, any later start is answered at once.
+  fn hex_string(&mut self) -> Option<()> {
+    if self.unclosed_hex.is_some_and(|from| self.pos >= from) {
+      return None;
+    }
+    match memchr::memchr(b'>', &self.data[self.pos..]) {
+      Some(offset) => {
+        self.pos += offset + 1;
+        Some(())
+      }
+      None => {
+        self.unclosed_hex = Some(self.pos);
+        None
+      }
+    }
+  }
+
   fn skip(&mut self) {
     loop {
       while self.data.get(self.pos).is_some_and(|b| whitespace(*b)) {
@@ -148,29 +212,11 @@ impl Parser<'_> {
         Some(Value::Dict(items))
       }
       b'(' => {
-        self.pos += 1;
-        let mut nesting = 1usize;
-        while nesting > 0 {
-          let b = *self.data.get(self.pos)?;
-          self.pos += 1;
-          match b {
-            b'\\' => {
-              self.data.get(self.pos)?;
-              self.pos += 1;
-            }
-            b'(' => nesting += 1,
-            b')' => nesting -= 1,
-            _ => (),
-          }
-        }
+        self.literal_string()?;
         Some(Value::Other)
       }
       b'<' => {
-        self.pos += 1;
-        while *self.data.get(self.pos)? != b'>' {
-          self.pos += 1;
-        }
-        self.pos += 1;
+        self.hex_string()?;
         Some(Value::Other)
       }
       b'0'..=b'9' => {
@@ -214,8 +260,45 @@ impl Parser<'_> {
   }
 }
 
+/// Given that the literal string opened at `from` runs to the end of `data`,
+/// marks every position `q >= from` (at index `q - from`) whose string would
+/// also run to the end. A backslash run is split the same way whichever
+/// parenthesis a scan starts from, so one nesting profile `d` answers every
+/// start: the string opened at `q` closes iff some later `d` drops below
+/// `d[q]`.
+fn unclosed_strings(data: &[u8], from: usize) -> Vec<bool> {
+  // Per-byte nesting step, then a backward pass from the final depth that
+  // tracks the minimum depth after each position.
+  let mut escaped = false;
+  let steps: Vec<i8> = data[from..]
+    .iter()
+    .map(|&b| match b {
+      _ if escaped => {
+        escaped = false;
+        0
+      }
+      b'\\' => {
+        escaped = true;
+        0
+      }
+      b'(' => 1,
+      b')' => -1,
+      _ => 0,
+    })
+    .collect();
+  let mut depth: i64 = steps.iter().map(|&step| i64::from(step)).sum();
+  let mut min_after = i64::MAX;
+  let mut unclosed = vec![false; steps.len()];
+  for (flag, &step) in unclosed.iter_mut().zip(&steps).rev() {
+    *flag = min_after >= depth;
+    min_after = min_after.min(depth);
+    depth -= i64::from(step);
+  }
+  unclosed
+}
+
 fn stream_end(data: &[u8], end: usize) -> Option<usize> {
-  let mut parser = Parser { data, pos: end };
+  let mut parser = Parser::new(data, end);
   if parser.word(b"endstream") && parser.word(b"endobj") {
     Some(parser.pos)
   } else {
@@ -242,7 +325,7 @@ fn unresolved_end(data: &[u8], start: usize) -> Option<usize> {
 // nonoverlapping ranges whose direct/resolved Length agrees with endstream;
 // ambiguous references and inline images remain in the caller's literal spans.
 pub(super) fn streams(data: &[u8]) -> Vec<Stream> {
-  let mut parser = Parser { data, pos: 0 };
+  let mut parser = Parser::new(data, 0);
   let mut objects = BTreeMap::new();
   let mut pending = Vec::new();
   while parser.pos < data.len() {
@@ -356,6 +439,77 @@ mod tests {
       assert_eq!(&data[streams[0].range.clone()], payload);
       assert_eq!(streams[0].dict.get(b"Name").and_then(Value::name), Some(b"FlateDecode".as_slice()));
     }
+  }
+
+  /// Whether the literal string opened at `start` runs to the end of `data`,
+  /// scanned byte by byte.
+  fn naive_unclosed(data: &[u8], start: usize) -> bool {
+    let mut pos = start + 1;
+    let mut nesting = 1;
+    while nesting > 0 {
+      let Some(&b) = data.get(pos) else { return true };
+      pos += 1;
+      match b {
+        b'\\' if data.get(pos).is_none() => return true,
+        b'\\' => pos += 1,
+        b'(' => nesting += 1,
+        b')' => nesting -= 1,
+        _ => (),
+      }
+    }
+    false
+  }
+
+  #[test]
+  fn unclosed_string_profile_matches_a_scan_from_every_parenthesis() {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..2000 {
+      let data: Vec<u8> = (0..14)
+        .map(|_| {
+          state ^= state << 13;
+          state ^= state >> 7;
+          state ^= state << 17;
+          b"((()\\x"[(state % 6) as usize]
+        })
+        .collect();
+      let Some(from) = (0..data.len()).find(|&q| data[q] == b'(' && naive_unclosed(&data, q)) else {
+        continue;
+      };
+      let unclosed = unclosed_strings(&data, from);
+      for q in (from..data.len()).filter(|&q| data[q] == b'(') {
+        assert_eq!(
+          unclosed[q - from],
+          naive_unclosed(&data, q),
+          "{:?} from {from} q {q}",
+          String::from_utf8_lossy(&data)
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn unterminated_strings_are_scanned_once_and_later_objects_still_parse() {
+    // Every opener here starts a string that never closes; a scan per opener
+    // would take quadratic time.
+    let garbage: [Vec<u8>; 4] = [
+      vec![b'('; 200_000],
+      [vec![b'('; 200_000], vec![b'\\']].concat(),
+      vec![b'<'; 200_000],
+      b"<0".repeat(100_000),
+    ];
+    let object = b"\n1 0 obj << /Length 3 >> stream\nabc\nendstream\nendobj\n";
+    for (i, garbage) in garbage.iter().enumerate() {
+      let data = [&b"%PDF-1.7\n"[..], &object[..], garbage].concat();
+      let streams = streams(&data);
+      assert_eq!(streams.len(), 1, "case {i}");
+      assert_eq!(&data[streams[0].range.clone()], b"abc", "case {i}");
+    }
+    let mut data = b"%PDF-1.7\n".to_vec();
+    data.extend(std::iter::repeat_n(b'(', 200_000));
+    data.extend_from_slice(object);
+    let streams = streams(&data);
+    assert_eq!(streams.len(), 1);
+    assert_eq!(&data[streams[0].range.clone()], b"abc");
   }
 
   #[test]

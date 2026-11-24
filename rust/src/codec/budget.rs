@@ -13,6 +13,11 @@ impl EncodeBudget {
     }
     Ok(())
   }
+
+  /// Output bytes still available under `config.max_total_output`.
+  pub(super) fn remaining(&self, config: &super::EncodeConfig) -> u64 {
+    config.max_total_output.saturating_sub(self.total_output)
+  }
 }
 
 #[derive(Default)]
@@ -23,7 +28,13 @@ pub(super) struct DecodeBudget {
 impl DecodeBudget {
   pub(super) fn consume(&mut self, len: usize, config: &super::DecodeConfig) -> Result<()> {
     self.total_output = self.total_output.saturating_add(len as u64);
-    if self.total_output > config.max_total_output {
+    self.check(0, config)
+  }
+
+  /// Fails before allocating when `len` more output bytes would exceed the
+  /// budget.
+  pub(super) fn check(&self, len: u64, config: &super::DecodeConfig) -> Result<()> {
+    if self.total_output.saturating_add(len) > config.max_total_output {
       return Err(Error::Other("decode output exceeds budget".to_string()));
     }
     Ok(())

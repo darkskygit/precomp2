@@ -1,4 +1,5 @@
 use super::{Error, Result};
+use crate::codec::scanline::{filter_row, unfilter_row};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PngIhdr {
@@ -81,35 +82,15 @@ pub(super) fn undo_png_filters(filtered: &[u8], width: u32, height: u32, bpp: us
 
   let mut out = vec![0u8; row_bytes * height_usize];
   let mut filters = Vec::with_capacity(height_usize);
-
-  for row in 0..height_usize {
-    let row_start = row * (row_bytes + 1);
-    let filter = filtered[row_start];
-    filters.push(filter);
-    let row_in = &filtered[row_start + 1..row_start + 1 + row_bytes];
-    let (prev_rows, current_rows) = out.split_at_mut(row * row_bytes);
-    let row_out = &mut current_rows[..row_bytes];
-    let prev_row = if row > 0 {
-      &prev_rows[(row - 1) * row_bytes..row * row_bytes]
-    } else {
-      &[]
-    };
-
-    for col in 0..row_bytes {
-      let left = if col >= bpp { row_out[col - bpp] } else { 0 };
-      let up = if row > 0 { prev_row[col] } else { 0 };
-      let up_left = if row > 0 && col >= bpp { prev_row[col - bpp] } else { 0 };
-      row_out[col] = match filter {
-        0 => row_in[col],
-        1 => row_in[col].wrapping_add(left),
-        2 => row_in[col].wrapping_add(up),
-        3 => row_in[col].wrapping_add(((left as u16 + up as u16) / 2) as u8),
-        4 => row_in[col].wrapping_add(paeth_predictor(left, up, up_left)),
-        _ => return Err(Error::InvalidSegment("png filter type")),
-      };
-    }
+  let zeros = vec![0u8; row_bytes.min(filtered.len())];
+  for (row, scanline) in filtered.chunks_exact(row_bytes + 1).enumerate() {
+    filters.push(scanline[0]);
+    let (done, rest) = out.split_at_mut(row * row_bytes);
+    let prev = if row == 0 { &zeros } else { &done[(row - 1) * row_bytes..] };
+    let current = &mut rest[..row_bytes];
+    current.copy_from_slice(&scanline[1..]);
+    unfilter_row(scanline[0], current, prev, bpp)?;
   }
-
   Ok((out, filters))
 }
 
@@ -119,56 +100,19 @@ pub(super) fn apply_png_filters_with_types(bitmap: &[u8], width: u32, height: u3
   if filters.len() != height_usize {
     return Err(Error::InvalidSegment("png filter count"));
   }
-  if bitmap.len() != row_bytes * height_usize {
+  if row_bytes.checked_mul(height_usize) != Some(bitmap.len()) || row_bytes == 0 {
     return Err(Error::InvalidSegment("png bitmap size"));
   }
 
   let mut out = vec![0u8; (row_bytes + 1) * height_usize];
-  for row in 0..height_usize {
-    let filter = filters[row];
-    let row_start = row * (row_bytes + 1);
-    out[row_start] = filter;
-    let row_out = &mut out[row_start + 1..row_start + 1 + row_bytes];
-    let row_in = &bitmap[row * row_bytes..(row + 1) * row_bytes];
-
-    for col in 0..row_bytes {
-      let left = if col >= bpp { row_in[col - bpp] } else { 0 };
-      let up = if row > 0 { bitmap[(row - 1) * row_bytes + col] } else { 0 };
-      let up_left = if row > 0 && col >= bpp {
-        bitmap[(row - 1) * row_bytes + col - bpp]
-      } else {
-        0
-      };
-      let predicted = match filter {
-        0 => 0,
-        1 => left,
-        2 => up,
-        3 => ((left as u16 + up as u16) / 2) as u8,
-        4 => paeth_predictor(left, up, up_left),
-        _ => return Err(Error::InvalidSegment("png filter type")),
-      };
-      row_out[col] = row_in[col].wrapping_sub(predicted);
-    }
+  let zeros = vec![0u8; row_bytes.min(bitmap.len())];
+  let mut prev = zeros.as_slice();
+  for ((row, scanline), &filter) in bitmap.chunks_exact(row_bytes).zip(out.chunks_exact_mut(row_bytes + 1)).zip(filters) {
+    scanline[0] = filter;
+    filter_row(filter, row, prev, bpp, &mut scanline[1..])?;
+    prev = row;
   }
-
   Ok(out)
-}
-
-fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
-  let a = a as i32;
-  let b = b as i32;
-  let c = c as i32;
-  let p = a + b - c;
-  let pa = (p - a).abs();
-  let pb = (p - b).abs();
-  let pc = (p - c).abs();
-  if pa <= pb && pa <= pc {
-    a as u8
-  } else if pb <= pc {
-    b as u8
-  } else {
-    c as u8
-  }
 }
 
 pub(in crate::codec) fn encode_webp_lossless(bitmap: &[u8], width: u32, height: u32, color_type: u8) -> Result<Vec<u8>> {

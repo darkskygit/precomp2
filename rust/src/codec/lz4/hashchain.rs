@@ -4,8 +4,8 @@
 
 use super::{
   LAST_LITERALS, MF_LIMIT,
-  common::{MIN_MATCH, Match, common_prefix, hash4, read32},
-  writer::{LengthEstimate, Overflow, SequenceWriter},
+  common::{CHAIN_SIZE, HASH_SIZE, MIN_MATCH, Match, common_prefix, hash4, read32, table},
+  writer::{LengthEstimate, SequenceWriter, Stop},
 };
 
 /// Farthest reachable match (64 KiB - 1).
@@ -15,8 +15,8 @@ const EMPTY: u32 = u32::MAX;
 /// Hash heads plus a 64K ring of distances to the previous position with the
 /// same hash.
 struct HashChain {
-  heads: Vec<u32>,
-  prev_distance: Vec<u16>,
+  heads: Box<[u32; HASH_SIZE]>,
+  prev_distance: Box<[u16; CHAIN_SIZE]>,
   next_to_insert: usize,
   attempts: usize,
 }
@@ -24,8 +24,8 @@ struct HashChain {
 impl HashChain {
   fn new(attempts: usize) -> Self {
     HashChain {
-      heads: vec![EMPTY; 1 << 15],
-      prev_distance: vec![0xFFFF; 1 << 16],
+      heads: table(EMPTY),
+      prev_distance: table(0xFFFF),
       next_to_insert: 0,
       attempts,
     }
@@ -131,7 +131,7 @@ struct Parser<'s, 'w> {
 }
 
 impl<'s, 'w> Parser<'s, 'w> {
-  fn emit(&mut self, m: Match) -> Result<(), Overflow> {
+  fn emit(&mut self, m: Match) -> Result<(), Stop> {
     self.out.sequence(m.start, m.offset(), m.len)
   }
 
@@ -148,7 +148,7 @@ impl<'s, 'w> Parser<'s, 'w> {
 
   /// Resolves the overlapping matches that follow `first` and emits them.
   /// Returns where scanning resumes.
-  fn encode_from(&mut self, first: Match) -> Result<usize, Overflow> {
+  fn encode_from(&mut self, first: Match) -> Result<usize, Stop> {
     let (mut m1, mut fallback) = (first, first);
     'search2: loop {
       // r131 lets m2 start one byte after m1 at the earliest; 1.7.3+ allow
@@ -220,7 +220,7 @@ impl<'s, 'w> Parser<'s, 'w> {
   }
 }
 
-fn parse<'a>(src: &'a [u8], out: &mut SequenceWriter<'a>, attempts: usize) -> Result<(), Overflow> {
+fn parse<'a>(src: &'a [u8], out: &mut SequenceWriter<'a>, attempts: usize) -> Result<(), Stop> {
   let mut parser = Parser {
     src,
     out,
@@ -238,8 +238,8 @@ fn parse<'a>(src: &'a [u8], out: &mut SequenceWriter<'a>, attempts: usize) -> Re
   Ok(())
 }
 
-pub(super) fn compress(src: &[u8], limit: Option<usize>, attempts: usize) -> Option<Vec<u8>> {
-  let mut out = SequenceWriter::new(src, limit, LengthEstimate::Shift8);
+pub(super) fn compress(src: &[u8], limit: Option<usize>, expected: Option<&[u8]>, attempts: usize) -> Option<Vec<u8>> {
+  let mut out = SequenceWriter::new(src, limit, LengthEstimate::Shift8, expected);
   parse(src, &mut out, attempts).ok()?;
   out.finish().ok()
 }

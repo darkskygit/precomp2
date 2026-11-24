@@ -22,6 +22,17 @@ pub(super) fn read64(s: &[u8], p: usize) -> u64 {
   u64::from_le_bytes(s[p..p + 8].try_into().unwrap())
 }
 
+/// Entries of the hash-head table.
+pub(super) const HASH_SIZE: usize = 1 << 15;
+/// Entries of the chain table, indexed by position modulo 64 KiB.
+pub(super) const CHAIN_SIZE: usize = 1 << 16;
+
+/// A zero-filled fixed-size table on the heap; the fixed length lets the
+/// compiler drop bounds checks on hash and `u16` indices.
+pub(super) fn table<T: Copy, const N: usize>(fill: T) -> Box<[T; N]> {
+  vec![fill; N].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!())
+}
+
 /// Knuth multiplicative hash, 15 bits.
 #[inline(always)]
 pub(super) fn hash(v: u32) -> usize {
@@ -70,10 +81,17 @@ pub(super) fn run_forward(s: &[u8], from: usize, to: usize, byte: u8) -> usize {
 /// Run length of `byte` ending at `s[..to]`, not before `low`.
 #[inline(always)]
 pub(super) fn run_backward(s: &[u8], to: usize, low: usize, byte: u8) -> usize {
-  if to <= low {
-    return 0;
+  let word = u64::from_ne_bytes([byte; 8]);
+  let mut p = to;
+  while p >= low + 8 {
+    // Little-endian read: the high bytes are the ones nearest `p`.
+    let diff = read64(s, p - 8) ^ word;
+    if diff != 0 {
+      return to - p + (diff.leading_zeros() / 8) as usize;
+    }
+    p -= 8;
   }
-  s[low..to].iter().rev().take_while(|&&c| c == byte).count()
+  to - p + s[low.min(p)..p].iter().rev().take_while(|&&c| c == byte).count()
 }
 
 /// `len` bytes at `start` repeat the bytes at `source` (`source < start`).
@@ -98,5 +116,31 @@ impl Match {
     self.start += n;
     self.source += n;
     self.len -= n;
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn runs_match_a_bytewise_scan() {
+    let s: Vec<u8> = (0..64u32)
+      .map(|i| if (5..40).contains(&i) || i % 7 == 0 { 9 } else { i as u8 })
+      .collect();
+    for low in 0..s.len() {
+      for to in 0..=s.len() {
+        let backward = if to <= low {
+          0
+        } else {
+          s[low..to].iter().rev().take_while(|&&c| c == 9).count()
+        };
+        assert_eq!(run_backward(&s, to, low, 9), backward, "backward {low}..{to}");
+        if low <= to {
+          let forward = s[low..to].iter().take_while(|&&c| c == 9).count();
+          assert_eq!(run_forward(&s, low, to, 9), forward, "forward {low}..{to}");
+        }
+      }
+    }
   }
 }

@@ -2,8 +2,8 @@ use super::{
   DecodeConfig, EncodeConfig,
   budget::{DecodeBudget, EncodeBudget},
   payload::{choose_payload, decode_payload},
-  preflate::{build_preflate_data, parse_preflate_data, parse_preflate_output, preflate_analyze, preflate_reencode},
-  varint::{parse_meta_header, read_varint_slice, write_varint_vec},
+  preflate::{PreflateAnalysis, build_preflate_data, parse_preflate_data, preflate_analyze, preflate_reencode},
+  varint::{parse_meta_header, read_len, take_bytes, write_varint_vec},
 };
 use crate::{
   error::{Error, Result},
@@ -14,13 +14,13 @@ pub(super) fn encode_deflate(input: &[u8], config: &EncodeConfig, depth: u32, bu
   if input.is_empty() {
     return Ok(None);
   }
-  let preflate = match preflate_analyze(input) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
-  };
-  let (deflate_len, corrections, plain) = match parse_preflate_output(&preflate) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
+  let Ok(PreflateAnalysis {
+    deflate_len,
+    corrections,
+    plain,
+  }) = preflate_analyze(input)
+  else {
+    return Ok(None);
   };
   if deflate_len != input.len() as u64 {
     return Ok(None);
@@ -59,13 +59,13 @@ pub(super) fn encode_zlib(input: &[u8], config: &EncodeConfig, depth: u32, budge
   let header = [cmf, flg];
   let footer = &input[input.len() - 4..];
   let deflate = &input[2..input.len() - 4];
-  let preflate = match preflate_analyze(deflate) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
-  };
-  let (deflate_len, corrections, plain) = match parse_preflate_output(&preflate) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
+  let Ok(PreflateAnalysis {
+    deflate_len,
+    corrections,
+    plain,
+  }) = preflate_analyze(deflate)
+  else {
+    return Ok(None);
   };
   if deflate_len != deflate.len() as u64 {
     return Ok(None);
@@ -100,13 +100,13 @@ pub(super) fn encode_gzip(input: &[u8], config: &EncodeConfig, depth: u32, budge
   }
   let footer = &input[input.len() - 8..];
   let deflate = &input[header_len..input.len() - 8];
-  let preflate = match preflate_analyze(deflate) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
-  };
-  let (deflate_len, corrections, plain) = match parse_preflate_output(&preflate) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
+  let Ok(PreflateAnalysis {
+    deflate_len,
+    corrections,
+    plain,
+  }) = preflate_analyze(deflate)
+  else {
+    return Ok(None);
   };
   if deflate_len != deflate.len() as u64 {
     return Ok(None);
@@ -149,7 +149,7 @@ pub(super) fn decode_deflate_segment(
   }
   let (corrections, payload) = parse_preflate_data(&segment.data)?;
   let plain = decode_payload(payload_kind, payload, config, depth, budget)?;
-  let deflate = preflate_reencode(&corrections, &plain)?;
+  let deflate = preflate_reencode(corrections, &plain)?;
   budget.consume(deflate.len(), config)?;
   Ok(deflate)
 }
@@ -167,7 +167,7 @@ pub(super) fn decode_zlib_segment(segment: &Pcf2Segment, config: &DecodeConfig, 
   }
   let (corrections, payload) = parse_preflate_data(&segment.data)?;
   let plain = decode_payload(payload_kind, payload, config, depth, budget)?;
-  let deflate = preflate_reencode(&corrections, &plain)?;
+  let deflate = preflate_reencode(corrections, &plain)?;
   let mut out = Vec::with_capacity(deflate.len() + 6);
   out.extend_from_slice(header);
   out.extend_from_slice(&deflate);
@@ -182,17 +182,13 @@ pub(super) fn decode_gzip_segment(segment: &Pcf2Segment, config: &DecodeConfig, 
     return Err(Error::InvalidSegment("gzip meta_version"));
   }
   let mut offset = 0usize;
-  let header_len = read_varint_slice(rest, &mut offset)? as usize;
-  if offset + header_len + 8 > rest.len() {
-    return Err(Error::InvalidSegment("gzip meta bounds"));
-  }
-  let header = &rest[offset..offset + header_len];
-  offset += header_len;
-  let footer = &rest[offset..offset + 8];
+  let header_len = read_len(rest, &mut offset)?;
+  let header = take_bytes(rest, &mut offset, header_len, "gzip meta bounds")?;
+  let footer = take_bytes(rest, &mut offset, 8, "gzip meta bounds")?;
 
   let (corrections, payload) = parse_preflate_data(&segment.data)?;
   let plain = decode_payload(payload_kind, payload, config, depth, budget)?;
-  let deflate = preflate_reencode(&corrections, &plain)?;
+  let deflate = preflate_reencode(corrections, &plain)?;
   let mut out = Vec::with_capacity(header.len() + deflate.len() + 8);
   out.extend_from_slice(header);
   out.extend_from_slice(&deflate);

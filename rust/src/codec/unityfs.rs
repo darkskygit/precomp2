@@ -91,8 +91,9 @@ fn decompress(compressed: &[u8], size: usize) -> Option<Vec<u8>> {
 
 /// Parses the archive structure. Returns `None` when the layout is not one we
 /// can reproduce byte for byte (unsupported compression, truncated fields,
-/// unexpected sizes); the caller then keeps the file as plain segments.
-fn parse_layout(input: &[u8]) -> Option<Layout> {
+/// unexpected sizes) or its compressed blocks info would decompress to more
+/// than `max_info` bytes; the caller then keeps the file as plain segments.
+fn parse_layout(input: &[u8], max_info: u64) -> Option<Layout> {
   let mut header = Reader { buf: input, pos: 0 };
   if header.take::<8>()? != *MAGIC {
     return None;
@@ -131,7 +132,7 @@ fn parse_layout(input: &[u8]) -> Option<Layout> {
   let info_compressed = &input[info_range.clone()];
   let info = match info_compression {
     COMPRESSION_NONE if info_compressed.len() == info_size => Cow::Borrowed(info_compressed),
-    c if is_lz4(c) => Cow::Owned(decompress(info_compressed, info_size)?),
+    c if is_lz4(c) && info_size as u64 <= max_info => Cow::Owned(decompress(info_compressed, info_size)?),
     _ => return None,
   };
   let info_lz4_size = is_lz4(info_compression).then_some(info_size);
@@ -235,11 +236,7 @@ impl Candidates {
   }
 
   fn reproduce(&mut self, raw: &[u8], compressed: &[u8]) -> Option<Compressor> {
-    let Some(i) = self
-      .order
-      .iter()
-      .position(|c| c.compress(raw, compressed.len()).is_some_and(|out| out == compressed))
-    else {
+    let Some(i) = self.order.iter().position(|c| c.reproduces(raw, compressed)) else {
       self.misses += 1;
       return None;
     };
@@ -282,7 +279,7 @@ pub struct UnityFsReport {
 }
 
 fn convert(input: &[u8], config: &EncodeConfig, budget: &mut EncodeBudget) -> Result<Option<(Vec<Pcf2Segment>, UnityFsReport)>> {
-  let Some(layout) = parse_layout(input) else {
+  let Some(layout) = parse_layout(input, budget.remaining(config)) else {
     return Ok(None);
   };
   let mut candidates = Candidates::for_engine(&layout.engine_version);
@@ -294,13 +291,15 @@ fn convert(input: &[u8], config: &EncodeConfig, budget: &mut EncodeBudget) -> Re
       push_lit(&mut segments, bytes);
       continue;
     };
-    let converted = if candidates.given_up() {
+    // Over budget, the region stays as stored: skip decompressing and
+    // recompressing it.
+    let converted = if candidates.given_up() || size as u64 > budget.remaining(config) {
       None
     } else {
       decompress(bytes, size).and_then(|raw| Some((candidates.reproduce(&raw, bytes)?, raw)))
     };
     let compressor = match converted {
-      Some((compressor, raw)) if budget.total_output.saturating_add(raw.len() as u64) <= config.max_total_output => {
+      Some((compressor, raw)) => {
         budget.consume(raw.len(), config)?;
         segments.push(Pcf2Segment {
           kind: SegmentKind::UnityFs as u8,

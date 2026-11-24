@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{borrow::Cow, io::Cursor};
 
 use ::base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -19,6 +19,7 @@ mod payload;
 mod pdf;
 mod png;
 mod preflate;
+mod scanline;
 mod stream;
 mod unityfs;
 mod varint;
@@ -53,8 +54,8 @@ use pdf::{decode_pdf_flate_segment, decode_pdf_stream, encode_pdf};
 use png::{decode_png_segment, decode_webp_bitmap, encode_png, encode_webp_lossless};
 #[cfg(test)]
 use preflate::preflate_analyze;
-use preflate::{parse_preflate_data, parse_preflate_output, preflate_analyze_limited, preflate_reencode};
-use stream::read_varint_async;
+use preflate::{PreflateAnalysis, parse_preflate_data, preflate_analyze_limited, preflate_reencode};
+use stream::{decode_segment_checked, read_varint_async};
 pub use unityfs::{Lz4Region, UnityFsReport, analyze as analyze_unityfs};
 use unityfs::{decode_unityfs_segment, encode_unityfs};
 use varint::{read_varint_slice, write_varint_vec};
@@ -170,11 +171,7 @@ pub fn decode_image_for_display(input: &[u8], config: &DecodeConfig) -> Result<O
   let mut image = Vec::new();
   let mut budget = DecodeBudget::default();
   for segment in &file.segments {
-    let bytes = decode_segment(segment, config, 0, &mut budget)?;
-    if bytes.len() as u64 != segment.orig_len {
-      return Err(Error::InvalidSegment("image original length"));
-    }
-    image.extend_from_slice(&bytes);
+    image.extend_from_slice(&decode_segment_checked(segment, config, 0, &mut budget)?);
   }
   if image.starts_with(b"\x89PNG\r\n\x1a\n")
     || image.starts_with(b"\xff\xd8")
@@ -287,17 +284,10 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
       meta,
       data,
     };
-    let decoded = decode_segment(&segment, config, 0, &mut budget)?;
-    out.extend_from_slice(&decoded);
+    out.extend_from_slice(&decode_segment_checked(&segment, config, 0, &mut budget)?);
   }
 
   Ok(out)
-}
-
-#[derive(Clone, Debug)]
-struct PenaltyEntry {
-  pos: u32,
-  value: u8,
 }
 
 fn encode_segments(input: &[u8], config: &EncodeConfig, depth: u32, budget: &mut EncodeBudget) -> Result<Vec<Pcf2Segment>> {
@@ -338,11 +328,11 @@ fn encode_segments(input: &[u8], config: &EncodeConfig, depth: u32, budget: &mut
   Ok(vec![Pcf2Segment::lit(input.to_vec())])
 }
 
-fn decode_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
-  match segment.kind {
+fn decode_segment<'a>(segment: &'a Pcf2Segment, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Cow<'a, [u8]>> {
+  let owned = match segment.kind {
     k if k == SegmentKind::Lit as u8 => {
       budget.consume(segment.data.len(), config)?;
-      Ok(segment.data.clone())
+      return Ok(Cow::Borrowed(&segment.data));
     }
     k if k == SegmentKind::Nested as u8 => {
       if depth >= config.max_depth {
@@ -350,18 +340,19 @@ fn decode_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budg
       }
       let nested = stream::decode_stream(Cursor::new(&segment.data), config, depth + 1, budget)?;
       budget.consume(nested.len(), config)?;
-      Ok(nested)
+      nested
     }
-    k if k == SegmentKind::Dflt as u8 => decode_deflate_segment(segment, config, depth, budget),
-    k if k == SegmentKind::Zlib as u8 => decode_zlib_segment(segment, config, depth, budget),
-    k if k == SegmentKind::Gzip as u8 => decode_gzip_segment(segment, config, depth, budget),
-    k if k == SegmentKind::PngIdat as u8 => decode_png_segment(segment, config, depth, budget),
-    k if k == SegmentKind::Jpg as u8 => decode_jpg_segment(segment, budget, config),
-    k if k == SegmentKind::Base64 as u8 => decode_base64_segment(segment, config, depth, budget),
-    k if k == SegmentKind::Bzip2 as u8 => decode_bzip2_segment(segment, config, depth, budget),
-    k if k == SegmentKind::PdfFlate as u8 => decode_pdf_flate_segment(segment, config, depth, budget),
-    k if k == SegmentKind::PdfStream as u8 => decode_pdf_stream(segment, config, depth, budget),
-    k if k == SegmentKind::UnityFs as u8 => decode_unityfs_segment(segment, config, budget),
-    _ => Err(Error::InvalidSegment("unknown segment kind")),
-  }
+    k if k == SegmentKind::Dflt as u8 => decode_deflate_segment(segment, config, depth, budget)?,
+    k if k == SegmentKind::Zlib as u8 => decode_zlib_segment(segment, config, depth, budget)?,
+    k if k == SegmentKind::Gzip as u8 => decode_gzip_segment(segment, config, depth, budget)?,
+    k if k == SegmentKind::PngIdat as u8 => decode_png_segment(segment, config, depth, budget)?,
+    k if k == SegmentKind::Jpg as u8 => decode_jpg_segment(segment, budget, config)?,
+    k if k == SegmentKind::Base64 as u8 => decode_base64_segment(segment, config, depth, budget)?,
+    k if k == SegmentKind::Bzip2 as u8 => decode_bzip2_segment(segment, config, depth, budget)?,
+    k if k == SegmentKind::PdfFlate as u8 => decode_pdf_flate_segment(segment, config, depth, budget)?,
+    k if k == SegmentKind::PdfStream as u8 => decode_pdf_stream(segment, config, depth, budget)?,
+    k if k == SegmentKind::UnityFs as u8 => decode_unityfs_segment(segment, config, budget)?,
+    _ => return Err(Error::InvalidSegment("unknown segment kind")),
+  };
+  Ok(Cow::Owned(owned))
 }

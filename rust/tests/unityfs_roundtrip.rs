@@ -271,6 +271,43 @@ fn candidates_follow_the_archive_and_give_up_on_unknown_compressors() {
 }
 
 #[test]
+fn regions_beyond_the_encode_budget_stay_as_stored() {
+  // The LZ4 blocks info of two blocks decompresses to 44 bytes; a budget
+  // below that keeps the archive literal without decompressing it.
+  let layouts: [(u32, &[(u64, usize)]); 2] = [
+    (0, &[(19_999, 0), (20_000, 1), (49_999, 1), (50_000, 2)]),
+    (3, &[(43, 0), (44, 1), (20_043, 1), (20_044, 2), (50_044, 3)]),
+  ];
+  for (flags, budgets) in layouts {
+    let spec = BundleSpec {
+      archive_version: 6,
+      unity_version: "2022.3.20f1",
+      flags,
+      compressor: Compressor::V1_10_0_L12,
+      blocks: vec![
+        Block::new(3, structured_payload(21, 20_000)),
+        Block::new(3, structured_payload(22, 30_000)),
+      ],
+    };
+    let original = spec.build();
+    for &(max_total_output, converted) in budgets {
+      let config = EncodeConfig {
+        max_total_output,
+        ..EncodeConfig::default()
+      };
+      let encoded = encode_bytes(&original, &config).expect("encode");
+      assert!(decode_bytes(&encoded, &DecodeConfig::default()).expect("decode") == original);
+      let pcf2 = Pcf2File::decode(encoded.as_slice()).expect("pcf2");
+      assert_eq!(
+        unityfs_segments(&pcf2).count(),
+        converted,
+        "flags {flags:#x} budget {max_total_output}"
+      );
+    }
+  }
+}
+
+#[test]
 fn non_unityfs_and_truncated_inputs_stay_literal() {
   let spec = BundleSpec {
     archive_version: 8,

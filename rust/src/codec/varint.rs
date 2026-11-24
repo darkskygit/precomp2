@@ -31,6 +31,20 @@ pub(super) fn read_varint_slice(data: &[u8], offset: &mut usize) -> Result<u64> 
   Err(Error::VarintTooLong)
 }
 
+/// Reads a varint length that must fit in `usize`.
+pub(super) fn read_len(data: &[u8], offset: &mut usize) -> Result<usize> {
+  usize::try_from(read_varint_slice(data, offset)?).map_err(|_| Error::LengthOverflow)
+}
+
+/// Returns the `len` bytes at `offset` and advances past them; fails with
+/// `error` when they run past the end of `data`.
+pub(super) fn take_bytes<'a>(data: &'a [u8], offset: &mut usize, len: usize, error: &'static str) -> Result<&'a [u8]> {
+  let end = offset.checked_add(len).ok_or(Error::InvalidSegment(error))?;
+  let bytes = data.get(*offset..end).ok_or(Error::InvalidSegment(error))?;
+  *offset = end;
+  Ok(bytes)
+}
+
 pub(super) fn write_varint_vec(value: u64, out: &mut Vec<u8>) {
   let mut val = value;
   loop {

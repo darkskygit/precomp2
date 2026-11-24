@@ -1,6 +1,8 @@
 mod bitmap;
 mod display;
 
+use std::borrow::Cow;
+
 use bitmap::{PngIhdr, PngWebpMeta, apply_png_filters_with_types, png_bytes_per_pixel, undo_png_filters};
 pub(super) use bitmap::{decode_webp_bitmap, encode_webp_lossless};
 use crc32fast::Hasher;
@@ -12,7 +14,7 @@ use super::{
   budget::{DecodeBudget, EncodeBudget},
   deflate::adler32,
   payload::{choose_payload, decode_payload},
-  preflate::{build_preflate_data, parse_preflate_data, parse_preflate_output, preflate_analyze, preflate_reencode},
+  preflate::{PreflateAnalysis, build_preflate_data, parse_preflate_data, preflate_analyze, preflate_reencode},
   varint::{read_varint_slice, write_varint_vec},
 };
 use crate::{
@@ -100,13 +102,13 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
     return Ok(None);
   }
 
-  let preflate = match preflate_analyze(deflate) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
-  };
-  let (deflate_len, corrections, plain) = match parse_preflate_output(&preflate) {
-    Ok(v) => v,
-    Err(_) => return Ok(None),
+  let Ok(PreflateAnalysis {
+    deflate_len,
+    corrections,
+    plain,
+  }) = preflate_analyze(deflate)
+  else {
+    return Ok(None);
   };
   if deflate_len != deflate.len() as u64 {
     return Ok(None);
@@ -299,15 +301,15 @@ pub(super) fn decode_png_segment(segment: &Pcf2Segment, config: &DecodeConfig, d
     let meta = webp_meta.ok_or(Error::InvalidSegment("png webp meta"))?;
     let bitmap = decode_webp_bitmap(&payload, meta.width, meta.height, meta.color_type)?;
     let bpp = png_bytes_per_pixel(meta.color_type)?;
-    apply_png_filters_with_types(&bitmap, meta.width, meta.height, bpp, &meta.filters)?
+    Cow::Owned(apply_png_filters_with_types(&bitmap, meta.width, meta.height, bpp, &meta.filters)?)
   };
-  let idat_data = preflate_reencode(&corrections, &plain)?;
+  let idat_data = preflate_reencode(corrections, &plain)?;
   let mut full_idat = Vec::with_capacity(idat_data.len() + 6);
   full_idat.extend_from_slice(&zlib_header);
   full_idat.extend_from_slice(&idat_data);
   full_idat.extend_from_slice(&zlib_footer);
-  let total_len: usize = idat_lengths.iter().sum();
-  if total_len != full_idat.len() {
+  let total_len = idat_lengths.iter().try_fold(0usize, |sum, &len| sum.checked_add(len));
+  if total_len != Some(full_idat.len()) {
     return Err(Error::InvalidSegment("png idat length mismatch"));
   }
 

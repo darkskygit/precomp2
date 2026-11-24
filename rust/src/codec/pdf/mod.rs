@@ -16,10 +16,12 @@
 //! include local metadata cost, but the caller must compare final compressed
 //! file sizes.
 
+use std::borrow::Cow;
+
 use super::{
-  DecodeBudget, DecodeConfig, EncodeBudget, EncodeConfig, Error, Pcf2Segment, Result, SegmentKind, adler32, decode_jpg_segment,
-  decode_payload, decode_webp_bitmap, encode_jpg, encode_webp_lossless, parse_preflate_data, parse_preflate_output,
-  preflate_analyze_limited, preflate_reencode, read_varint_slice, write_varint_vec,
+  DecodeBudget, DecodeConfig, EncodeBudget, EncodeConfig, Error, Pcf2Segment, PreflateAnalysis, Result, SegmentKind, adler32,
+  decode_jpg_segment, decode_payload, decode_webp_bitmap, encode_jpg, encode_webp_lossless, parse_preflate_data, preflate_analyze_limited,
+  preflate_reencode, read_varint_slice, write_varint_vec,
 };
 
 mod ascii;
@@ -268,9 +270,12 @@ fn unpack_flate(bytes: &[u8], limit: usize) -> Result<(Vec<u8>, Vec<u8>)> {
   {
     return Err(Error::InvalidSegment("pdf zlib header"));
   }
-  let analysis = preflate_analyze_limited(&bytes[2..], limit)?;
-  let (consumed, corrections, plain) = parse_preflate_output(&analysis)?;
-  let end = usize::try_from(consumed)
+  let PreflateAnalysis {
+    deflate_len,
+    corrections,
+    plain,
+  } = preflate_analyze_limited(&bytes[2..], limit)?;
+  let end = usize::try_from(deflate_len)
     .ok()
     .and_then(|n| n.checked_add(2))
     .ok_or(Error::LengthOverflow)?;
@@ -305,7 +310,7 @@ pub(super) fn decode_pdf_stream(segment: &Pcf2Segment, config: &DecodeConfig, de
   if pos != segment.meta.len() {
     return Err(Error::InvalidSegment("pdf step trailing bytes"));
   }
-  let mut bytes = segment.data.clone();
+  let mut bytes = Cow::Borrowed(segment.data.as_slice());
   for (kind, len, meta) in steps.into_iter().rev() {
     if (len as u64) > config.max_total_output.saturating_sub(budget.total_output) {
       return Err(Error::InvalidSegment("pdf output budget"));
@@ -337,7 +342,7 @@ pub(super) fn decode_pdf_stream(segment: &Pcf2Segment, config: &DecodeConfig, de
           flags: 0,
           orig_len: len as u64,
           meta: meta.to_vec(),
-          data: bytes,
+          data: bytes.into_owned(),
         };
         decode_jpg_segment(&jpeg, &mut DecodeBudget::default(), config)?
       }
@@ -348,12 +353,12 @@ pub(super) fn decode_pdf_stream(segment: &Pcf2Segment, config: &DecodeConfig, de
       return Err(Error::InvalidSegment("pdf reconstructed length"));
     }
     budget.consume(output.len(), config)?;
-    bytes = output;
+    bytes = Cow::Owned(output);
   }
   if bytes.len() as u64 != segment.orig_len {
     return Err(Error::InvalidSegment("pdf original length"));
   }
-  Ok(bytes)
+  Ok(bytes.into_owned())
 }
 
 fn count_steps(segment: &Pcf2Segment, stats: &mut PdfStats) -> Result<()> {

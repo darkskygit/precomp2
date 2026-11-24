@@ -1,6 +1,9 @@
+use std::borrow::Cow;
+
 use super::{
   DecodeBudget, DecodeConfig, Error, Pcf2Segment, Result, decode_payload, parse_preflate_data, preflate_reencode, read_varint_slice,
 };
+use crate::codec::scanline::filter_row;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PdfDecodeParms {
@@ -94,16 +97,16 @@ pub(crate) fn decode_pdf_flate_segment(
     0 => payload,
     1 => {
       let params = predictor_meta.ok_or(Error::InvalidSegment("pdf predictor meta"))?;
-      encode_pdf_predictor(&payload, &params)?
+      Cow::Owned(encode_pdf_predictor(&payload, &params)?)
     }
     2 => {
       let meta = bmp_meta.ok_or(Error::InvalidSegment("pdf bmp meta"))?;
-      decode_pdf_bmp_payload(&payload, meta)?
+      Cow::Owned(decode_pdf_bmp_payload(&payload, meta)?)
     }
     _ => return Err(Error::InvalidSegment("pdf transform")),
   };
 
-  let deflate = preflate_reencode(&corrections, &plain)?;
+  let deflate = preflate_reencode(corrections, &plain)?;
   let mut out = Vec::new();
   if let (Some(header), Some(footer)) = (header, footer) {
     out.extend_from_slice(&header);
@@ -149,76 +152,67 @@ pub(crate) fn encode_pdf_predictor(data: &[u8], params: &PdfDecodeParms) -> Resu
   if row_bytes == 0 || !data.len().is_multiple_of(row_bytes) {
     return Err(Error::InvalidSegment("pdf predictor size"));
   }
-  let rows = data.len() / row_bytes;
-  let mut out = vec![0u8; rows * row_bytes];
-  for row in 0..rows {
-    let row_in = &data[row * row_bytes..(row + 1) * row_bytes];
-    let row_out = &mut out[row * row_bytes..(row + 1) * row_bytes];
-    for col in 0..row_bytes {
-      let left = if col >= bpp { row_in[col - bpp] } else { 0 };
-      let up = if row > 0 { data[(row - 1) * row_bytes + col] } else { 0 };
-      let up_left = if row > 0 && col >= bpp {
-        data[(row - 1) * row_bytes + col - bpp]
-      } else {
-        0
-      };
-      let predicted = match filter {
-        0 => 0,
-        1 => left,
-        2 => up,
-        3 => ((left as u16 + up as u16) / 2) as u8,
-        4 => paeth_predictor(left, up, up_left),
-        _ => return Err(Error::InvalidSegment("pdf predictor filter")),
-      };
-      row_out[col] = row_in[col].wrapping_sub(predicted);
-    }
+  let mut out = vec![0u8; data.len()];
+  let zeros = vec![0; row_bytes.min(data.len())];
+  let mut prev = zeros.as_slice();
+  for (row, filtered) in data.chunks_exact(row_bytes).zip(out.chunks_exact_mut(row_bytes)) {
+    filter_row(filter, row, prev, bpp, filtered)?;
+    prev = row;
   }
   Ok(out)
 }
 
-fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
-  let a = a as i32;
-  let b = b as i32;
-  let c = c as i32;
-  let p = a + b - c;
-  let pa = (p - a).abs();
-  let pb = (p - b).abs();
-  let pc = (p - c).abs();
-  if pa <= pb && pa <= pc {
-    a as u8
-  } else if pb <= pc {
-    b as u8
-  } else {
-    c as u8
-  }
-}
-
 fn decode_pdf_bmp_payload(payload: &[u8], meta: PdfBmpMeta) -> Result<Vec<u8>> {
-  let bytes_per_pixel = if meta.mode == 1 {
-    1
-  } else if meta.mode == 2 {
-    3
-  } else {
-    return Err(Error::InvalidSegment("pdf bmp mode"));
+  let bytes_per_pixel = match meta.mode {
+    1 => 1,
+    2 => 3,
+    _ => return Err(Error::InvalidSegment("pdf bmp mode")),
   };
   let header_size = 14 + 40 + if meta.mode == 1 { 1024 } else { 0 };
   if payload.len() < header_size {
     return Err(Error::InvalidSegment("pdf bmp payload"));
   }
-  let row_bytes = meta.width as usize * bytes_per_pixel;
-  let padded_row_bytes = (row_bytes + 3) & !3;
-  let height_usize = usize::try_from(meta.height).map_err(|_| Error::InvalidSegment("pdf bmp height"))?;
-  let data_size = padded_row_bytes
-    .checked_mul(height_usize)
-    .ok_or(Error::InvalidSegment("pdf bmp size"))?;
-  if payload.len() < header_size + data_size {
+  let width = usize::try_from(meta.width).map_err(|_| Error::InvalidSegment("pdf bmp width"))?;
+  let height = usize::try_from(meta.height).map_err(|_| Error::InvalidSegment("pdf bmp height"))?;
+  let row_bytes = width.checked_mul(bytes_per_pixel).ok_or(Error::InvalidSegment("pdf bmp size"))?;
+  // A zero-width or zero-height bitmap has no samples; return before walking
+  // up to `u32::MAX` empty rows.
+  if row_bytes == 0 || height == 0 {
+    return Ok(Vec::new());
+  }
+  let padded_row_bytes = row_bytes.checked_next_multiple_of(4).ok_or(Error::InvalidSegment("pdf bmp size"))?;
+  let data_size = padded_row_bytes.checked_mul(height).ok_or(Error::InvalidSegment("pdf bmp size"))?;
+  let pixels = &payload[header_size..];
+  if pixels.len() < data_size {
     return Err(Error::InvalidSegment("pdf bmp payload"));
   }
-  let mut out = Vec::with_capacity(row_bytes * height_usize);
-  let mut cursor = header_size;
-  for _ in 0..height_usize {
-    out.extend_from_slice(&payload[cursor..cursor + row_bytes]);
-    cursor += padded_row_bytes;
+  let mut out = Vec::with_capacity(row_bytes * height);
+  for row in pixels.chunks_exact(padded_row_bytes).take(height) {
+    out.extend_from_slice(&row[..row_bytes]);
   }
   Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn bmp_payload_strips_row_padding_and_rejects_impossible_sizes() {
+    let header = 14 + 40;
+    let mut two_rows = vec![0u8; header];
+    two_rows.extend_from_slice(&[1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0]);
+    let cases: [(u32, u32, Option<&[u8]>); 5] = [
+      (2, 2, Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])),
+      // Empty bitmaps return at once instead of walking u32::MAX empty rows.
+      (0, u32::MAX, Some(&[])),
+      (1, 0, Some(&[])),
+      (u32::MAX, u32::MAX, None),
+      (2, 3, None),
+    ];
+    for (width, height, expected) in cases {
+      let result = decode_pdf_bmp_payload(&two_rows, PdfBmpMeta { mode: 2, width, height });
+      assert_eq!(result.ok().as_deref(), expected, "{width}x{height}");
+    }
+  }
 }

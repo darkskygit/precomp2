@@ -1,7 +1,7 @@
 //! Match finder of the optimal parser (`LZ4HC_Insert` +
 //! `LZ4HC_InsertAndGetWiderMatch`), 1.8.2+ release classes.
 
-use super::common::{MIN_MATCH, Match, common_prefix, hash, read16, read32, run_backward, run_forward};
+use super::common::{CHAIN_SIZE, HASH_SIZE, MIN_MATCH, Match, common_prefix, hash, read16, read32, run_backward, run_forward, table};
 
 const MAX_DISTANCE: u32 = 65_535;
 /// Table index of `src[0]`. liblz4 starts a fresh context at 64 KiB, so an
@@ -36,10 +36,10 @@ impl Quirks {
 pub(super) struct MatchFinder<'a> {
   src: &'a [u8],
   /// hash of 4 bytes -> newest index
-  head: Vec<u32>,
+  head: Box<[u32; HASH_SIZE]>,
   /// `index as u16` -> distance to the previous index with the same hash
   /// (saturates at 65535)
-  prev: Vec<u16>,
+  prev: Box<[u16; CHAIN_SIZE]>,
   next_to_update: u32,
   quirks: Quirks,
 }
@@ -48,8 +48,8 @@ impl<'a> MatchFinder<'a> {
   pub fn new(src: &'a [u8], quirks: Quirks) -> Self {
     MatchFinder {
       src,
-      head: vec![0; 1 << 15],
-      prev: vec![u16::MAX; 1 << 16],
+      head: table(0),
+      prev: table(u16::MAX),
       next_to_update: BASE,
       quirks,
     }
@@ -90,6 +90,8 @@ impl<'a> MatchFinder<'a> {
     let mut run: Option<Option<usize>> = None;
     let mut chain_shift = 0u32;
     let mut best = None;
+    // The byte pair at `ip + longest - 1`, refreshed whenever `longest` grows.
+    let mut tail = read16(s, ip + longest - 1);
 
     let mut idx = self.head[hash(pattern)];
     while idx >= lowest && attempts > 0 {
@@ -97,10 +99,11 @@ impl<'a> MatchFinder<'a> {
       let cand = Self::pos(idx);
       let mut len = 0;
       // cheap reject: the byte pair that would make the match longer must agree
-      if read16(s, ip + longest - 1) == read16(s, cand + longest - 1) && read32(s, cand) == pattern {
+      if tail == read16(s, cand + longest - 1) && read32(s, cand) == pattern {
         len = MIN_MATCH + common_prefix(s, ip + MIN_MATCH, cand + MIN_MATCH, limit);
         if len > longest {
           longest = len;
+          tail = read16(s, ip + longest - 1);
           best = Some(Match {
             start: ip,
             source: cand,
@@ -146,6 +149,7 @@ impl<'a> MatchFinder<'a> {
                   break;
                 }
                 longest = ml;
+                tail = read16(s, ip + longest - 1);
                 best = Some(Match {
                   start: ip,
                   source: Self::pos(idx),
