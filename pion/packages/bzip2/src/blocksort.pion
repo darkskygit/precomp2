@@ -1,0 +1,474 @@
+///| Burrows-Wheeler block sorting, translated from `libbz2-rs-sys` 0.2.3 (itself derived from
+///| bzip2/libbzip2 by Julian R Seward; see `NOTICE`) so the sorted order and `origPtr` match exactly.
+///| `main_sort` is a radix + three-way quicksort; when a repetitive block exhausts its work budget,
+///| `fallback_sort` in `fallbacksort.pion` takes over.
+
+///| Bytes kept past the block end so comparisons can read ahead without wrapping.
+let n_overshoot : Int = 34
+
+///| Main-sort budget factor: libbz2 default work factor 30 gives `(30 - 1) / 3`.
+let work_factor_budget : Int = 9
+
+///| Bucket-completed flag stored in `ftab` entries.
+let setmask : Int = 2097152
+
+///|
+let clearmask : Int = -2097153
+
+///| Shell sort increments used by `main_simple_sort`.
+let shell_incs : FixedArray[Int] = [
+  1, 4, 13, 40, 121, 364, 1093, 3280, 9841, 29524, 88573, 265720, 797161, 2391484,
+]
+
+///| Sort workspace sized for the largest block of one stream.
+struct Sorter {
+  ptr : FixedArray[Int]
+  quadrant : FixedArray[Int]
+  ftab : FixedArray[Int]
+  eclass : FixedArray[Int]
+  bhtab : FixedArray[Int]
+  mut budget : Int
+}
+
+///|
+fn Sorter::new(cap : Int) -> Sorter {
+  Sorter::{
+    ptr: FixedArray::make(cap, 0),
+    quadrant: FixedArray::make(cap + n_overshoot, 0),
+    ftab: FixedArray::make(65537, 0),
+    eclass: FixedArray::make(cap, 0),
+    bhtab: FixedArray::make(cap / 32 + 8, 0),
+    budget: 0,
+  }
+}
+
+///| Sort the rotations of `block[0..nblock]` into `s.ptr` and return `origPtr`.
+///| `block` must have `n_overshoot` spare slots past `nblock`.
+fn block_sort(s : Sorter, block : FixedArray[Int], nblock : Int) -> Int {
+  if nblock < 10000 {
+    fallback_sort(s, block, nblock)
+  } else {
+    s.budget = nblock * work_factor_budget
+    main_sort(s, block, nblock)
+    if s.budget < 0 {
+      fallback_sort(s, block, nblock)
+    }
+  }
+  let mut i = 0
+  while i < nblock {
+    if s.ptr[i] == 0 {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///| Return whether the rotation at `i1` sorts after the rotation at `i2`, charging `s.budget`.
+fn main_gt_u(s : Sorter, block : FixedArray[Int], nblock : Int, a : Int, b : Int) -> Bool {
+  let quadrant = s.quadrant
+  let mut i1 = a
+  let mut i2 = b
+  let mut k = 0
+  while k < 12 {
+    let c1 = block[i1 + k]
+    let c2 = block[i2 + k]
+    if c1 != c2 {
+      return c1 > c2
+    }
+    k = k + 1
+  }
+  i1 = i1 + 12
+  i2 = i2 + 12
+  // `libbz2-rs-sys` 0.2.3 runs `nblock.div_ceil(8)` rounds (libbz2 1.0.8 runs `nblock / 8 + 2`);
+  // the round count sets the budget charge, so it decides when main sort falls back.
+  let mut iters = (nblock + 7) / 8
+  while iters > 0 {
+    k = 0
+    while k < 8 {
+      let c1 = block[i1 + k]
+      let c2 = block[i2 + k]
+      if c1 != c2 {
+        return c1 > c2
+      }
+      let s1 = quadrant[i1 + k]
+      let s2 = quadrant[i2 + k]
+      if s1 != s2 {
+        return s1 > s2
+      }
+      k = k + 1
+    }
+    i1 = i1 + 8
+    i2 = i2 + 8
+    if i1 >= nblock {
+      i1 = i1 - nblock
+    }
+    if i2 >= nblock {
+      i2 = i2 - nblock
+    }
+    s.budget = s.budget - 1
+    iters = iters - 1
+  }
+  false
+}
+
+///|
+fn main_simple_sort(s : Sorter, block : FixedArray[Int], nblock : Int, lo : Int, hi : Int, d : Int) -> Unit {
+  let ptr = s.ptr
+  let big_n = hi - lo + 1
+  let mut hp = 0
+  while hp < 14 && shell_incs[hp] < big_n {
+    hp = hp + 1
+  }
+  if hp >= 14 {
+    return
+  }
+  hp = hp - 1
+  while hp >= 0 {
+    let h = shell_incs[hp]
+    let mut i = lo + h
+    while i <= hi {
+      let v = ptr[i]
+      let mut j = i
+      let mut go = true
+      while go && main_gt_u(s, block, nblock, ptr[j - h] + d, v + d) {
+        ptr[j] = ptr[j - h]
+        j = j - h
+        if j < lo + h {
+          go = false
+        }
+      }
+      ptr[j] = v
+      if s.budget < 0 {
+        return
+      }
+      i = i + 1
+    }
+    hp = hp - 1
+  }
+}
+
+///|
+fn median_of_3(a0 : Int, b0 : Int, c0 : Int) -> Int {
+  let mut a = a0
+  let mut b = b0
+  let mut c = c0
+  if a > b {
+    let t = a
+    a = b
+    b = t
+  }
+  if a > c {
+    c = a
+  }
+  if b > c {
+    b = c
+  }
+  b
+}
+
+///| Push the three partitions largest-first so the smallest is popped next.
+fn mqs_push3(
+  st_lo : FixedArray[Int],
+  st_hi : FixedArray[Int],
+  st_d : FixedArray[Int],
+  sp : Int,
+  lo : FixedArray[Int],
+  hi : FixedArray[Int],
+  d : FixedArray[Int],
+) -> Unit {
+  let mut x = 0
+  let mut y = 1
+  let mut z = 2
+  if hi[x] - lo[x] < hi[y] - lo[y] {
+    let t = x
+    x = y
+    y = t
+  }
+  if hi[y] - lo[y] < hi[z] - lo[z] {
+    let t = y
+    y = z
+    z = t
+  }
+  if hi[x] - lo[x] < hi[y] - lo[y] {
+    let t = x
+    x = y
+    y = t
+  }
+  st_lo[sp] = lo[x]
+  st_hi[sp] = hi[x]
+  st_d[sp] = d[x]
+  st_lo[sp + 1] = lo[y]
+  st_hi[sp + 1] = hi[y]
+  st_d[sp + 1] = d[y]
+  st_lo[sp + 2] = lo[z]
+  st_hi[sp + 2] = hi[z]
+  st_d[sp + 2] = d[z]
+}
+
+///|
+fn main_qsort3(s : Sorter, block : FixedArray[Int], nblock : Int, lo_st : Int, hi_st : Int, d_st : Int) -> Unit {
+  let ptr = s.ptr
+  let st_lo : FixedArray[Int] = FixedArray::make(100, 0)
+  let st_hi : FixedArray[Int] = FixedArray::make(100, 0)
+  let st_d : FixedArray[Int] = FixedArray::make(100, 0)
+  let nx_lo : FixedArray[Int] = FixedArray::make(3, 0)
+  let nx_hi : FixedArray[Int] = FixedArray::make(3, 0)
+  let nx_d : FixedArray[Int] = FixedArray::make(3, 0)
+  st_lo[0] = lo_st
+  st_hi[0] = hi_st
+  st_d[0] = d_st
+  let mut sp = 1
+  while sp > 0 {
+    sp = sp - 1
+    let lo = st_lo[sp]
+    let hi = st_hi[sp]
+    let d = st_d[sp]
+    if hi - lo < 20 || d > 14 {
+      main_simple_sort(s, block, nblock, lo, hi, d)
+      if s.budget < 0 {
+        return
+      }
+      continue
+    }
+    let med = median_of_3(block[ptr[lo] + d], block[ptr[hi] + d], block[ptr[(lo + hi) >> 1] + d])
+    let mut lt_lo = lo
+    let mut un_lo = lo
+    let mut gt_hi = hi
+    let mut un_hi = hi
+    let mut go = true
+    while go {
+      let mut scan = true
+      while scan && un_lo <= un_hi {
+        let c = block[ptr[un_lo] + d]
+        if c > med {
+          scan = false
+        } else if c == med {
+          ptr.swap(un_lo, lt_lo)
+          lt_lo = lt_lo + 1
+          un_lo = un_lo + 1
+        } else {
+          un_lo = un_lo + 1
+        }
+      }
+      scan = true
+      while scan && un_lo <= un_hi {
+        let c = block[ptr[un_hi] + d]
+        if c < med {
+          scan = false
+        } else if c == med {
+          ptr.swap(un_hi, gt_hi)
+          gt_hi = gt_hi - 1
+          un_hi = un_hi - 1
+        } else {
+          un_hi = un_hi - 1
+        }
+      }
+      if un_lo > un_hi {
+        go = false
+      } else {
+        ptr.swap(un_lo, un_hi)
+        un_lo = un_lo + 1
+        un_hi = un_hi - 1
+      }
+    }
+    if gt_hi < lt_lo {
+      st_lo[sp] = lo
+      st_hi[sp] = hi
+      st_d[sp] = d + 1
+      sp = sp + 1
+      continue
+    }
+    let n0 = if lt_lo - lo < un_lo - lt_lo { lt_lo - lo } else { un_lo - lt_lo }
+    let mut k = 0
+    while k < n0 {
+      ptr.swap(lo + k, un_lo - n0 + k)
+      k = k + 1
+    }
+    let m0 = if hi - gt_hi < gt_hi - un_hi { hi - gt_hi } else { gt_hi - un_hi }
+    k = 0
+    while k < m0 {
+      ptr.swap(un_lo + k, hi - m0 + 1 + k)
+      k = k + 1
+    }
+    let n = lo + un_lo - lt_lo - 1
+    let m = hi - (gt_hi - un_hi) + 1
+    nx_lo[0] = lo
+    nx_hi[0] = n
+    nx_d[0] = d
+    nx_lo[1] = m
+    nx_hi[1] = hi
+    nx_d[1] = d
+    nx_lo[2] = n + 1
+    nx_hi[2] = m - 1
+    nx_d[2] = d + 1
+    mqs_push3(st_lo, st_hi, st_d, sp, nx_lo, nx_hi, nx_d)
+    sp = sp + 3
+  }
+}
+
+///|
+fn big_freq(ftab : FixedArray[Int], b : Int) -> Int {
+  ftab[(b + 1) << 8] - ftab[b << 8]
+}
+
+///| Radix + quicksort of `block[0..nblock]` into `s.ptr`; leaves `s.budget < 0` when it gives up.
+fn main_sort(s : Sorter, block : FixedArray[Int], nblock : Int) -> Unit {
+  let ptr = s.ptr
+  let quadrant = s.quadrant
+  let ftab = s.ftab
+  let big_done : FixedArray[Bool] = FixedArray::make(256, false)
+  let copy_start : FixedArray[Int] = FixedArray::make(256, 0)
+  let copy_end : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut i = 0
+  while i < nblock + n_overshoot {
+    quadrant[i] = 0
+    i = i + 1
+  }
+  ftab.fill(0)
+  let mut j = block[0] << 8
+  i = nblock - 1
+  while i >= 0 {
+    j = (j >> 8) | (block[i] << 8)
+    ftab[j] += 1
+    i = i - 1
+  }
+  i = 0
+  while i < n_overshoot {
+    block[nblock + i] = block[i]
+    i = i + 1
+  }
+  i = 1
+  while i <= 65536 {
+    ftab[i] += ftab[i - 1]
+    i = i + 1
+  }
+  let mut s16 = block[0] << 8
+  i = nblock - 1
+  while i >= 0 {
+    s16 = (s16 >> 8) | (block[i] << 8)
+    let k = ftab[s16] - 1
+    ftab[s16] = k
+    ptr[k] = i
+    i = i - 1
+  }
+  let running_order : FixedArray[Int] = FixedArray::make(256, 0)
+  i = 0
+  while i < 256 {
+    running_order[i] = i
+    i = i + 1
+  }
+  let mut h = 364
+  let mut sorting = true
+  while sorting {
+    h = h / 3
+    i = h
+    while i < 256 {
+      let vv = running_order[i]
+      let mut jj = i
+      let mut go = true
+      while go && big_freq(ftab, running_order[jj - h]) > big_freq(ftab, vv) {
+        running_order[jj] = running_order[jj - h]
+        jj = jj - h
+        if jj < h {
+          go = false
+        }
+      }
+      running_order[jj] = vv
+      i = i + 1
+    }
+    if h == 1 {
+      sorting = false
+    }
+  }
+  i = 0
+  while i < 256 {
+    let ss = running_order[i]
+    // Step 1: quicksort the unsorted small buckets [ss, jb].
+    let mut jb = 0
+    while jb < 256 {
+      if jb != ss {
+        let sb = (ss << 8) + jb
+        if (ftab[sb] & setmask) == 0 {
+          let lo = ftab[sb] & clearmask
+          let hi = (ftab[sb + 1] & clearmask) - 1
+          if hi > lo {
+            main_qsort3(s, block, nblock, lo, hi, 2)
+            if s.budget < 0 {
+              return
+            }
+          }
+        }
+        ftab[sb] = ftab[sb] | setmask
+      }
+      jb = jb + 1
+    }
+    // Step 2: derive the order of buckets [t, ss] from the sorted big bucket [ss].
+    jb = 0
+    while jb < 256 {
+      copy_start[jb] = ftab[(jb << 8) + ss] & clearmask
+      copy_end[jb] = (ftab[(jb << 8) + ss + 1] & clearmask) - 1
+      jb = jb + 1
+    }
+    jb = ftab[ss << 8] & clearmask
+    while jb < copy_start[ss] {
+      let mut k = ptr[jb] - 1
+      if k < 0 {
+        k = k + nblock
+      }
+      let c1 = block[k]
+      if !big_done[c1] {
+        ptr[copy_start[c1]] = k
+        copy_start[c1] += 1
+      }
+      jb = jb + 1
+    }
+    jb = (ftab[(ss + 1) << 8] & clearmask) - 1
+    while jb > copy_end[ss] {
+      let mut k = ptr[jb] - 1
+      if k < 0 {
+        k = k + nblock
+      }
+      let c1 = block[k]
+      if !big_done[c1] {
+        ptr[copy_end[c1]] = k
+        copy_end[c1] -= 1
+      }
+      jb = jb - 1
+    }
+    jb = 0
+    while jb < 256 {
+      let idx = (jb << 8) + ss
+      ftab[idx] = ftab[idx] | setmask
+      jb = jb + 1
+    }
+    // Step 3: record quadrant ranks of the finished big bucket.
+    big_done[ss] = true
+    if i < 255 {
+      let bb_start = ftab[ss << 8] & clearmask
+      let bb_size = (ftab[(ss + 1) << 8] & clearmask) - bb_start
+      // `libbz2-rs-sys` 0.2.3 scales quadrant ranks by `popcount(bb_size >> 16)`, which changes the
+      // main-sort work budget (and so the fallback decision) relative to libbz2 1.0.8. When that
+      // shift is too small for 16-bit ranks, 0.2.3 aborts (internal error 1002); use the smallest
+      // sufficient shift there so the sort stays correct.
+      let mut shifts = (bb_size >> 16).count_ones()
+      if ((bb_size - 1) >> shifts) > 65535 {
+        shifts = 0
+        while ((bb_size - 1) >> shifts) > 65535 {
+          shifts = shifts + 1
+        }
+      }
+      let mut q = bb_size - 1
+      while q >= 0 {
+        let a2update = ptr[bb_start + q]
+        let qval = q >> shifts
+        quadrant[a2update] = qval
+        if a2update < n_overshoot {
+          quadrant[a2update + nblock] = qval
+        }
+        q = q - 1
+      }
+    }
+    i = i + 1
+  }
+}

@@ -1,0 +1,149 @@
+///| Golden outputs of Rust `bzip2` 0.6.1 / `libbz2-rs-sys` 0.2.3 (`BzEncoder::write_all` + `finish`),
+///| the encoder precomp2's Rust side uses; `compress` must match them byte for byte.
+
+///| FNV-1a 32-bit hash, used to pin long golden streams without embedding them.
+fn fnv1a32(b : Bytes) -> UInt {
+  let mut h : UInt = 2166136261U
+  let mut i = 0
+  while i < b.length() {
+    h = (h ^ b[i].to_int().to_uint()) * 16777619U
+    i = i + 1
+  }
+  h
+}
+
+///| Bytes 255 down to 0, values below 16 once and the rest twice, repeated 30 times (14,880 bytes).
+fn periodic_descending() -> Bytes {
+  let unit = Bytes::new(496)
+  let mut k = 0
+  let mut v = 255
+  while v >= 0 {
+    unit[k] = v.to_byte()
+    k = k + 1
+    if v >= 16 {
+      unit[k] = v.to_byte()
+      k = k + 1
+    }
+    v = v - 1
+  }
+  repeat_bytes(unit, 30)
+}
+
+///|
+fn repeat_bytes(unit : Bytes, times : Int) -> Bytes {
+  let out = Bytes::new(unit.length() * times)
+  let mut i = 0
+  while i < out.length() {
+    out[i] = unit[i % unit.length()]
+    i = i + 1
+  }
+  out
+}
+
+///| `n` bytes where every fourth byte is a pseudo-random separator and the rest are `a`.
+fn triple_runs(n : Int, seed : Int64) -> Bytes {
+  let r = lcg_bytes(n, seed, 100)
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = (if i % 4 != 3 { 0x61 } else { 0x62 + r[i].to_int() }).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+test "compress_matches_rust_libbz2_rs_sys_on_periodic_fixture_where_c_libbz2_differs" {
+  let plain = periodic_descending()
+  debug_assert(plain.length() == 14880, "fixture length")
+  let golden = hex_bytes(
+    "425a6831314159265359d960929b001d017fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" +
+    "ffffffd003fc000000024c00130001300000000000000000000000000000000000000000000000000000000126000980" +
+    "009800000000000000000000000000000000000000000000000000000000930004c0004c000000000000000000000000" +
+    "000000000000000000000000000000001355554000000000000000000000000000000000000000000000000000000000" +
+    "0000000930004c0004c00000000000000000000000000000000000000000000000000000000c02180c30286070c12182" +
+    "c306860f0c22184c30a86170c32186c30e861f4310a188d0c4a86274314a18ad0c5a862f4318a18cd0c6a8637431ca18" +
+    "ed0c7a863f4320a190d0c8a86474324a192d0c9a864f4328a194d0caa8657432ca196d0cba865f4330a198d0cca86674" +
+    "334a19ad0cda866f4338a19cd0cea8677433ca19ed0cfa867f4340a1a0d0d0a86874344a1a2d0d1a868f4348a1a4d0d2" +
+    "a8697434ca1a6d0d3a869f4350a1a8d0d4a86a74354a1aad0d5a86af4358a1acd0d6a86b7435ca1aed0d7a86bf4360a1" +
+    "b0d0d8a86c74364a1b2d0d9a86cf4368a1b4d0daa86d7436ca1b6d0dba86df4370a1b8d0dca86e74374a1bad0dda86ef" +
+    "4378a1bcd0dea86f7437ca1bed0dfa86ff4380a1c0d0e0a87074384a1c2d0e1a870f4388a1c4d0e2a8717438ca1c6d0e" +
+    "3a871f4390a1c8d0e4a87274394a1cad0e5a872f4398a1ccd0e6a8737439ca1ced0e7a873f43a0a1d0d0e8a874743a4a" +
+    "1d2d0e9a874f43a8a1d4d0eaa875743aca1d6d0eba875f43b0a1d8d0eca876743b4a1dad0eda876f43b8a1dcd0eea877" +
+    "743bca1ded0efa877f43c0a1e0d0f0a878743c4a1e2d0f1a878f43c8a1e4d0f2a879743cca1e6d0f3a879f43d0a1e8d0" +
+    "f4a87a743d4a1ead0f5a87af43d8a1ecd0f6a87b743dca1eed0f7a87bf43e0a1f0d0f8a87c743e4a1f2d0f9a87cf43e8" +
+    "a1f4d0faa87d743eca1f6d0fba87df43f0a1f8d0fca87e743f4a1fad0fda87ef43f8a1fcd0fea87f743fca1fed0ffa87" +
+    "fd0ffc5dc914e1424365824a6c",
+  )
+  match compress(plain, 1) {
+    Ok(out) => debug_assert(bytes_equal(out, golden), "periodic fixture differs from libbz2-rs-sys")
+    Err(e) => debug_assert(false, e)
+  }
+  match decompress(golden) {
+    Ok(out) => debug_assert(bytes_equal(out, plain), "periodic golden misdecoded")
+    Err(e) => debug_assert(false, e)
+  }
+}
+
+///| `(name, plain, level, golden length, golden FNV-1a)` from libbz2-rs-sys 0.2.3.
+fn rust_golden_cases() -> Array[(String, Bytes, Int, Int, UInt)] {
+  let half = lcg_bytes(23500, 5L, 256)
+  let twin = half.concat(half)
+  [
+    ("twin halves, level 1", twin, 1, 29657, 0xCBD8172BU),
+    ("twin halves, level 9", twin, 9, 29657, 0x7EB24593U),
+    ("periodic text", repeat_text(30011, "the quick brown fox jumps over the lazy dog. "), 6, 163, 0xA24F5618U),
+    ("periodic fallback sort", repeat_text(120000, "ab"), 2, 43, 0x7BFA7CBAU),
+    ("block cut 99981", repeat_text(99981, "ab"), 1, 43, 0x8D8914ACU),
+    ("block cut 99982", repeat_text(99982, "ab"), 1, 66, 0xD572BC4EU),
+    ("block cut 99983", repeat_text(99983, "ab"), 1, 66, 0x657935B4U),
+    ("three blocks", lcg_bytes(250000, 3L, 3), 1, 56356, 0x43FF02A4U),
+    ("150k-entry bucket", triple_runs(200000, 9L), 3, 42042, 0x6BEE1FA3U),
+    ("270k-entry bucket", triple_runs(360000, 9L), 4, 75567, 0xB20F3F66U),
+  ]
+}
+
+///|
+test "compress_matches_rust_libbz2_rs_sys_goldens_for_main_fallback_cutoff_and_multiblock" {
+  for c in rust_golden_cases() {
+    let (name, plain, level, len, hash) = c
+    match compress(plain, level) {
+      Ok(out) => {
+        debug_assert(out.length() == len, name + ": length differs from libbz2-rs-sys")
+        debug_assert(fnv1a32(out) == hash, name + ": bytes differ from libbz2-rs-sys")
+        match decompress(out) {
+          Ok(back) => debug_assert(bytes_equal(back, plain), name + ": roundtrip mismatch")
+          Err(e) => debug_assert(false, name + ": " + e)
+        }
+      }
+      Err(e) => debug_assert(false, name + ": " + e)
+    }
+  }
+}
+
+///| Main-sort work budget left for `plain`; negative means `block_sort` falls back.
+fn main_sort_budget_left(plain : Bytes) -> Int {
+  let n = plain.length()
+  let block : FixedArray[Int] = FixedArray::make(n + n_overshoot, 0)
+  let mut i = 0
+  while i < n {
+    block[i] = plain[i].to_int()
+    i = i + 1
+  }
+  let s = Sorter::new(n)
+  s.budget = n * work_factor_budget
+  main_sort(s, block, n)
+  s.budget
+}
+
+///|
+test "main_sort_budget_completes_twin_halves_falls_back_on_periodic_and_ends_at_zero_on_fixture" {
+  let half = lcg_bytes(23500, 5L, 256)
+  debug_assert(main_sort_budget_left(half.concat(half)) >= 0, "twin halves should finish main sort")
+  debug_assert(main_sort_budget_left(triple_runs(200000, 9L)) >= 0, "triple runs should finish main sort")
+  debug_assert(main_sort_budget_left(repeat_text(30011, "the quick brown fox jumps over the lazy dog. ")) < 0, "periodic text should fall back")
+  debug_assert(main_sort_budget_left(repeat_text(30000, "ab")) < 0, "ab block should fall back")
+  // `div_ceil(8)` rounds leave exactly zero budget here; libbz2 1.0.8 charges more and falls back,
+  // which is why C output differs on this fixture.
+  debug_assert(main_sort_budget_left(periodic_descending()) == 0, "periodic fixture budget")
+}

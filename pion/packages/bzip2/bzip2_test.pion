@@ -1,0 +1,224 @@
+///| bzip2 codec tests: libbz2 reference vectors, roundtrips across levels, and malformed-stream rejection.
+
+///|
+fn hex_nibble(c : Int) -> Int {
+  if c >= 0x30 && c <= 0x39 {
+    c - 0x30
+  } else {
+    c - 0x61 + 10
+  }
+}
+
+///|
+fn hex_bytes(h : String) -> Bytes {
+  let src = h.to_bytes()
+  let n = src.length() / 2
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = (hex_nibble(src[2 * i].to_int()) * 16 + hex_nibble(src[2 * i + 1].to_int())).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn bytes_equal(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Deterministic LCG bytes over an alphabet of `span` symbols (`span <= 256`).
+fn lcg_bytes(n : Int, seed : Int64, span : Int) -> Bytes {
+  let out = Bytes::new(n)
+  let mut s = seed
+  let mut i = 0
+  while i < n {
+    s = (s * 6364136223846793005L + 1442695040888963407L) & 0x7FFFFFFFFFFFFFFFL
+    out[i] = ((s >> 33) % span.to_int64()).to_int().to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn repeat_byte(n : Int, b : Int) -> Bytes {
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = b.to_byte()
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn repeat_text(n : Int, text : String) -> Bytes {
+  let t = text.to_bytes()
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = t[i % t.length()]
+    i = i + 1
+  }
+  out
+}
+
+///| libbz2 1.0.8 outputs (Python `bz2.compress`) for `(plain, level, stream)`.
+fn reference_vectors() -> Array[(Bytes, Int, Bytes)] {
+  [
+    (
+      "bzip2 payload data".to_bytes(),
+      6,
+      hex_bytes(
+        "425a6836314159265359837d4d580000039980400010003424c4302000310340d02268f4267a8bbfbb5e9690050c68bb9229c284841bea6ac0",
+      ),
+    ),
+    (Bytes::new(0), 9, hex_bytes("425a683917724538509000000000")),
+    (
+      "hello hello hello hello aaaaaaaaaaaa".to_bytes(),
+      1,
+      hex_bytes(
+        "425a68313141592653593183ff790000085100004040002244a000310c005500571317a4c669c3c5dc914e14240c60ffde40",
+      ),
+    ),
+  ]
+}
+
+///|
+test "compress_matches_libbz2_and_decompress_reads_libbz2_vectors" {
+  for v in reference_vectors() {
+    let (plain, level, stream) = v
+    match compress(plain, level) {
+      Ok(out) => debug_assert(bytes_equal(out, stream), "compress output differs from libbz2")
+      Err(e) => debug_assert(false, e)
+    }
+    match decompress(stream) {
+      Ok(out) => debug_assert(bytes_equal(out, plain), "decompress output differs from plain")
+      Err(e) => debug_assert(false, e)
+    }
+  }
+}
+
+///|
+test "roundtrip_text_binary_runs_and_multiblock_across_levels" {
+  let inputs : Array[Bytes] = [
+    Bytes::new(0),
+    repeat_byte(1, 0x41),
+    repeat_byte(4, 0x41),
+    repeat_byte(5, 0x41),
+    repeat_byte(300, 0),
+    repeat_byte(50000, 0x61),
+    repeat_text(20000, "ab"),
+    repeat_text(30011, "the quick brown fox jumps over the lazy dog. "),
+    lcg_bytes(3000, 7L, 256),
+    lcg_bytes(40000, 11L, 4),
+  ]
+  for level in 1..=9 {
+    for plain in inputs {
+      match compress(plain, level) {
+        Ok(stream) =>
+        match decompress(stream) {
+          Ok(out) => debug_assert(bytes_equal(out, plain), "roundtrip mismatch")
+          Err(e) => debug_assert(false, e)
+        }
+        Err(e) => debug_assert(false, e)
+      }
+    }
+  }
+  // 250 KB at level 1 spans three blocks, including a block carried over mid-run.
+  let big = lcg_bytes(250000, 3L, 3)
+  match compress(big, 1) {
+    Ok(stream) =>
+    match decompress(stream) {
+      Ok(out) => debug_assert(bytes_equal(out, big), "multi-block roundtrip mismatch")
+      Err(e) => debug_assert(false, e)
+    }
+    Err(e) => debug_assert(false, e)
+  }
+}
+
+///|
+test "compress_rejects_levels_outside_1_to_9" {
+  for level in [0, 10, -1] {
+    debug_assert(compress(Bytes::new(1), level).is_err(), "invalid level accepted")
+  }
+}
+
+///|
+test "decompress_rejects_bad_header_magic_crc_and_every_truncation" {
+  let good = hex_bytes(
+    "425a6836314159265359837d4d580000039980400010003424c4302000310340d02268f4267a8bbfbb5e9690050c68bb9229c284841bea6ac0",
+  )
+  let cases : Array[Bytes] = [
+    Bytes::new(0),
+    "BZh".to_bytes(),
+    "BZh0".to_bytes(),
+    "BZhA".to_bytes(),
+    "BZx9".to_bytes(),
+    hex_bytes("425a6839"),
+    hex_bytes("425a68391772453850900000"),
+    hex_bytes("425a683917724538509000000001"),
+    hex_bytes("425a6839ffffffffffff00000000"),
+  ]
+  for c in cases {
+    debug_assert(decompress(c).is_err(), "malformed stream accepted")
+  }
+  // Every strict prefix of a valid stream is truncated.
+  for n in 0..<good.length() {
+    debug_assert(decompress(good.slice(0, n)).is_err(), "truncated stream accepted")
+  }
+}
+
+///| Bit positions (`byte * 8 + bit`) whose single flip libbz2 1.0.8 still decodes to the same plain text:
+///| unused code-length and selector bits plus trailing padding.
+fn libbz2_tolerated_flips() -> Array[Int] {
+  [119, 233, 234, 240, 241, 246, 247, 253, 255, 259, 261, 262, 263, 448, 449, 450]
+}
+
+///|
+test "decompress_accepts_exactly_the_bit_flips_libbz2_accepts" {
+  let good = hex_bytes(
+    "425a6836314159265359837d4d580000039980400010003424c4302000310340d02268f4267a8bbfbb5e9690050c68bb9229c284841bea6ac0",
+  )
+  let tolerated = libbz2_tolerated_flips()
+  let plain = "bzip2 payload data".to_bytes()
+  let mut i = 4
+  while i < good.length() {
+    let mut bit = 0
+    while bit < 8 {
+      let bad = good.slice(0, good.length())
+      bad[i] = (bad[i].to_int() ^ (1 << bit)).to_byte()
+      let mut expect_ok = false
+      for p in tolerated {
+        if p == i * 8 + bit {
+          expect_ok = true
+        }
+      }
+      match decompress(bad) {
+        Ok(out) => debug_assert(expect_ok && bytes_equal(out, plain), "bit flip accepted unlike libbz2")
+        Err(_) => debug_assert(!expect_ok, "bit flip rejected unlike libbz2")
+      }
+      bit = bit + 1
+    }
+    i = i + 1
+  }
+}
+
+///|
+test "decompress_ignores_bytes_after_stream_end" {
+  let stream = hex_bytes("425a683917724538509000000000ff00")
+  match decompress(stream) {
+    Ok(out) => debug_assert(out.length() == 0, "expected empty output")
+    Err(e) => debug_assert(false, e)
+  }
+}

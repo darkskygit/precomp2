@@ -1,0 +1,218 @@
+///| Canonical Huffman code construction and decode tables, matching libbz2 bit for bit.
+
+///| Largest alphabet: 256 MTF values plus RUNA, RUNB and EOB, minus one unused slot.
+let max_alpha_size : Int = 258
+
+///| Size of the per-table `limit` and `base` decode arrays.
+let max_code_len : Int = 23
+
+///|
+fn huff_weight_of(w : Int) -> Int {
+  w & -256
+}
+
+///|
+fn huff_depth_of(w : Int) -> Int {
+  w & 0xFF
+}
+
+///|
+fn huff_add_weights(a : Int, b : Int) -> Int {
+  let da = huff_depth_of(a)
+  let db = huff_depth_of(b)
+  let d = if da > db { da } else { db }
+  (huff_weight_of(a) + huff_weight_of(b)) | (1 + d)
+}
+
+///|
+fn huff_upheap(heap : FixedArray[Int], weight : FixedArray[Int], start : Int) -> Unit {
+  let mut z = start
+  let tmp = heap[z]
+  while weight[tmp] < weight[heap[z >> 1]] {
+    heap[z] = heap[z >> 1]
+    z = z >> 1
+  }
+  heap[z] = tmp
+}
+
+///|
+fn huff_downheap(heap : FixedArray[Int], weight : FixedArray[Int], n_heap : Int, start : Int) -> Unit {
+  let mut z = start
+  let tmp = heap[z]
+  let mut go = true
+  while go {
+    let mut yy = z << 1
+    if yy > n_heap {
+      go = false
+    } else {
+      if yy < n_heap && weight[heap[yy + 1]] < weight[heap[yy]] {
+        yy = yy + 1
+      }
+      if weight[tmp] < weight[heap[yy]] {
+        go = false
+      } else {
+        heap[z] = heap[yy]
+        z = yy
+      }
+    }
+  }
+  heap[z] = tmp
+}
+
+///| Write code lengths for `freq[freq_off ..+ alpha_size]` into `len[len_off ..]`, capped at `max_len` bits.
+fn make_code_lengths(
+  len : FixedArray[Int],
+  len_off : Int,
+  freq : FixedArray[Int],
+  freq_off : Int,
+  alpha_size : Int,
+  max_len : Int,
+) -> Unit {
+  let heap : FixedArray[Int] = FixedArray::make(max_alpha_size + 2, 0)
+  let weight : FixedArray[Int] = FixedArray::make(max_alpha_size * 2, 0)
+  let parent : FixedArray[Int] = FixedArray::make(max_alpha_size * 2, 0)
+  let mut i = 0
+  while i < alpha_size {
+    let f = freq[freq_off + i]
+    weight[i + 1] = (if f == 0 { 1 } else { f }) << 8
+    i = i + 1
+  }
+  let mut done = false
+  while !done {
+    let mut n_nodes = alpha_size
+    let mut n_heap = 0
+    heap[0] = 0
+    weight[0] = 0
+    parent[0] = -2
+    i = 1
+    while i <= alpha_size {
+      parent[i] = -1
+      n_heap = n_heap + 1
+      heap[n_heap] = i
+      huff_upheap(heap, weight, n_heap)
+      i = i + 1
+    }
+    while n_heap > 1 {
+      let n1 = heap[1]
+      heap[1] = heap[n_heap]
+      n_heap = n_heap - 1
+      huff_downheap(heap, weight, n_heap, 1)
+      let n2 = heap[1]
+      heap[1] = heap[n_heap]
+      n_heap = n_heap - 1
+      huff_downheap(heap, weight, n_heap, 1)
+      n_nodes = n_nodes + 1
+      parent[n1] = n_nodes
+      parent[n2] = n_nodes
+      weight[n_nodes] = huff_add_weights(weight[n1], weight[n2])
+      parent[n_nodes] = -1
+      n_heap = n_heap + 1
+      heap[n_heap] = n_nodes
+      huff_upheap(heap, weight, n_heap)
+    }
+    let mut too_long = false
+    i = 1
+    while i <= alpha_size {
+      let mut j = 0
+      let mut k = i
+      while parent[k] >= 0 {
+        k = parent[k]
+        j = j + 1
+      }
+      len[len_off + i - 1] = j
+      if j > max_len {
+        too_long = true
+      }
+      i = i + 1
+    }
+    if too_long {
+      i = 1
+      while i <= alpha_size {
+        weight[i] = (1 + (weight[i] >> 8) / 2) << 8
+        i = i + 1
+      }
+    } else {
+      done = true
+    }
+  }
+}
+
+///| Assign canonical codes to `alpha_size` symbols with lengths in `min_len..=max_len`.
+fn assign_codes(
+  code : FixedArray[Int],
+  len : FixedArray[Int],
+  off : Int,
+  alpha_size : Int,
+  min_len : Int,
+  max_len : Int,
+) -> Unit {
+  let mut vec = 0
+  let mut n = min_len
+  while n <= max_len {
+    let mut i = 0
+    while i < alpha_size {
+      if len[off + i] == n {
+        code[off + i] = vec
+        vec = vec + 1
+      }
+      i = i + 1
+    }
+    vec = vec << 1
+    n = n + 1
+  }
+}
+
+///| Build libbz2 `limit`/`base`/`perm` decode tables for one coding table at `off`.
+fn create_decode_tables(
+  limit : FixedArray[Int],
+  base : FixedArray[Int],
+  perm : FixedArray[Int],
+  off : Int,
+  len : FixedArray[Int],
+  alpha_size : Int,
+  min_len : Int,
+  max_len : Int,
+) -> Unit {
+  let mut pp = 0
+  let mut i = min_len
+  while i <= max_len {
+    let mut j = 0
+    while j < alpha_size {
+      if len[off + j] == i {
+        perm[off + pp] = j
+        pp = pp + 1
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < max_code_len {
+    base[off + i] = 0
+    limit[off + i] = 0
+    i = i + 1
+  }
+  i = 0
+  while i < alpha_size {
+    base[off + len[off + i] + 1] += 1
+    i = i + 1
+  }
+  i = 1
+  while i < max_code_len {
+    base[off + i] += base[off + i - 1]
+    i = i + 1
+  }
+  let mut vec = 0
+  i = min_len
+  while i <= max_len {
+    vec = vec + (base[off + i + 1] - base[off + i])
+    limit[off + i] = vec - 1
+    vec = vec << 1
+    i = i + 1
+  }
+  i = min_len
+  while i < max_len {
+    base[off + i + 1] = 2 * (limit[off + i] + 1) - base[off + i + 1]
+    i = i + 1
+  }
+}

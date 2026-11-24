@@ -1,0 +1,462 @@
+///| bzip2 compressor that reproduces `libbz2-rs-sys` 0.2.3 (work factor 30) output byte for byte:
+///| RLE1 block filling, BWT, MTF + RUNA/RUNB coding, and 2..6 Huffman tables refined over 4 passes.
+
+///| Symbol coding the run-length digit 1 in bijective base 2.
+let run_a : Int = 0
+
+///| Symbol coding the run-length digit 2 in bijective base 2.
+let run_b : Int = 1
+
+///| Symbols per Huffman group.
+let group_size : Int = 50
+
+///| Upper bound on selectors in one block.
+let max_selectors : Int = 18002
+
+///| Compressor state for one stream.
+struct Encoder {
+  nblock_max : Int
+  block : FixedArray[Int]
+  in_use : FixedArray[Bool]
+  sorter : Sorter
+  out : BitWriter
+  mut nblock : Int
+  mut block_crc : UInt
+  mut combined_crc : UInt
+  mut in_ch : Int
+  mut in_len : Int
+}
+
+///|
+fn Encoder::new(level : Int, input_len : Int) -> Encoder {
+  let block_cap = 100000 * level
+  // RLE1 grows data by at most 5/4, so small inputs need small buffers.
+  // Clamp first so `input_len + input_len / 4` cannot overflow `Int`.
+  let bounded = if input_len < block_cap { input_len } else { block_cap }
+  let need = bounded + bounded / 4 + 8
+  let cap = if need < block_cap { need } else { block_cap }
+  Encoder::{
+    nblock_max: block_cap - 19,
+    block: FixedArray::make(cap + n_overshoot, 0),
+    in_use: FixedArray::make(256, false),
+    sorter: Sorter::new(cap),
+    out: BitWriter::new(input_len + input_len / 8 + 64),
+    nblock: 0,
+    block_crc: 0xFFFFFFFFU,
+    combined_crc: 0U,
+    in_ch: 256,
+    in_len: 0,
+  }
+}
+
+///| Append the pending run (`in_ch` repeated `in_len` times) to the block.
+fn enc_add_pair(e : Encoder) -> Unit {
+  let ch = e.in_ch
+  let mut i = 0
+  while i < e.in_len {
+    e.block_crc = crc_update(e.block_crc, ch)
+    i = i + 1
+  }
+  e.in_use[ch] = true
+  if e.in_len <= 3 {
+    i = 0
+    while i < e.in_len {
+      e.block[e.nblock] = ch
+      e.nblock = e.nblock + 1
+      i = i + 1
+    }
+  } else {
+    e.in_use[e.in_len - 4] = true
+    i = 0
+    while i < 4 {
+      e.block[e.nblock] = ch
+      e.nblock = e.nblock + 1
+      i = i + 1
+    }
+    e.block[e.nblock] = e.in_len - 4
+    e.nblock = e.nblock + 1
+  }
+}
+
+///|
+fn enc_add_char(e : Encoder, ch : Int) -> Unit {
+  if ch != e.in_ch && e.in_len == 1 {
+    let prev = e.in_ch
+    e.block_crc = crc_update(e.block_crc, prev)
+    e.in_use[prev] = true
+    e.block[e.nblock] = prev
+    e.nblock = e.nblock + 1
+    e.in_ch = ch
+  } else if ch != e.in_ch || e.in_len == 255 {
+    if e.in_ch < 256 {
+      enc_add_pair(e)
+    }
+    e.in_ch = ch
+    e.in_len = 1
+  } else {
+    e.in_len = e.in_len + 1
+  }
+}
+
+///|
+fn enc_flush_run(e : Encoder) -> Unit {
+  if e.in_ch < 256 {
+    enc_add_pair(e)
+  }
+  e.in_ch = 256
+  e.in_len = 0
+}
+
+///| Compress and emit the current block, then reset block state.
+fn enc_compress_block(e : Encoder) -> Unit {
+  let nblock = e.nblock
+  e.block_crc = e.block_crc ^ 0xFFFFFFFFU
+  e.combined_crc = combine_crc(e.combined_crc, e.block_crc)
+  let orig_ptr = block_sort(e.sorter, e.block, nblock)
+  let w = e.out
+  bw_write(w, 24, 0x314159)
+  bw_write(w, 24, 0x265359)
+  bw_write_u32(w, e.block_crc)
+  bw_write(w, 1, 0)
+  bw_write(w, 24, orig_ptr)
+  let unseq_to_seq : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut n_in_use = 0
+  let mut i = 0
+  while i < 256 {
+    if e.in_use[i] {
+      unseq_to_seq[i] = n_in_use
+      n_in_use = n_in_use + 1
+    }
+    i = i + 1
+  }
+  let mtf_freq : FixedArray[Int] = FixedArray::make(max_alpha_size, 0)
+  let mtfv : FixedArray[Int] = FixedArray::make(nblock + 1, 0)
+  let n_mtf = generate_mtf_values(e, unseq_to_seq, n_in_use, mtfv, mtf_freq)
+  send_mtf_values(e, n_in_use, mtfv, n_mtf, mtf_freq)
+  e.nblock = 0
+  e.block_crc = 0xFFFFFFFFU
+  e.in_use.fill(false)
+}
+
+///| Emit the zero-run length `z_pend` as RUNA/RUNB digits.
+fn mtf_put_run(mtfv : FixedArray[Int], start : Int, mtf_freq : FixedArray[Int], z_pend : Int) -> Int {
+  let mut wr = start
+  let mut z = z_pend - 1
+  let mut go = true
+  while go {
+    let sym = if (z & 1) != 0 { run_b } else { run_a }
+    mtfv[wr] = sym
+    wr = wr + 1
+    mtf_freq[sym] += 1
+    if z < 2 {
+      go = false
+    } else {
+      z = (z - 2) / 2
+    }
+  }
+  wr
+}
+
+///| Turn the sorted block into MTF/RUNA/RUNB/EOB symbols; returns the symbol count.
+fn generate_mtf_values(
+  e : Encoder,
+  unseq_to_seq : FixedArray[Int],
+  n_in_use : Int,
+  mtfv : FixedArray[Int],
+  mtf_freq : FixedArray[Int],
+) -> Int {
+  let nblock = e.nblock
+  let ptr = e.sorter.ptr
+  let block = e.block
+  let eob = n_in_use + 1
+  let yy : FixedArray[Int] = FixedArray::make(256, 0)
+  let mut i = 0
+  while i < n_in_use {
+    yy[i] = i
+    i = i + 1
+  }
+  let mut wr = 0
+  let mut z_pend = 0
+  i = 0
+  while i < nblock {
+    let mut j = ptr[i] - 1
+    if j < 0 {
+      j = j + nblock
+    }
+    let ll_i = unseq_to_seq[block[j]]
+    if yy[0] == ll_i {
+      z_pend = z_pend + 1
+    } else {
+      if z_pend > 0 {
+        wr = mtf_put_run(mtfv, wr, mtf_freq, z_pend)
+        z_pend = 0
+      }
+      let mut rtmp = yy[1]
+      yy[1] = yy[0]
+      let mut k = 1
+      while ll_i != rtmp {
+        k = k + 1
+        let t = yy[k]
+        yy[k] = rtmp
+        rtmp = t
+      }
+      yy[0] = rtmp
+      mtfv[wr] = k + 1
+      wr = wr + 1
+      mtf_freq[k + 1] += 1
+    }
+    i = i + 1
+  }
+  if z_pend > 0 {
+    wr = mtf_put_run(mtfv, wr, mtf_freq, z_pend)
+  }
+  mtfv[wr] = eob
+  mtf_freq[eob] += 1
+  wr + 1
+}
+
+///| Choose and refine Huffman tables, then emit the block's tables and symbols.
+fn send_mtf_values(
+  e : Encoder,
+  n_in_use : Int,
+  mtfv : FixedArray[Int],
+  n_mtf : Int,
+  mtf_freq : FixedArray[Int],
+) -> Unit {
+  let alpha = n_in_use + 2
+  let n_groups = if n_mtf < 200 {
+    2
+  } else if n_mtf < 600 {
+    3
+  } else if n_mtf < 1200 {
+    4
+  } else if n_mtf < 2400 {
+    5
+  } else {
+    6
+  }
+  let len : FixedArray[Int] = FixedArray::make(6 * max_alpha_size, 15)
+  let code : FixedArray[Int] = FixedArray::make(6 * max_alpha_size, 0)
+  let rfreq : FixedArray[Int] = FixedArray::make(6 * max_alpha_size, 0)
+  let cost : FixedArray[Int] = FixedArray::make(6, 0)
+  let selector : FixedArray[Int] = FixedArray::make(max_selectors, 0)
+  // Initial tables: split the symbol range into slices of roughly equal frequency.
+  let mut n_part = n_groups
+  let mut rem_f = n_mtf
+  let mut gs = 0
+  while n_part > 0 {
+    let t_freq = rem_f / n_part
+    let mut ge = gs - 1
+    let mut a_freq = 0
+    while a_freq < t_freq && ge < alpha - 1 {
+      ge = ge + 1
+      a_freq = a_freq + mtf_freq[ge]
+    }
+    if ge > gs && n_part != n_groups && n_part != 1 && (n_groups - n_part) % 2 == 1 {
+      a_freq = a_freq - mtf_freq[ge]
+      ge = ge - 1
+    }
+    let off = (n_part - 1) * max_alpha_size
+    let mut v = 0
+    while v < alpha {
+      len[off + v] = if v >= gs && v <= ge { 0 } else { 15 }
+      v = v + 1
+    }
+    n_part = n_part - 1
+    gs = ge + 1
+    rem_f = rem_f - a_freq
+  }
+  // Refine: assign each group to its cheapest table and rebuild tables from the counts.
+  let mut n_selectors = 0
+  let mut iter = 0
+  while iter < 4 {
+    rfreq.fill(0)
+    n_selectors = 0
+    gs = 0
+    while gs < n_mtf {
+      let mut ge = gs + group_size - 1
+      if ge >= n_mtf {
+        ge = n_mtf - 1
+      }
+      let mut t = 0
+      while t < n_groups {
+        let off = t * max_alpha_size
+        let mut c = 0
+        let mut i = gs
+        while i <= ge {
+          c = c + len[off + mtfv[i]]
+          i = i + 1
+        }
+        cost[t] = c
+        t = t + 1
+      }
+      let mut bc = 999999999
+      let mut bt = 0
+      t = 0
+      while t < n_groups {
+        if cost[t] < bc {
+          bc = cost[t]
+          bt = t
+        }
+        t = t + 1
+      }
+      selector[n_selectors] = bt
+      n_selectors = n_selectors + 1
+      let off = bt * max_alpha_size
+      let mut i = gs
+      while i <= ge {
+        rfreq[off + mtfv[i]] += 1
+        i = i + 1
+      }
+      gs = ge + 1
+    }
+    let mut t = 0
+    while t < n_groups {
+      make_code_lengths(len, t * max_alpha_size, rfreq, t * max_alpha_size, alpha, 17)
+      t = t + 1
+    }
+    iter = iter + 1
+  }
+  // Canonical codes per table.
+  let mut t = 0
+  while t < n_groups {
+    let off = t * max_alpha_size
+    let mut min_len = 32
+    let mut max_len = 0
+    let mut i = 0
+    while i < alpha {
+      let l = len[off + i]
+      if l > max_len {
+        max_len = l
+      }
+      if l < min_len {
+        min_len = l
+      }
+      i = i + 1
+    }
+    assign_codes(code, len, off, alpha, min_len, max_len)
+    t = t + 1
+  }
+  let w = e.out
+  // Symbol map: 16 coarse bits, then 16 fine bits for each used range.
+  let mut i = 0
+  while i < 16 {
+    bw_write(w, 1, if range_in_use(e.in_use, i) { 1 } else { 0 })
+    i = i + 1
+  }
+  i = 0
+  while i < 16 {
+    if range_in_use(e.in_use, i) {
+      let mut j = 0
+      while j < 16 {
+        bw_write(w, 1, if e.in_use[i * 16 + j] { 1 } else { 0 })
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  // Selectors, MTF-coded in unary.
+  bw_write(w, 3, n_groups)
+  bw_write(w, 15, n_selectors)
+  let pos : FixedArray[Int] = [0, 1, 2, 3, 4, 5]
+  i = 0
+  while i < n_selectors {
+    let ll_i = selector[i]
+    let mut j = 0
+    let mut tmp = pos[0]
+    while ll_i != tmp {
+      j = j + 1
+      let tmp2 = tmp
+      tmp = pos[j]
+      pos[j] = tmp2
+    }
+    pos[0] = tmp
+    let mut k = 0
+    while k < j {
+      bw_write(w, 1, 1)
+      k = k + 1
+    }
+    bw_write(w, 1, 0)
+    i = i + 1
+  }
+  // Code lengths, delta-coded.
+  t = 0
+  while t < n_groups {
+    let off = t * max_alpha_size
+    let mut curr = len[off]
+    bw_write(w, 5, curr)
+    i = 0
+    while i < alpha {
+      let target = len[off + i]
+      while curr < target {
+        bw_write(w, 2, 2)
+        curr = curr + 1
+      }
+      while curr > target {
+        bw_write(w, 2, 3)
+        curr = curr - 1
+      }
+      bw_write(w, 1, 0)
+      i = i + 1
+    }
+    t = t + 1
+  }
+  // Block data.
+  let mut sel = 0
+  gs = 0
+  while gs < n_mtf {
+    let mut ge = gs + group_size - 1
+    if ge >= n_mtf {
+      ge = n_mtf - 1
+    }
+    let off = selector[sel] * max_alpha_size
+    i = gs
+    while i <= ge {
+      let v = mtfv[i]
+      bw_write(w, len[off + v], code[off + v])
+      i = i + 1
+    }
+    gs = ge + 1
+    sel = sel + 1
+  }
+}
+
+///|
+fn range_in_use(in_use : FixedArray[Bool], r : Int) -> Bool {
+  let mut j = 0
+  while j < 16 {
+    if in_use[r * 16 + j] {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+///| Compress `input` into a single bzip2 stream with block size `level * 100000`.
+fn compress_stream(input : Bytes, level : Int) -> Bytes {
+  let e = Encoder::new(level, input.length())
+  let w = e.out
+  bw_write(w, 24, 0x425A68)
+  bw_write(w, 8, 0x30 + level)
+  let n = input.length()
+  let mut i = 0
+  while i < n {
+    if e.nblock >= e.nblock_max {
+      enc_compress_block(e)
+    }
+    enc_add_char(e, input[i].to_int())
+    i = i + 1
+  }
+  if e.nblock >= e.nblock_max {
+    enc_compress_block(e)
+  }
+  enc_flush_run(e)
+  if e.nblock > 0 {
+    enc_compress_block(e)
+  }
+  bw_write(w, 24, 0x177245)
+  bw_write(w, 24, 0x385090)
+  bw_write_u32(w, e.combined_crc)
+  bw_finish(w)
+}

@@ -1,0 +1,266 @@
+///| libbz2 fallback block sort: bucket refinement by prefix doubling, used for small or highly
+///| repetitive blocks. Worst case O(n log^2 n), independent of input structure.
+
+///|
+fn bh_isset(bhtab : FixedArray[Int], z : Int) -> Bool {
+  (bhtab[z >> 5] & (1 << (z & 31))) != 0
+}
+
+///|
+fn bh_set(bhtab : FixedArray[Int], z : Int) -> Unit {
+  bhtab[z >> 5] = bhtab[z >> 5] | (1 << (z & 31))
+}
+
+///|
+fn bh_clear(bhtab : FixedArray[Int], z : Int) -> Unit {
+  bhtab[z >> 5] = bhtab[z >> 5] & ((1 << (z & 31)) ^ -1)
+}
+
+///|
+fn fallback_simple_sort(fmap : FixedArray[Int], eclass : FixedArray[Int], lo : Int, hi : Int) -> Unit {
+  if lo == hi {
+    return
+  }
+  if hi - lo > 3 {
+    let mut i = hi - 4
+    while i >= lo {
+      let tmp = fmap[i]
+      let ec_tmp = eclass[tmp]
+      let mut j = i + 4
+      while j <= hi && ec_tmp > eclass[fmap[j]] {
+        fmap[j - 4] = fmap[j]
+        j = j + 4
+      }
+      fmap[j - 4] = tmp
+      i = i - 1
+    }
+  }
+  let mut i = hi - 1
+  while i >= lo {
+    let tmp = fmap[i]
+    let ec_tmp = eclass[tmp]
+    let mut j = i + 1
+    while j <= hi && ec_tmp > eclass[fmap[j]] {
+      fmap[j - 1] = fmap[j]
+      j = j + 1
+    }
+    fmap[j - 1] = tmp
+    i = i - 1
+  }
+}
+
+///|
+fn fallback_vswap(fmap : FixedArray[Int], p1 : Int, p2 : Int, n : Int) -> Unit {
+  let mut a = p1
+  let mut b = p2
+  let mut k = n
+  while k > 0 {
+    fmap.swap(a, b)
+    a = a + 1
+    b = b + 1
+    k = k - 1
+  }
+}
+
+///|
+fn fallback_qsort3(fmap : FixedArray[Int], eclass : FixedArray[Int], lo_st : Int, hi_st : Int) -> Unit {
+  let stack_lo : FixedArray[Int] = FixedArray::make(100, 0)
+  let stack_hi : FixedArray[Int] = FixedArray::make(100, 0)
+  let mut r = 0
+  let mut sp = 1
+  stack_lo[0] = lo_st
+  stack_hi[0] = hi_st
+  while sp > 0 {
+    sp = sp - 1
+    let lo = stack_lo[sp]
+    let hi = stack_hi[sp]
+    if hi - lo < 10 {
+      fallback_simple_sort(fmap, eclass, lo, hi)
+      continue
+    }
+    r = (r * 7621 + 1) % 32768
+    let pick = r % 3
+    let index = if pick == 0 {
+      fmap[lo]
+    } else if pick == 1 {
+      fmap[(lo + hi) >> 1]
+    } else {
+      fmap[hi]
+    }
+    let med = eclass[index]
+    let mut lt_lo = lo
+    let mut un_lo = lo
+    let mut gt_hi = hi
+    let mut un_hi = hi
+    let mut go = true
+    while go {
+      let mut scan = true
+      while scan && un_lo <= un_hi {
+        let a = eclass[fmap[un_lo]]
+        if a > med {
+          scan = false
+        } else if a == med {
+          fmap.swap(un_lo, lt_lo)
+          lt_lo = lt_lo + 1
+          un_lo = un_lo + 1
+        } else {
+          un_lo = un_lo + 1
+        }
+      }
+      scan = true
+      while scan && un_lo <= un_hi {
+        let a = eclass[fmap[un_hi]]
+        if a < med {
+          scan = false
+        } else if a == med {
+          fmap.swap(un_hi, gt_hi)
+          gt_hi = gt_hi - 1
+          un_hi = un_hi - 1
+        } else {
+          un_hi = un_hi - 1
+        }
+      }
+      if un_lo > un_hi {
+        go = false
+      } else {
+        fmap.swap(un_lo, un_hi)
+        un_lo = un_lo + 1
+        un_hi = un_hi - 1
+      }
+    }
+    if gt_hi < lt_lo {
+      continue
+    }
+    let n0 = if lt_lo - lo < un_lo - lt_lo { lt_lo - lo } else { un_lo - lt_lo }
+    fallback_vswap(fmap, lo, un_lo - n0, n0)
+    let m0 = if hi - gt_hi < gt_hi - un_hi { hi - gt_hi } else { gt_hi - un_hi }
+    fallback_vswap(fmap, un_lo, hi - m0 + 1, m0)
+    let n = lo + un_lo - lt_lo - 1
+    let m = hi - (gt_hi - un_hi) + 1
+    if n - lo > hi - m {
+      stack_lo[sp] = lo
+      stack_hi[sp] = n
+      stack_lo[sp + 1] = m
+      stack_hi[sp + 1] = hi
+    } else {
+      stack_lo[sp] = m
+      stack_hi[sp] = hi
+      stack_lo[sp + 1] = lo
+      stack_hi[sp + 1] = n
+    }
+    sp = sp + 2
+  }
+}
+
+///| Prefix-doubling sort of `block[0..nblock]` into `s.ptr`.
+fn fallback_sort(s : Sorter, block : FixedArray[Int], nblock : Int) -> Unit {
+  let fmap = s.ptr
+  let eclass = s.eclass
+  let bhtab = s.bhtab
+  let ftab : FixedArray[Int] = FixedArray::make(257, 0)
+  let mut i = 0
+  while i < nblock {
+    ftab[block[i]] += 1
+    i = i + 1
+  }
+  i = 1
+  while i < 257 {
+    ftab[i] += ftab[i - 1]
+    i = i + 1
+  }
+  i = 0
+  while i < nblock {
+    let c = block[i]
+    let k = ftab[c] - 1
+    ftab[c] = k
+    fmap[k] = i
+    i = i + 1
+  }
+  let words = (nblock + 64) / 32 + 2
+  i = 0
+  while i < words {
+    bhtab[i] = 0
+    i = i + 1
+  }
+  i = 0
+  while i < 256 {
+    bh_set(bhtab, ftab[i])
+    i = i + 1
+  }
+  i = 0
+  while i < 32 {
+    bh_set(bhtab, nblock + 2 * i)
+    bh_clear(bhtab, nblock + 2 * i + 1)
+    i = i + 1
+  }
+  let mut h = 1
+  let mut more = true
+  while more {
+    let mut j = 0
+    i = 0
+    while i < nblock {
+      if bh_isset(bhtab, i) {
+        j = i
+      }
+      let mut k = fmap[i] - h
+      if k < 0 {
+        k = k + nblock
+      }
+      eclass[k] = j
+      i = i + 1
+    }
+    let mut n_not_done = 0
+    let mut r = -1
+    let mut scanning = true
+    while scanning {
+      let mut k = r + 1
+      while bh_isset(bhtab, k) && (k & 31) != 0 {
+        k = k + 1
+      }
+      if bh_isset(bhtab, k) {
+        while bhtab[k >> 5] == -1 {
+          k = k + 32
+        }
+        while bh_isset(bhtab, k) {
+          k = k + 1
+        }
+      }
+      let l = k - 1
+      if l >= nblock {
+        break
+      }
+      while !bh_isset(bhtab, k) && (k & 31) != 0 {
+        k = k + 1
+      }
+      if !bh_isset(bhtab, k) {
+        while bhtab[k >> 5] == 0 {
+          k = k + 32
+        }
+        while !bh_isset(bhtab, k) {
+          k = k + 1
+        }
+      }
+      r = k - 1
+      if r >= nblock {
+        scanning = false
+      } else if r > l {
+        n_not_done = n_not_done + (r - l + 1)
+        fallback_qsort3(fmap, eclass, l, r)
+        let mut cc = -1
+        let mut q = l
+        while q <= r {
+          let cc1 = eclass[fmap[q]]
+          if cc != cc1 {
+            bh_set(bhtab, q)
+            cc = cc1
+          }
+          q = q + 1
+        }
+      }
+    }
+    h = h * 2
+    if h > nblock || n_not_done == 0 {
+      more = false
+    }
+  }
+}

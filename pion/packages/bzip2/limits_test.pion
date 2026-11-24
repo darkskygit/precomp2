@@ -1,0 +1,84 @@
+///| Decoder bound tests: `decompress_limited` output caps and RLE1 runs cut off at a block end.
+
+///|
+test "decompress_limited_rejects_bombs_and_negative_limits_and_allows_exact_limit" {
+  // 4,000,000 zero bytes compress to a tiny stream of long RLE1 runs.
+  let plain = repeat_byte(4000000, 0)
+  let stream = match compress(plain, 9) {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, e)
+      Bytes::new(0)
+    }
+  }
+  debug_assert(stream.length() < 128, "bomb stream should be tiny")
+  debug_assert(decompress_limited(stream, 65536).is_err(), "bomb accepted under 64 KiB limit")
+  debug_assert(decompress_limited(stream, 3999999).is_err(), "output one byte over the limit accepted")
+  debug_assert(decompress_limited(stream, -1).is_err(), "negative limit accepted")
+  match decompress_limited(stream, 4000000) {
+    Ok(out) => debug_assert(bytes_equal(out, plain), "exact-limit output differs")
+    Err(e) => debug_assert(false, e)
+  }
+  // Literal bytes count against the limit too.
+  let text = "bzip2 payload data".to_bytes()
+  match compress(text, 1) {
+    Ok(s) => {
+      debug_assert(decompress_limited(s, text.length() - 1).is_err(), "literal overflow accepted")
+      debug_assert(decompress_limited(s, text.length()).is_ok(), "exact literal limit rejected")
+      debug_assert(decompress_limited(Bytes::new(0), 0).is_err(), "empty input accepted")
+    }
+    Err(e) => debug_assert(false, e)
+  }
+}
+
+///| Encode `block` (already RLE1-coded) as a one-block stream whose CRC covers `plain`.
+fn raw_block_stream(block : Array[Int], plain : Bytes) -> Bytes {
+  let e = Encoder::new(1, block.length())
+  bw_write(e.out, 24, 0x425A68)
+  bw_write(e.out, 8, 0x31)
+  for i, v in block {
+    e.block[i] = v
+    e.in_use[v] = true
+  }
+  e.nblock = block.length()
+  let mut i = 0
+  while i < plain.length() {
+    e.block_crc = crc_update(e.block_crc, plain[i].to_int())
+    i = i + 1
+  }
+  enc_compress_block(e)
+  bw_write(e.out, 24, 0x177245)
+  bw_write(e.out, 24, 0x385090)
+  bw_write_u32(e.out, e.combined_crc)
+  bw_finish(e.out)
+}
+
+///|
+test "decompress_rejects_block_ending_in_four_equal_bytes_without_run_count" {
+  let a = 0x61
+  let cut = raw_block_stream([a, a, a, a], "aaaa".to_bytes())
+  match decompress(cut) {
+    Ok(_) => debug_assert(false, "unfinished RLE1 run accepted")
+    Err(e) => debug_assert(e == "bzip2: truncated RLE1 run at block end", e)
+  }
+  let whole = raw_block_stream([a, a, a, a, 2], "aaaaaa".to_bytes())
+  match decompress(whole) {
+    Ok(out) => debug_assert(bytes_equal(out, "aaaaaa".to_bytes()), "finished RLE1 run misdecoded")
+    Err(e) => debug_assert(false, e)
+  }
+  let three = raw_block_stream([a, a, a], "aaa".to_bytes())
+  match decompress(three) {
+    Ok(out) => debug_assert(bytes_equal(out, "aaa".to_bytes()), "three-byte run misdecoded")
+    Err(e) => debug_assert(false, e)
+  }
+}
+
+///|
+test "out_next_cap_saturates_above_1gib_without_signed_overflow" {
+  let gib = 1073741824
+  let limit_1_5gib = 1610612736
+  debug_assert(out_next_cap(gib, gib + 1, limit_1_5gib) == limit_1_5gib, "1 GiB growth must saturate to 1.5 GiB")
+  debug_assert(out_next_cap(gib, gib + 1, 2147483647) == 2147483647, "1 GiB growth must saturate to Int max")
+  debug_assert(out_next_cap(256, 257, 4096) == 512, "normal doubling must double")
+  debug_assert(out_next_cap(256, 1000, 4096) == 1000, "large single jump must satisfy need")
+}

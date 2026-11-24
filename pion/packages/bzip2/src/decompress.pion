@@ -1,0 +1,423 @@
+///| bzip2 stream decoder with libbz2 acceptance rules: Huffman/selector/MTF decoding, inverse BWT,
+///| RLE1 expansion, legacy randomized blocks, and block plus stream CRC checks.
+
+///| Per-stream decode workspace, reused across blocks.
+struct Decoder {
+  r : BitReader
+  level : Int
+  tt : FixedArray[Int]
+  in_use : FixedArray[Bool]
+  seq_to_unseq : FixedArray[Int]
+  selector : FixedArray[Int]
+  len : FixedArray[Int]
+  limit : FixedArray[Int]
+  base : FixedArray[Int]
+  perm : FixedArray[Int]
+  min_lens : FixedArray[Int]
+  unzftab : FixedArray[Int]
+  cftab : FixedArray[Int]
+  yy : FixedArray[Int]
+  mut alpha : Int
+}
+
+///| Decode one Huffman symbol with table `t`; returns -1 on an invalid code.
+fn dec_symbol(d : Decoder, t : Int) -> Int {
+  let off = t * max_alpha_size
+  let mut zn = d.min_lens[t]
+  let mut zvec = br_bits(d.r, zn)
+  while true {
+    if zn > 20 {
+      return -1
+    }
+    if zvec <= d.limit[off + zn] {
+      break
+    }
+    zn = zn + 1
+    zvec = (zvec << 1) | br_bit(d.r)
+  }
+  let idx = zvec - d.base[off + zn]
+  if idx < 0 || idx >= d.alpha {
+    return -1
+  }
+  d.perm[off + idx]
+}
+
+///| Read the symbol map, selectors and code tables. Returns `(n_in_use, n_groups, n_selectors)`.
+fn dec_tables(d : Decoder) -> Result[(Int, Int, Int), String] {
+  let r = d.r
+  d.in_use.fill(false)
+  let in_use16 = br_bits(r, 16)
+  let mut i = 0
+  while i < 16 {
+    if (in_use16 & (0x8000 >> i)) != 0 {
+      let bits = br_bits(r, 16)
+      let mut j = 0
+      while j < 16 {
+        if (bits & (0x8000 >> j)) != 0 {
+          d.in_use[i * 16 + j] = true
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  let mut n_in_use = 0
+  i = 0
+  while i < 256 {
+    if d.in_use[i] {
+      d.seq_to_unseq[n_in_use] = i
+      n_in_use = n_in_use + 1
+    }
+    i = i + 1
+  }
+  if n_in_use == 0 {
+    return Err("bzip2: block uses no symbols")
+  }
+  let alpha = n_in_use + 2
+  d.alpha = alpha
+  let n_groups = br_bits(r, 3)
+  if n_groups < 2 || n_groups > 6 {
+    return Err("bzip2: invalid Huffman table count")
+  }
+  let mut n_selectors = br_bits(r, 15)
+  if n_selectors < 1 {
+    return Err("bzip2: no selectors")
+  }
+  let pos : FixedArray[Int] = [0, 1, 2, 3, 4, 5]
+  i = 0
+  while i < n_selectors {
+    let mut j = 0
+    while br_bit(r) == 1 {
+      j = j + 1
+      if j >= n_groups {
+        return Err("bzip2: invalid selector")
+      }
+    }
+    if i < max_selectors {
+      // Undo the selector MTF inline.
+      let v = pos[j]
+      let mut k = j
+      while k > 0 {
+        pos[k] = pos[k - 1]
+        k = k - 1
+      }
+      pos[0] = v
+      d.selector[i] = v
+    }
+    if r.overrun {
+      return Err("bzip2: truncated stream")
+    }
+    i = i + 1
+  }
+  if n_selectors > max_selectors {
+    n_selectors = max_selectors
+  }
+  let mut t = 0
+  while t < n_groups {
+    let off = t * max_alpha_size
+    let mut curr = br_bits(r, 5)
+    i = 0
+    while i < alpha {
+      while true {
+        if curr < 1 || curr > 20 {
+          return Err("bzip2: invalid code length")
+        }
+        if br_bit(r) == 0 {
+          break
+        }
+        if br_bit(r) == 0 {
+          curr = curr + 1
+        } else {
+          curr = curr - 1
+        }
+      }
+      d.len[off + i] = curr
+      i = i + 1
+    }
+    let mut min_len = 32
+    let mut max_len = 0
+    i = 0
+    while i < alpha {
+      let l = d.len[off + i]
+      if l > max_len {
+        max_len = l
+      }
+      if l < min_len {
+        min_len = l
+      }
+      i = i + 1
+    }
+    create_decode_tables(d.limit, d.base, d.perm, off, d.len, alpha, min_len, max_len)
+    d.min_lens[t] = min_len
+    t = t + 1
+  }
+  if r.overrun {
+    return Err("bzip2: truncated stream")
+  }
+  Ok((n_in_use, n_groups, n_selectors))
+}
+
+///| Decode the MTF/RLE symbol stream into `d.tt`; returns `nblock`.
+fn dec_symbols(d : Decoder, n_in_use : Int, n_selectors : Int) -> Result[Int, String] {
+  let r = d.r
+  let tt = d.tt
+  let yy = d.yy
+  let unzftab = d.unzftab
+  let nblock_max = 100000 * d.level
+  let eob = n_in_use + 1
+  let mut i = 0
+  while i < 256 {
+    yy[i] = i
+    unzftab[i] = 0
+    i = i + 1
+  }
+  let mut group_no = -1
+  let mut group_pos = 0
+  let mut table = 0
+  let mut nblock = 0
+  let mut next_sym = 0
+  let mut need = true
+  while true {
+    if need {
+      if group_pos == 0 {
+        group_no = group_no + 1
+        if group_no >= n_selectors {
+          return Err("bzip2: selector overflow")
+        }
+        if r.overrun {
+          return Err("bzip2: truncated stream")
+        }
+        group_pos = group_size
+        table = d.selector[group_no]
+      }
+      group_pos = group_pos - 1
+      next_sym = dec_symbol(d, table)
+      if next_sym < 0 {
+        return Err("bzip2: invalid Huffman code")
+      }
+    }
+    need = true
+    if next_sym == eob {
+      break
+    }
+    if next_sym == run_a || next_sym == run_b {
+      let mut es = -1
+      let mut n = 1
+      while next_sym == run_a || next_sym == run_b {
+        if n >= 2097152 {
+          return Err("bzip2: run too long")
+        }
+        es = es + (if next_sym == run_a { n } else { 2 * n })
+        n = n * 2
+        if group_pos == 0 {
+          group_no = group_no + 1
+          if group_no >= n_selectors {
+            return Err("bzip2: selector overflow")
+          }
+          if r.overrun {
+            return Err("bzip2: truncated stream")
+          }
+          group_pos = group_size
+          table = d.selector[group_no]
+        }
+        group_pos = group_pos - 1
+        next_sym = dec_symbol(d, table)
+        if next_sym < 0 {
+          return Err("bzip2: invalid Huffman code")
+        }
+      }
+      es = es + 1
+      let uc = d.seq_to_unseq[yy[0]]
+      if nblock + es > nblock_max {
+        return Err("bzip2: block exceeds declared size")
+      }
+      unzftab[uc] += es
+      let end = nblock + es
+      while nblock < end {
+        tt[nblock] = uc
+        nblock = nblock + 1
+      }
+      need = false
+      continue
+    }
+    if nblock >= nblock_max {
+      return Err("bzip2: block exceeds declared size")
+    }
+    let nn = next_sym - 1
+    let v = yy[nn]
+    let mut k = nn
+    while k > 0 {
+      yy[k] = yy[k - 1]
+      k = k - 1
+    }
+    yy[0] = v
+    let uc = d.seq_to_unseq[v]
+    unzftab[uc] += 1
+    tt[nblock] = uc
+    nblock = nblock + 1
+  }
+  if r.overrun {
+    return Err("bzip2: truncated stream")
+  }
+  Ok(nblock)
+}
+
+///| Decode one block into `out`; returns the block CRC.
+fn dec_block(d : Decoder, out : OutBuf) -> Result[UInt, String] {
+  let r = d.r
+  let stored_crc = br_u32(r)
+  let randomised = br_bit(r) == 1
+  let orig_ptr = br_bits(r, 24)
+  if orig_ptr > 10 + 100000 * d.level {
+    return Err("bzip2: invalid origPtr")
+  }
+  let (n_in_use, _, n_selectors) = dec_tables(d)?
+  let nblock = dec_symbols(d, n_in_use, n_selectors)?
+  if orig_ptr >= nblock {
+    return Err("bzip2: invalid origPtr")
+  }
+  let tt = d.tt
+  let cftab = d.cftab
+  cftab[0] = 0
+  let mut i = 1
+  while i <= 256 {
+    cftab[i] = cftab[i - 1] + d.unzftab[i - 1]
+    i = i + 1
+  }
+  i = 0
+  while i < nblock {
+    let uc = tt[i] & 0xFF
+    let p = cftab[uc]
+    tt[p] = tt[p] | (i << 8)
+    cftab[uc] = p + 1
+    i = i + 1
+  }
+  // Walk the inverse BWT and undo RLE1 in one pass.
+  let mut t_pos = tt[orig_ptr] >> 8
+  let mut crc : UInt = 0xFFFFFFFFU
+  let mut r_to_go = 0
+  let mut r_t_pos = 0
+  let mut prev = -1
+  let mut run = 0
+  i = 0
+  while i < nblock {
+    t_pos = tt[t_pos]
+    let mut ch = t_pos & 0xFF
+    t_pos = t_pos >> 8
+    if randomised {
+      if r_to_go == 0 {
+        r_to_go = rand_nums[r_t_pos]
+        r_t_pos = r_t_pos + 1
+        if r_t_pos == 512 {
+          r_t_pos = 0
+        }
+      }
+      r_to_go = r_to_go - 1
+      if r_to_go == 1 {
+        ch = ch ^ 1
+      }
+    }
+    if run == 4 {
+      if ch > out.limit - out.len {
+        return Err("bzip2: output exceeds limit")
+      }
+      out_fill(out, prev, ch)
+      let mut k = 0
+      while k < ch {
+        crc = crc_update(crc, prev)
+        k = k + 1
+      }
+      run = 0
+    } else {
+      if out.len >= out.limit {
+        return Err("bzip2: output exceeds limit")
+      }
+      if ch == prev {
+        run = run + 1
+      } else {
+        prev = ch
+        run = 1
+      }
+      out_fill(out, ch, 1)
+      crc = crc_update(crc, ch)
+    }
+    i = i + 1
+  }
+  // A block cannot end between four equal bytes and their repeat count.
+  if run == 4 {
+    return Err("bzip2: truncated RLE1 run at block end")
+  }
+  crc = crc ^ 0xFFFFFFFFU
+  if crc != stored_crc {
+    return Err("bzip2: block CRC mismatch")
+  }
+  Ok(crc)
+}
+
+///| Decode the first bzip2 stream in `input` into at most `max_out` bytes.
+///| Bytes after its end-of-stream marker are ignored.
+fn decompress_stream(input : Bytes, max_out : Int) -> Result[Bytes, String] {
+  if max_out < 0 {
+    return Err("bzip2: negative output limit")
+  }
+  if input.length() < 4 || input[0].to_int() != 0x42 || input[1].to_int() != 0x5A || input[2].to_int() != 0x68 {
+    return Err("bzip2: missing BZh header")
+  }
+  let level = input[3].to_int() - 0x30
+  if level < 1 || level > 9 {
+    return Err("bzip2: invalid block size")
+  }
+  let r = BitReader::{ data: input, pos: 4, bits: 0U, live: 0, overrun: false }
+  // Start near a typical 4x ratio; the buffer grows on demand up to `max_out`.
+  let hint = if input.length() > 4194304 { 16777216 } else { input.length() * 4 }
+  let out = OutBuf::new(hint, max_out)
+  let mut dec : Option[Decoder] = None
+  let mut combined : UInt = 0U
+  while true {
+    let m1 = br_bits(r, 24)
+    let m2 = br_bits(r, 24)
+    if r.overrun {
+      return Err("bzip2: truncated stream")
+    }
+    if m1 == 0x177245 && m2 == 0x385090 {
+      let stored = br_u32(r)
+      if r.overrun {
+        return Err("bzip2: truncated stream")
+      }
+      if stored != combined {
+        return Err("bzip2: stream CRC mismatch")
+      }
+      break
+    }
+    if m1 != 0x314159 || m2 != 0x265359 {
+      return Err("bzip2: invalid block magic")
+    }
+    let d = match dec {
+      Some(d) => d
+      None => {
+        let fresh = Decoder::{
+          r,
+          level,
+          tt: FixedArray::make(100000 * level, 0),
+          in_use: FixedArray::make(256, false),
+          seq_to_unseq: FixedArray::make(256, 0),
+          selector: FixedArray::make(max_selectors, 0),
+          len: FixedArray::make(6 * max_alpha_size, 0),
+          limit: FixedArray::make(6 * max_alpha_size, 0),
+          base: FixedArray::make(6 * max_alpha_size, 0),
+          perm: FixedArray::make(6 * max_alpha_size, 0),
+          min_lens: FixedArray::make(6, 0),
+          unzftab: FixedArray::make(256, 0),
+          cftab: FixedArray::make(257, 0),
+          yy: FixedArray::make(256, 0),
+          alpha: 0,
+        }
+        dec = Some(fresh)
+        fresh
+      }
+    }
+    let block_crc = dec_block(d, out)?
+    combined = combine_crc(combined, block_crc)
+  }
+  Ok(out.buf.slice(0, out.len))
+}

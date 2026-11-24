@@ -1,0 +1,129 @@
+///| Bit-level I/O: MSB-first bit writer and reader, and the bounded decoder output buffer.
+
+///| MSB-first bit writer over a growable byte buffer.
+struct BitWriter {
+  mut buf : Bytes
+  mut len : Int
+  mut bits : UInt
+  mut live : Int
+}
+
+///|
+fn BitWriter::new(cap : Int) -> BitWriter {
+  BitWriter::{ buf: Bytes::new(if cap < 64 { 64 } else { cap }), len: 0, bits: 0U, live: 0 }
+}
+
+///|
+fn bw_push_byte(w : BitWriter, b : Int) -> Unit {
+  if w.len == w.buf.length() {
+    w.buf = w.buf.concat(Bytes::new(w.buf.length()))
+  }
+  w.buf[w.len] = b.to_byte()
+  w.len = w.len + 1
+}
+
+///| Append the low `n` (`<= 24`) bits of `v`.
+fn bw_write(w : BitWriter, n : Int, v : Int) -> Unit {
+  w.bits = (w.bits << n) | v.to_uint()
+  w.live = w.live + n
+  while w.live >= 8 {
+    w.live = w.live - 8
+    bw_push_byte(w, (w.bits >> w.live).to_int() & 0xFF)
+  }
+}
+
+///|
+fn bw_write_u32(w : BitWriter, v : UInt) -> Unit {
+  bw_write(w, 16, (v >> 16).to_int() & 0xFFFF)
+  bw_write(w, 16, v.to_int() & 0xFFFF)
+}
+
+///| Zero-pad to a byte boundary and return the written bytes.
+fn bw_finish(w : BitWriter) -> Bytes {
+  if w.live > 0 {
+    bw_write(w, 8 - w.live, 0)
+  }
+  w.buf.slice(0, w.len)
+}
+
+///| MSB-first bit reader. Reads past the end yield zero bits and set `overrun`.
+struct BitReader {
+  data : Bytes
+  mut pos : Int
+  mut bits : UInt
+  mut live : Int
+  mut overrun : Bool
+}
+
+///| Read `n` (`1..=24`) bits.
+fn br_bits(r : BitReader, n : Int) -> Int {
+  while r.live < n {
+    let b = if r.pos < r.data.length() {
+      r.data[r.pos].to_int()
+    } else {
+      r.overrun = true
+      0
+    }
+    r.pos = r.pos + 1
+    r.bits = (r.bits << 8) | b.to_uint()
+    r.live = r.live + 8
+  }
+  r.live = r.live - n
+  ((r.bits >> r.live) & ((1U << n) - 1U)).to_int()
+}
+
+///|
+fn br_bit(r : BitReader) -> Int {
+  br_bits(r, 1)
+}
+
+///|
+fn br_u32(r : BitReader) -> UInt {
+  let hi = br_bits(r, 16).to_uint()
+  let lo = br_bits(r, 16).to_uint()
+  (hi << 16) | lo
+}
+
+///| Output buffer that grows by doubling but never past `limit` bytes.
+struct OutBuf {
+  mut buf : Bytes
+  mut len : Int
+  limit : Int
+}
+
+///|
+fn OutBuf::new(hint : Int, limit : Int) -> OutBuf {
+  let mut cap = if hint < 256 { 256 } else if hint > 16777216 { 16777216 } else { hint }
+  if cap > limit {
+    cap = limit
+  }
+  OutBuf::{ buf: Bytes::new(cap), len: 0, limit }
+}
+
+///| Compute next buffer capacity for `need <= limit` without signed-`Int` doubling overflow.
+fn out_next_cap(cur : Int, need : Int, limit : Int) -> Int {
+  let mut cap = if cur > limit / 2 { limit } else { cur * 2 }
+  if cap < need {
+    cap = need
+  }
+  if cap > limit {
+    cap = limit
+  }
+  cap
+}
+
+///| Append `count` copies of byte `b`; the caller guarantees `len + count <= limit`.
+fn out_fill(o : OutBuf, b : Int, count : Int) -> Unit {
+  let need = o.len + count
+  if need > o.buf.length() {
+    let cap = out_next_cap(o.buf.length(), need, o.limit)
+    o.buf = o.buf.slice(0, o.len).concat(Bytes::new(cap - o.len))
+  }
+  let v = b.to_byte()
+  let mut i = 0
+  while i < count {
+    o.buf[o.len + i] = v
+    i = i + 1
+  }
+  o.len = need
+}
