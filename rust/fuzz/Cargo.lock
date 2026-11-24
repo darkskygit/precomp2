@@ -364,11 +364,12 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "precomp2"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "base64",
  "bzip2",
  "crc32fast",
+ "flate2",
  "lepton_jpeg",
  "lz4_flex",
  "memchr",

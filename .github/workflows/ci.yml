@@ -3,9 +3,9 @@ name: Lint & Test
 on:
   workflow_dispatch:
   push:
-    branches: [ main, "feat/reimpl-pion*" ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, "feat/reimpl-pion*" ]
+    branches: [ main ]
 
 permissions: read-all
 

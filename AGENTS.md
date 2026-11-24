@@ -9,18 +9,11 @@ These rules apply to the whole repository. Keep them true whenever a change alte
 - `fixtures/`: binary test fixtures shared by both Rust and Pion test suites.
 - `benchmarks/`: head-to-head Rust (`--release`) vs Pion (`--release`) benchmark suite with interleaved rounds and mandatory output SHA-256 verification.
 
-## Branching, pull requests, and reviews
-
-- Develop the Pion port on `feat/reimpl-pion`. Parallel topic branches (`feat/reimpl-pion-*`) run CI on push and squash-land onto `feat/reimpl-pion` without opening PRs against `main`. Never push to or modify `main`.
-- When opening PRs in external upstream repositories (such as `AFK-surf/pion-packages`), open one PR per request from the target base branch, squash each task into one commit before the first PR, and end the PR description with the models used and test frameworks run.
-- Each topic branch requires independent multi-seat review approval (at least 3 of 4 seats, with all reasonable objections resolved) before squash-landing onto `feat/reimpl-pion`.
-- Set both Git author and committer to `DarkSky <darksky2048@gmail.com>` for all commits, including sub-chats and squashes. Do not add AI `Co-Authored-By` trailers. Preserve original authors on external commits.
-
-## Commit, comment, and PR messages
+## Commits and style
 
 - Write commit messages, code comments, documentation, error messages, and PR titles/descriptions in clear, concise, direct English (active voice, no filler).
 - Use `{type}({scope}): {description}` for commit subjects (for example `feat(pion): port lz4hc compressors and unityfs codec`).
-- Keep code, comments, workflows, `AGENTS.md`, and commit messages free of internal process-journal jargon.
+- Keep code, comments, workflows, `AGENTS.md`, and commit messages free of internal process-journal jargon. Do not add AI `Co-Authored-By` trailers.
 
 ## Engineering and testing principles
 
