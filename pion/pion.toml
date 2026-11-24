@@ -1,0 +1,16 @@
+[workspace]
+members = [
+  "packages/bzip2",
+  "packages/preflate",
+  "packages/lepton",
+  "packages/precomp2",
+]
+
+[workspace.dependencies]
+bzip2 = { path = "packages/bzip2" }
+preflate = { path = "packages/preflate" }
+lepton = { path = "packages/lepton" }
+precomp2 = { path = "packages/precomp2" }
+
+[registry]
+url = "https://github.com/AFK-surf/pion-packages.git"

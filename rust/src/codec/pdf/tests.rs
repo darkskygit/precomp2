@@ -104,7 +104,7 @@ fn image_samples_masks_and_padding() {
 
 #[test]
 fn jpeg_and_qpdf_fixtures() {
-  let jpeg = include_bytes!("../../../fixtures/minimal.jpg");
+  let jpeg = include_bytes!("../../../../fixtures/minimal.jpg");
   let stats = roundtrip(&pdf(jpeg, "/Filter /DCTDecode"));
   assert_eq!(stats.dct, 1);
   let stats = roundtrip(&pdf(&hex(jpeg), "/Filter [/ASCIIHexDecode /DCTDecode]"));
@@ -114,29 +114,29 @@ fn jpeg_and_qpdf_fixtures() {
   let stats = roundtrip(&pdf(&zlib(jpeg), "/Filter [/FlateDecode /DCTDecode]"));
   assert_eq!((stats.flate, stats.dct), (1, 1));
   for bytes in [
-    include_bytes!("../../../fixtures/qpdf/filter-abbreviation.pdf").as_slice(),
-    include_bytes!("../../../fixtures/qpdf/image-streams-small.pdf").as_slice(),
-    include_bytes!("../../../fixtures/qpdf/jpeg-qstream.pdf").as_slice(),
+    include_bytes!("../../../../fixtures/qpdf/filter-abbreviation.pdf").as_slice(),
+    include_bytes!("../../../../fixtures/qpdf/image-streams-small.pdf").as_slice(),
+    include_bytes!("../../../../fixtures/qpdf/jpeg-qstream.pdf").as_slice(),
   ] {
     assert!(roundtrip(bytes).transformed > 0);
   }
-  assert!(roundtrip(include_bytes!("../../../fixtures/qpdf/image-streams.pdf")).images > 0);
+  assert!(roundtrip(include_bytes!("../../../../fixtures/qpdf/image-streams.pdf")).images > 0);
 }
 
 #[tokio::test]
 async fn legacy_and_current_versions() {
   for (encoded, original) in [
     (
-      include_bytes!("../../../fixtures/pdf-v1-0.pcf").as_slice(),
-      include_bytes!("../../../fixtures/pdf-v1-0.pdf").as_slice(),
+      include_bytes!("../../../../fixtures/pdf-v1-0.pcf").as_slice(),
+      include_bytes!("../../../../fixtures/pdf-v1-0.pdf").as_slice(),
     ),
     (
-      include_bytes!("../../../fixtures/pdf-v1-1.pcf").as_slice(),
-      include_bytes!("../../../fixtures/pdf-v1-1.pdf").as_slice(),
+      include_bytes!("../../../../fixtures/pdf-v1-1.pcf").as_slice(),
+      include_bytes!("../../../../fixtures/pdf-v1-1.pdf").as_slice(),
     ),
     (
-      include_bytes!("../../../fixtures/pdf-v1-2.pcf").as_slice(),
-      include_bytes!("../../../fixtures/pdf-v1-2.pdf").as_slice(),
+      include_bytes!("../../../../fixtures/pdf-v1-2.pcf").as_slice(),
+      include_bytes!("../../../../fixtures/pdf-v1-2.pdf").as_slice(),
     ),
   ] {
     assert_eq!(decode_bytes(encoded, &DecodeConfig::default()).unwrap(), original);

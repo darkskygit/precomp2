@@ -1,0 +1,14 @@
+///| Minimal pure-Pion bzip2 codec for precomp2 (BZh1..BZh9).
+
+///| Decompress a bzip2 stream.
+pub fn decompress(input : Bytes) -> Result[Bytes, String] {
+  let _ = input
+  Err("bzip2::decompress not implemented")
+}
+
+///| Compress `input` into a bzip2 stream at block level `1..=9`.
+pub fn compress(input : Bytes, level : Int) -> Result[Bytes, String] {
+  let _ = input
+  let _ = level
+  Err("bzip2::compress not implemented")
+}

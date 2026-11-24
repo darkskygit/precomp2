@@ -8,8 +8,8 @@ use tokio::io::ReadBuf;
 
 use super::*;
 
-const PNG_FIXTURE: &[u8] = include_bytes!("../../fixtures/minimal.png");
-const JPG_FIXTURE: &[u8] = include_bytes!("../../fixtures/minimal.jpg");
+const PNG_FIXTURE: &[u8] = include_bytes!("../../../fixtures/minimal.png");
+const JPG_FIXTURE: &[u8] = include_bytes!("../../../fixtures/minimal.jpg");
 
 fn decode_segments(encoded: &[u8]) -> Vec<Pcf2Segment> {
   Pcf2File::decode(encoded).expect("decode pcf2").segments

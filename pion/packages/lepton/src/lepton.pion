@@ -1,0 +1,13 @@
+///| Minimal pure-Pion lossless JPEG recompression codec for precomp2.
+
+///| Losslessly recompress a JPEG byte stream into a compact reversible payload.
+pub fn encode(jpeg : Bytes) -> Result[Bytes, String] {
+  let _ = jpeg
+  Err("lepton::encode not implemented")
+}
+
+///| Restore the original byte-exact JPEG stream from an encoded payload.
+pub fn decode(data : Bytes) -> Result[Bytes, String] {
+  let _ = data
+  Err("lepton::decode not implemented")
+}

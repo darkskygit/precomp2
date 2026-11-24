@@ -1,0 +1,5 @@
+///| Smoke test for workspace wiring.
+
+test "workspace_skeleton_loads" {
+  debug_assert(pcf2_version == 2, "expected PCF2 version 2")
+}

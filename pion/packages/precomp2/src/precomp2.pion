@@ -1,0 +1,4 @@
+///| Pure-Pion reversible preprocessing library for compressed and container data.
+
+///| PCF2 container version emitted by writers.
+pub let pcf2_version : Int = 2

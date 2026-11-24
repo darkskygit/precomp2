@@ -3,9 +3,9 @@ name: Lint & Test
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, "feat/reimpl-pion*" ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, "feat/reimpl-pion*" ]
 
 permissions: read-all
 
@@ -20,7 +20,7 @@ env:
 
 jobs:
   lint:
-    name: format & clippy
+    name: rust format & clippy
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -42,25 +42,25 @@ jobs:
       with:
         workspaces: |
           .
-          fuzz
-          tools/lz4-matrix
+          rust/fuzz
+          rust/tools/lz4-matrix
 
     - name: Format check
       run: |
         cargo +${{ env.nightly }} fmt --all --check
-        cargo +${{ env.nightly }} fmt --manifest-path fuzz/Cargo.toml --check
-        cargo +${{ env.nightly }} fmt --manifest-path tools/lz4-matrix/Cargo.toml --check
+        cargo +${{ env.nightly }} fmt --manifest-path rust/fuzz/Cargo.toml --check
+        cargo +${{ env.nightly }} fmt --manifest-path rust/tools/lz4-matrix/Cargo.toml --check
 
     - name: Clippy
-      run: cargo +stable clippy --all-targets -- -D warnings
+      run: cargo +stable clippy --workspace --all-targets -- -D warnings
 
     - name: Lint fuzz targets and tools
       run: |
-        RUSTFLAGS="--cfg fuzzing" cargo +stable clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
-        cargo +stable clippy --manifest-path tools/lz4-matrix/Cargo.toml -- -D warnings
+        RUSTFLAGS="--cfg fuzzing" cargo +stable clippy --manifest-path rust/fuzz/Cargo.toml --all-targets -- -D warnings
+        cargo +stable clippy --manifest-path rust/tools/lz4-matrix/Cargo.toml -- -D warnings
 
   test:
-    name: test
+    name: rust test
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -D warnings
@@ -75,4 +75,38 @@ jobs:
     - uses: Swatinem/rust-cache@v2
 
     - name: Test
-      run: cargo test
+      run: cargo test --workspace
+
+  pion:
+    name: pion fmt, check & test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Resolve pion commit
+      id: pion_rev
+      run: |
+        rev=$(git ls-remote https://github.com/AFK-surf/pion.git refs/heads/main | awk '{print $1}')
+        echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Pion toolchain
+      id: pion_cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.pion
+        key: pion-toolchain-linux-x86_64-${{ steps.pion_rev.outputs.rev }}
+
+    - name: Bootstrap Pion toolchain
+      if: steps.pion_cache.outputs.cache-hit != 'true'
+      run: |
+        git clone --depth 1 https://github.com/AFK-surf/pion.git /tmp/pion-src
+        cd /tmp/pion-src
+        sh scripts/install.sh --prefix "$HOME/.pion" || sh scripts/install.sh --no-bootstrap --prefix "$HOME/.pion"
+
+    - name: Pion fmt, check, and test
+      run: |
+        export PATH="$HOME/.pion/bin:$PATH"
+        pionc --version
+        pionc fmt --check pion
+        pionc check --json pion
+        pionc test --json pion

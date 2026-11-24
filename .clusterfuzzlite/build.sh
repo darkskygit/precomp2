@@ -9,7 +9,7 @@ export RUSTUP_TOOLCHAIN=nightly-2026-07-07
 # They are trusted code; build them uninstrumented.
 unset CFLAGS CXXFLAGS
 
-cd "$SRC/precomp2/fuzz"
+cd "$SRC/precomp2/rust/fuzz"
 
 case "${SANITIZER:-address}" in
 address)
