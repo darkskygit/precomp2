@@ -1,6 +1,0 @@
-[package]
-name = "bzip2"
-version = "0.1.0"
-license = "Apache-2.0 AND bzip2-1.0.6"
-
-[dependencies]

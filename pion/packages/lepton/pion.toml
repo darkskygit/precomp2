@@ -1,7 +1,0 @@
-[package]
-name = "lepton"
-version = "0.1.0"
-license = "Apache-2.0"
-
-[dependencies]
-flate = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "flate-v0.1.0", subdir = "packages/flate" }

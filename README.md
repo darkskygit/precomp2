@@ -7,7 +7,7 @@ The project is inspired by [precomp-cpp](https://github.com/schnaader/precomp-cp
 ## Repository Layout
 
 - `rust/`: Reference Rust crate (`#![forbid(unsafe_code)]`), including `tests/lz4-reference`, `examples/`, `fuzz/`, and `tools/lz4-matrix/`.
-- `pion/`: Pure-Pion workspace (`World`-free, zero C/FFI, Wasm32-compatible) with `packages/bzip2`, `packages/preflate`, `packages/lepton`, and `packages/precomp2`.
+- `pion/`: Pure-Pion workspace (`World`-free, zero C/FFI, Wasm32-compatible) with `packages/precomp2`, pulling `base64`, `bzip2`, `flate`, `lepton`, `preflate`, and `webp` from [`AFK-surf/pion-packages`](https://github.com/AFK-surf/pion-packages).
 - `fixtures/`: Shared binary test fixtures (JPEG, PNG, legacy v1 PCF2, and `qpdf` PDFs).
 - `benchmarks/`: Head-to-head Rust (`--release`) vs Pion (`--release`) benchmark suite and cross-language PCF2 interoperability harness (`benchmarks/run.sh`, `benchmarks/RESULTS.md`).
 

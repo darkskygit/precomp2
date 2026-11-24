@@ -5,7 +5,7 @@ These rules apply to the whole repository. Keep them true whenever a change alte
 ## Repository layout
 
 - `rust/`: reference Rust implementation of `precomp2` (Cargo workspace member of root `Cargo.toml`), including `tests/lz4-reference`, `examples/`, `fuzz/`, and `tools/lz4-matrix/`.
-- `pion/`: pure-Pion workspace implementing `precomp2` and its minimal in-repo codec packages (`packages/bzip2`, `packages/preflate`, `packages/lepton`, `packages/precomp2`). Reuse official `AFK-surf/pion-packages` libraries (`flate`, `base64`, `webp`) instead of duplicating generic codecs.
+- `pion/`: pure-Pion workspace implementing `packages/precomp2`. Reuse official `AFK-surf/pion-packages` libraries (`base64`, `bzip2`, `flate`, `lepton`, `preflate`, `webp`) instead of duplicating generic codecs in-repo.
 - `fixtures/`: binary test fixtures shared by both Rust and Pion test suites.
 - `benchmarks/`: head-to-head Rust (`--release`) vs Pion (`--release`) benchmark suite with interleaved rounds and mandatory output SHA-256 verification.
 
@@ -25,7 +25,6 @@ These rules apply to the whole repository. Keep them true whenever a change alte
 ## Engineering and testing principles
 
 - **Global optimum over band-aid patches:** prefer clean structure and bold deletion over minimal-diff workarounds, defensive clutter, or one-caller indirection. Split source files when a single non-test file grows past ~500 lines and carries distinct responsibilities.
-- **Minimal necessary internal codecs:** `pion/packages/{bzip2,preflate,lepton}` implement only what `precomp2` requires for lossless reversible preprocessing — do not bloat them with unused features.
 - **Zero C/FFI and zero `World` in Pion library code:** all packages under `pion/packages/` must be 100% pure Pion, `World`-free, and Wasm32-compatible.
 - **Deterministic, scope-accurate tests:** keep tests deterministic with fixed seeds and no sleeps or retries. Group related cases into table-driven loops. Name every test function and file after everything it asserts.
 - **Cross-language verification:** every PCF2 segment kind implemented in Pion must pass lossless roundtrip tests, shared `fixtures/` tests, and byte-exact `lz4` reference checks where applicable.
