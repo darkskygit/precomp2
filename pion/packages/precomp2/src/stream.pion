@@ -1,5 +1,32 @@
 ///| Stream decoding and magic-scanning recovery for PCF2 containers.
 
+let segment_input_slack : UInt64 = 65536UL
+
+let segment_meta_overhead : UInt64 = 2097152UL
+
+let segment_data_overhead : UInt64 = 2097152UL
+
+fn u64_saturating_mul_32(v : UInt64) -> UInt64 {
+  if v > 576460752303423487UL {
+    0xFFFFFFFFFFFFFFFFUL
+  } else {
+    v * 32UL
+  }
+}
+
+fn segment_meta_limit(orig_len : UInt64, cap : UInt64) -> UInt64 {
+  let bound = u64_saturating_add(orig_len, segment_meta_overhead)
+  if bound < cap { bound } else { cap }
+}
+
+fn segment_data_limit(orig_len : UInt64, cap : UInt64) -> UInt64 {
+  let bound = u64_saturating_add(
+    u64_saturating_mul_32(orig_len),
+    segment_data_overhead,
+  )
+  if bound < cap { bound } else { cap }
+}
+
 fn decode_stream_with_len(
   input : Bytes,
   offset : Int,
@@ -16,6 +43,7 @@ fn decode_stream_with_len(
     Err(e) => return Err(e)
     Ok(_) => ()
   }
+  let seg_cap = u64_saturating_add(config.max_total_output, segment_input_slack)
   let out : Array[Byte] = []
   let mut total : UInt64 = 0UL
   while total < header.original_size {
@@ -31,6 +59,12 @@ fn decode_stream_with_len(
     match budget.check(seg.orig_len, config) {
       Err(e) => return Err(e)
       Ok(_) => ()
+    }
+    let meta_len_u = seg.meta.length().to_int64().to_uint64()
+    let data_len_u = seg.data.length().to_int64().to_uint64()
+    if meta_len_u > segment_meta_limit(seg.orig_len, seg_cap) ||
+    data_len_u > segment_data_limit(seg.orig_len, seg_cap) {
+      return Err(Error::Other("decode output exceeds budget"))
     }
     let data = match decode_segment(seg, config, depth, budget) {
       Ok(d) => d

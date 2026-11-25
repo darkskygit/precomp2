@@ -26,7 +26,7 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
   if input.len() < 8 || &input[..8] != b"\x89PNG\r\n\x1a\n" {
     return Ok(None);
   }
-  let metadata = if config.enable_png_webp {
+  let metadata = if config.enable_png_webp && config.max_webp_pixels > 0 {
     match parse_png_metadata(input) {
       Ok(plan) => plan,
       Err(_) => return Ok(Some(vec![Pcf2Segment::lit(input.to_vec())])),
@@ -130,19 +130,22 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
 
   if let Some(plan) = metadata {
     let ihdr = plan.ihdr;
-    let bpp = ihdr.bytes_per_pixel()?;
-    if let Ok((bitmap, filters)) = undo_png_filters(&payload_bytes, ihdr.width, ihdr.height, bpp)
-      && let Ok(webp_bytes) = encode_webp_lossless(&bitmap, ihdr.width, ihdr.height, ihdr.color_type)
-      && (webp_bytes.len() as u64) <= remaining
-    {
-      png_payload_kind = 1;
-      payload_bytes = webp_bytes;
-      webp_meta = Some(PngWebpMeta {
-        color_type: ihdr.color_type,
-        width: ihdr.width,
-        height: ihdr.height,
-        filters,
-      });
+    let pixels = u64::from(ihdr.width).saturating_mul(u64::from(ihdr.height));
+    if pixels <= config.max_webp_pixels {
+      let bpp = ihdr.bytes_per_pixel()?;
+      if let Ok((bitmap, filters)) = undo_png_filters(&payload_bytes, ihdr.width, ihdr.height, bpp)
+        && let Ok(webp_bytes) = encode_webp_lossless(&bitmap, ihdr.width, ihdr.height, ihdr.color_type)
+        && (webp_bytes.len() as u64) <= remaining
+      {
+        png_payload_kind = 1;
+        payload_bytes = webp_bytes;
+        webp_meta = Some(PngWebpMeta {
+          color_type: ihdr.color_type,
+          width: ihdr.width,
+          height: ihdr.height,
+          filters,
+        });
+      }
     }
   }
 

@@ -367,7 +367,7 @@ fn pdf_encode_stream(
     }
   }
   if samples && config.enable_pdf_images {
-    match pdf_image_encode(bytes, dict) {
+    match pdf_image_encode(bytes, dict, config.max_webp_pixels) {
       Ok(Some((encoded, imeta))) => {
         let cap = if bytes.length() < input.length() {
           bytes.length()

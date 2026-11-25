@@ -66,6 +66,10 @@ pub struct EncodeConfig {
   pub max_expand_ratio: f64,
   pub max_total_output: u64,
   pub enable_png_webp: bool,
+  /// Maximum pixel count (`width * height`) eligible for lossless WebP
+  /// reencoding in PNG and PDF images. Set to `0` to disable WebP reencoding
+  /// while keeping scanline/preflate transforms.
+  pub max_webp_pixels: u64,
   /// Undo TIFF 2 and PNG 10–15 predictors. Off by default; the assetpack
   /// adapter enables this. Reconstruction retains PNG row tags and packed
   /// sample padding.
@@ -86,6 +90,7 @@ impl Default for EncodeConfig {
       max_expand_ratio: 16.0,
       max_total_output: 1 << 32,
       enable_png_webp: false,
+      max_webp_pixels: 16_777_216,
       enable_pdf_predictor: false,
       enable_pdf_dct: true,
       enable_pdf_ascii: true,
@@ -281,7 +286,7 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
         return Err(Error::InvalidSegment("lit orig_len must match data_len"));
       }
     }
-    if meta_len > seg_cap || data_len > seg_cap {
+    if meta_len > crate::pcf2::segment_meta_limit(orig_len, seg_cap) || data_len > crate::pcf2::segment_data_limit(orig_len, seg_cap) {
       return Err(Error::Other("decode output exceeds budget".to_string()));
     }
     remaining -= orig_len;

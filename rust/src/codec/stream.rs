@@ -113,7 +113,7 @@ fn decode_segments_to_writer<R: Read, W: Write>(
   let mut copy_buf = [0u8; STREAM_COPY_BUF_LEN];
 
   while total < original_size {
-    let Some(mut seg_reader) = decoder.next_segment_limited(seg_cap, seg_cap)? else {
+    let Some(mut seg_reader) = decoder.next_segment_bounded(seg_cap)? else {
       return Err(Error::SizeMismatch {
         expected: original_size,
         actual: total,
