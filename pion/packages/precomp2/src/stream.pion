@@ -12,6 +12,10 @@ fn decode_stream_with_len(
     Err(e) => return Err(e)
   }
   let header = decoder.header
+  match budget.check(header.original_size, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let out : Array[Byte] = []
   let mut total : UInt64 = 0UL
   while total < header.original_size {
@@ -23,6 +27,10 @@ fn decode_stream_with_len(
     total = u64_saturating_add(total, seg.orig_len)
     if total > header.original_size {
       return Err(Error::SizeMismatch(header.original_size, total))
+    }
+    match budget.check(seg.orig_len, config) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
     }
     let data = match decode_segment(seg, config, depth, budget) {
       Ok(d) => d

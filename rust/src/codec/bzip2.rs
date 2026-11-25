@@ -4,7 +4,7 @@ use bzip2::{Compression, read::BzDecoder, write::BzEncoder};
 
 use super::{
   DecodeConfig, EncodeConfig,
-  budget::{DecodeBudget, EncodeBudget},
+  budget::{BoundedWriter, DecodeBudget, EncodeBudget},
   payload::{choose_payload, decode_payload},
   varint::{read_len, take_bytes, write_varint_vec},
 };
@@ -67,6 +67,7 @@ pub(super) fn encode_bzip2(input: &[u8], config: &EncodeConfig, depth: u32, budg
 }
 
 pub(super) fn decode_bzip2_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   if segment.meta.len() < 3 {
     return Err(Error::InvalidSegment("bzip2 meta"));
   }
@@ -98,7 +99,7 @@ pub(super) fn decode_bzip2_segment(segment: &Pcf2Segment, config: &DecodeConfig,
     return Err(Error::InvalidSegment("bzip2 decoded_len mismatch"));
   }
   let level_num = (level - b'0') as u32;
-  let mut recompressed = encode_bzip2_raw(&payload, level_num)?;
+  let mut recompressed = encode_bzip2_raw_limited(&payload, level_num, budget.remaining(config))?;
   for entry in penalty.as_chunks::<PENALTY_ENTRY_LEN>().0 {
     let pos = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
     *recompressed
@@ -120,6 +121,26 @@ fn encode_bzip2_raw(input: &[u8], level: u32) -> Result<Vec<u8>> {
   let mut encoder = BzEncoder::new(Vec::new(), Compression::new(level));
   encoder.write_all(input)?;
   Ok(encoder.finish()?)
+}
+
+fn encode_bzip2_raw_limited(input: &[u8], level: u32, limit: u64) -> Result<Vec<u8>> {
+  let mut encoder = BzEncoder::new(BoundedWriter::new(limit), Compression::new(level));
+  if let Err(err) = encoder.write_all(input) {
+    if encoder.get_ref().is_exceeded() {
+      return Err(Error::Other("decode output exceeds budget".to_string()));
+    }
+    return Err(err.into());
+  }
+  match encoder.finish() {
+    Ok(writer) => Ok(writer.into_vec()),
+    Err(err) => {
+      if err.kind() == std::io::ErrorKind::FileTooLarge {
+        Err(Error::Other("decode output exceeds budget".to_string()))
+      } else {
+        Err(err.into())
+      }
+    }
+  }
 }
 
 fn compute_penalty(original: &[u8], recompressed: &[u8]) -> Vec<PenaltyEntry> {

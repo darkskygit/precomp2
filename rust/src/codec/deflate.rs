@@ -2,7 +2,7 @@ use super::{
   DecodeConfig, EncodeConfig,
   budget::{DecodeBudget, EncodeBudget},
   payload::{choose_payload, decode_payload},
-  preflate::{PreflateAnalysis, build_preflate_data, parse_preflate_data, preflate_analyze, preflate_reencode},
+  preflate::{PreflateAnalysis, build_preflate_data, parse_preflate_data, preflate_analyze_limited, preflate_reencode},
   varint::{parse_meta_header, read_len, take_bytes, write_varint_vec},
 };
 use crate::{
@@ -14,15 +14,17 @@ pub(super) fn encode_deflate(input: &[u8], config: &EncodeConfig, depth: u32, bu
   if input.is_empty() {
     return Ok(None);
   }
+  let remaining = budget.remaining(config);
+  let limit = usize::try_from(remaining).unwrap_or(usize::MAX);
   let Ok(PreflateAnalysis {
     deflate_len,
     corrections,
     plain,
-  }) = preflate_analyze(input)
+  }) = preflate_analyze_limited(input, limit)
   else {
     return Ok(None);
   };
-  if deflate_len != input.len() as u64 {
+  if deflate_len != input.len() as u64 || (plain.len() as u64) > remaining {
     return Ok(None);
   }
   let (payload_kind, payload) = choose_payload(plain, input.len(), config, depth, budget)?;
@@ -59,15 +61,17 @@ pub(super) fn encode_zlib(input: &[u8], config: &EncodeConfig, depth: u32, budge
   let header = [cmf, flg];
   let footer = &input[input.len() - 4..];
   let deflate = &input[2..input.len() - 4];
+  let remaining = budget.remaining(config);
+  let limit = usize::try_from(remaining).unwrap_or(usize::MAX);
   let Ok(PreflateAnalysis {
     deflate_len,
     corrections,
     plain,
-  }) = preflate_analyze(deflate)
+  }) = preflate_analyze_limited(deflate, limit)
   else {
     return Ok(None);
   };
-  if deflate_len != deflate.len() as u64 {
+  if deflate_len != deflate.len() as u64 || (plain.len() as u64) > remaining {
     return Ok(None);
   }
   let adler = adler32(&plain);
@@ -94,21 +98,28 @@ pub(super) fn encode_gzip(input: &[u8], config: &EncodeConfig, depth: u32, budge
   if input.len() < 18 || input[0] != 0x1f || input[1] != 0x8b {
     return Ok(None);
   }
-  let (header_len, header_bytes) = parse_gzip_header(input)?;
-  if input.len() < header_len + 8 {
+  let Ok((header_len, header_bytes)) = parse_gzip_header(input) else {
+    return Ok(None);
+  };
+  let Some(min_len) = header_len.checked_add(8) else {
+    return Ok(None);
+  };
+  if input.len() < min_len {
     return Ok(None);
   }
   let footer = &input[input.len() - 8..];
   let deflate = &input[header_len..input.len() - 8];
+  let remaining = budget.remaining(config);
+  let limit = usize::try_from(remaining).unwrap_or(usize::MAX);
   let Ok(PreflateAnalysis {
     deflate_len,
     corrections,
     plain,
-  }) = preflate_analyze(deflate)
+  }) = preflate_analyze_limited(deflate, limit)
   else {
     return Ok(None);
   };
-  if deflate_len != deflate.len() as u64 {
+  if deflate_len != deflate.len() as u64 || (plain.len() as u64) > remaining {
     return Ok(None);
   }
   if plain.len() > u32::MAX as usize {
@@ -143,6 +154,7 @@ pub(super) fn decode_deflate_segment(
   depth: u32,
   budget: &mut DecodeBudget,
 ) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   let (meta_version, payload_kind, _rest) = parse_meta_header(&segment.meta)?;
   if meta_version != 0 {
     return Err(Error::InvalidSegment("deflate meta_version"));
@@ -155,6 +167,7 @@ pub(super) fn decode_deflate_segment(
 }
 
 pub(super) fn decode_zlib_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   let (meta_version, payload_kind, mut rest) = parse_meta_header(&segment.meta)?;
   if meta_version != 0 || rest.len() < 6 {
     return Err(Error::InvalidSegment("zlib meta"));
@@ -168,7 +181,9 @@ pub(super) fn decode_zlib_segment(segment: &Pcf2Segment, config: &DecodeConfig, 
   let (corrections, payload) = parse_preflate_data(&segment.data)?;
   let plain = decode_payload(payload_kind, payload, config, depth, budget)?;
   let deflate = preflate_reencode(corrections, &plain)?;
-  let mut out = Vec::with_capacity(deflate.len() + 6);
+  let out_len = deflate.len().checked_add(6).ok_or(Error::LengthOverflow)?;
+  budget.check(out_len as u64, config)?;
+  let mut out = Vec::with_capacity(out_len);
   out.extend_from_slice(header);
   out.extend_from_slice(&deflate);
   out.extend_from_slice(footer);
@@ -177,6 +192,7 @@ pub(super) fn decode_zlib_segment(segment: &Pcf2Segment, config: &DecodeConfig, 
 }
 
 pub(super) fn decode_gzip_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   let (meta_version, payload_kind, rest) = parse_meta_header(&segment.meta)?;
   if meta_version != 0 {
     return Err(Error::InvalidSegment("gzip meta_version"));
@@ -189,7 +205,13 @@ pub(super) fn decode_gzip_segment(segment: &Pcf2Segment, config: &DecodeConfig, 
   let (corrections, payload) = parse_preflate_data(&segment.data)?;
   let plain = decode_payload(payload_kind, payload, config, depth, budget)?;
   let deflate = preflate_reencode(corrections, &plain)?;
-  let mut out = Vec::with_capacity(header.len() + deflate.len() + 8);
+  let out_len = header
+    .len()
+    .checked_add(deflate.len())
+    .and_then(|n| n.checked_add(8))
+    .ok_or(Error::LengthOverflow)?;
+  budget.check(out_len as u64, config)?;
+  let mut out = Vec::with_capacity(out_len);
   out.extend_from_slice(header);
   out.extend_from_slice(&deflate);
   out.extend_from_slice(footer);
@@ -204,26 +226,30 @@ pub(super) fn parse_gzip_header(input: &[u8]) -> Result<(usize, Vec<u8>)> {
   let flags = input[3];
   let mut offset = 10usize;
   if flags & 0x04 != 0 {
-    if offset + 2 > input.len() {
+    let xlen_end = offset.checked_add(2).ok_or(Error::InvalidSegment("gzip extra"))?;
+    if xlen_end > input.len() {
       return Err(Error::InvalidSegment("gzip extra"));
     }
     let xlen = u16::from_le_bytes([input[offset], input[offset + 1]]) as usize;
-    offset += 2 + xlen;
+    offset = xlen_end.checked_add(xlen).ok_or(Error::InvalidSegment("gzip header bounds"))?;
+    if offset > input.len() {
+      return Err(Error::InvalidSegment("gzip header bounds"));
+    }
   }
   if flags & 0x08 != 0 {
     while offset < input.len() && input[offset] != 0 {
       offset += 1;
     }
-    offset += 1;
+    offset = offset.checked_add(1).ok_or(Error::InvalidSegment("gzip header bounds"))?;
   }
   if flags & 0x10 != 0 {
     while offset < input.len() && input[offset] != 0 {
       offset += 1;
     }
-    offset += 1;
+    offset = offset.checked_add(1).ok_or(Error::InvalidSegment("gzip header bounds"))?;
   }
   if flags & 0x02 != 0 {
-    offset += 2;
+    offset = offset.checked_add(2).ok_or(Error::InvalidSegment("gzip header bounds"))?;
   }
   if offset > input.len() {
     return Err(Error::InvalidSegment("gzip header bounds"));

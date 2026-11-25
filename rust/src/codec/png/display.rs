@@ -21,7 +21,8 @@ pub(super) fn parse_png_metadata(input: &[u8]) -> Result<Option<PngDisplayMetada
   let mut cicp = false;
   let mut ended = false;
   while offset < input.len() {
-    let header = input.get(offset..offset + 8).ok_or(Error::InvalidSegment("png chunk header"))?;
+    let header_end = offset.checked_add(8).ok_or(Error::LengthOverflow)?;
+    let header = input.get(offset..header_end).ok_or(Error::InvalidSegment("png chunk header"))?;
     let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
     let kind = &header[4..];
     let end = offset
@@ -110,6 +111,8 @@ pub(in crate::codec) fn extract_png_display(segments: &[Pcf2Segment], config: &D
   let mut metadata = Vec::new();
   let mut carrier = None;
   let mut parsed = None;
+  let mut carrier_charged = false;
+  let mut budget = DecodeBudget::default();
   for segment in segments {
     if segment.kind == SegmentKind::Lit as u8 {
       metadata.extend_from_slice(&segment.data);
@@ -128,7 +131,8 @@ pub(in crate::codec) fn extract_png_display(segments: &[Pcf2Segment], config: &D
       if framed != Some(segment.orig_len) {
         return Err(Error::InvalidSegment("png idat original length"));
       }
-      carrier = Some(decode_payload(meta.payload_kind, payload, config, 0, &mut DecodeBudget::default())?.into_owned());
+      carrier = Some(decode_payload(meta.payload_kind, payload, config, 0, &mut budget)?.into_owned());
+      carrier_charged = meta.payload_kind != 0;
       parsed = meta.webp_meta;
     } else {
       return Err(Error::InvalidSegment("png display segment layout"));
@@ -153,16 +157,16 @@ pub(in crate::codec) fn extract_png_display(segments: &[Pcf2Segment], config: &D
     return Err(Error::InvalidSegment("png webp size"));
   }
   // Validate the complete standalone RIFF, even when no ICC needs muxing.
-  if carrier.len() < 12
-    || &carrier[..4] != b"RIFF"
-    || &carrier[8..12] != b"WEBP"
-    || u32::from_le_bytes(carrier[4..8].try_into().unwrap()) as usize + 8 != carrier.len()
-  {
+  let riff_total = carrier
+    .get(4..8)
+    .and_then(|b| (u32::from_le_bytes(b.try_into().ok()?) as usize).checked_add(8));
+  if carrier.len() < 12 || &carrier[..4] != b"RIFF" || &carrier[8..12] != b"WEBP" || riff_total != Some(carrier.len()) {
     return Err(Error::InvalidSegment("webp riff"));
   }
   let mut offset = 12usize;
   while offset < carrier.len() {
-    let header = carrier.get(offset..offset + 8).ok_or(Error::InvalidSegment("webp chunk"))?;
+    let header_end = offset.checked_add(8).ok_or(Error::LengthOverflow)?;
+    let header = carrier.get(offset..header_end).ok_or(Error::InvalidSegment("webp chunk"))?;
     let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
     offset = offset
       .checked_add(8)
@@ -173,10 +177,11 @@ pub(in crate::codec) fn extract_png_display(segments: &[Pcf2Segment], config: &D
       return Err(Error::InvalidSegment("webp chunk bounds"));
     }
   }
-  let mut budget = DecodeBudget::default();
-  budget.consume(carrier.len(), config)?;
+  if !carrier_charged {
+    budget.consume(carrier.len(), config)?;
+  }
   let icc = match plan.icc {
-    Some(compressed) => decode_png_icc(&compressed, config.max_total_output)?,
+    Some(compressed) => decode_png_icc(&compressed, budget.remaining(config))?,
     None => None,
   };
   let Some(icc) = icc else {

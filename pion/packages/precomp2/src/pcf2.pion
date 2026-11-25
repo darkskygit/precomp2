@@ -237,7 +237,7 @@ pub fn Pcf2File::from_segments(segments : Array[Pcf2Segment]) -> Pcf2File {
   let mut total : UInt64 = 0UL
   let mut i = 0
   while i < segments.length() {
-    total = total + segments[i].orig_len
+    total = u64_saturating_add(total, segments[i].orig_len)
     i += 1
   }
   Pcf2File::{ header: Pcf2Header::new(total), segments }
@@ -248,7 +248,11 @@ pub fn Pcf2File::encode(self : Pcf2File) -> Result[Bytes, Error] {
   let mut total : UInt64 = 0UL
   let mut i = 0
   while i < self.segments.length() {
-    total = total + self.segments[i].orig_len
+    let seg_len = self.segments[i].orig_len
+    if seg_len > 0xFFFFFFFFFFFFFFFFUL - total {
+      return Err(Error::LengthOverflow)
+    }
+    total = total + seg_len
     i += 1
   }
   if total != self.header.original_size {
@@ -374,6 +378,17 @@ pub fn Pcf2Decoder::next_segment(
   if flags != (0).to_byte() {
     return Err(Error::InvalidSegment("flags must be 0 for v1"))
   }
+  if orig_len > self.remaining_orig {
+    return Err(Error::InvalidSegment("orig_len exceeds original_size"))
+  }
+  if kind == SegmentKind::Lit.to_u8() {
+    if meta_len != 0UL {
+      return Err(Error::InvalidSegment("lit meta must be empty"))
+    }
+    if orig_len != data_len {
+      return Err(Error::InvalidSegment("lit orig_len must match data_len"))
+    }
+  }
   let available = (len - self.pos).to_int64().to_uint64()
   if meta_len > available {
     return Err(Error::SizeMismatch(meta_len, available))
@@ -384,18 +399,7 @@ pub fn Pcf2Decoder::next_segment(
   }
   let meta = bytes_slice(self.input, self.pos, self.pos + meta_len_int)
   self.pos += meta_len_int
-  if orig_len > self.remaining_orig {
-    return Err(Error::InvalidSegment("orig_len exceeds original_size"))
-  }
   self.remaining_orig = self.remaining_orig - orig_len
-  if kind == SegmentKind::Lit.to_u8() {
-    if meta_len != 0UL {
-      return Err(Error::InvalidSegment("lit meta must be empty"))
-    }
-    if orig_len != data_len {
-      return Err(Error::InvalidSegment("lit orig_len must match data_len"))
-    }
-  }
   if kind == SegmentKind::Nested.to_u8() {
     if meta_len != 1UL || meta[0] != (0).to_byte() {
       return Err(Error::InvalidSegment("nested meta_version must be 0"))

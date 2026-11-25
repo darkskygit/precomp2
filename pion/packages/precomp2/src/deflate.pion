@@ -19,7 +19,9 @@ fn encode_deflate(
   if input.length() == 0 {
     return Ok(None)
   }
-  let pf = match preflate_analyze(input) {
+  let rem = budget.remaining(config)
+  let lim = if rem > 2147483647UL { 2147483647 } else { rem.to_int() }
+  let pf = match preflate_analyze_limited(input, lim) {
     Ok(v) => v
     Err(_) => return Ok(None)
   }
@@ -27,7 +29,8 @@ fn encode_deflate(
     Ok(v) => v
     Err(_) => return Ok(None)
   }
-  if deflate_len != input.length().to_int64().to_uint64() {
+  if deflate_len != input.length().to_int64().to_uint64() ||
+  plain.length().to_int64().to_uint64() > rem {
     return Ok(None)
   }
   let (payload_kind, payload) = match
@@ -68,7 +71,9 @@ fn encode_zlib(
     return Ok(None)
   }
   let deflate = bytes_slice(input, 2, ilen - 4)
-  let pf = match preflate_analyze(deflate) {
+  let rem = budget.remaining(config)
+  let lim = if rem > 2147483647UL { 2147483647 } else { rem.to_int() }
+  let pf = match preflate_analyze_limited(deflate, lim) {
     Ok(v) => v
     Err(_) => return Ok(None)
   }
@@ -76,7 +81,8 @@ fn encode_zlib(
     Ok(v) => v
     Err(_) => return Ok(None)
   }
-  if deflate_len != deflate.length().to_int64().to_uint64() {
+  if deflate_len != deflate.length().to_int64().to_uint64() ||
+  plain.length().to_int64().to_uint64() > rem {
     return Ok(None)
   }
   let expected_adler = read_u32_be(input, ilen - 4)
@@ -156,13 +162,19 @@ fn encode_gzip(
   }
   let (header_len, header_bytes) = match parse_gzip_header(input) {
     Ok(v) => v
-    Err(e) => return Err(e)
+    Err(_) => return Ok(None)
   }
-  if ilen < header_len + 8 {
+  let min_len = match int_checked_add(header_len, 8) {
+    Some(v) => v
+    None => return Ok(None)
+  }
+  if ilen < min_len {
     return Ok(None)
   }
   let deflate = bytes_slice(input, header_len, ilen - 8)
-  let pf = match preflate_analyze(deflate) {
+  let rem = budget.remaining(config)
+  let lim = if rem > 2147483647UL { 2147483647 } else { rem.to_int() }
+  let pf = match preflate_analyze_limited(deflate, lim) {
     Ok(v) => v
     Err(_) => return Ok(None)
   }
@@ -170,7 +182,8 @@ fn encode_gzip(
     Ok(v) => v
     Err(_) => return Ok(None)
   }
-  if deflate_len != deflate.length().to_int64().to_uint64() {
+  if deflate_len != deflate.length().to_int64().to_uint64() ||
+  plain.length().to_int64().to_uint64() > rem {
     return Ok(None)
   }
   let crc_expected = read_u32_le(input, ilen - 8)
@@ -207,6 +220,10 @@ fn decode_deflate_segment(
   depth : Int,
   budget : DecodeBudget,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let (meta_version, payload_kind, _) = match parse_meta_header(segment.meta) {
     Ok(v) => v
     Err(e) => return Err(e)
@@ -240,6 +257,10 @@ fn decode_zlib_segment(
   depth : Int,
   budget : DecodeBudget,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let (meta_version, payload_kind, rest) = match
   parse_meta_header(segment.meta) {
     Ok(v) => v
@@ -282,6 +303,10 @@ fn decode_gzip_segment(
   depth : Int,
   budget : DecodeBudget,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let (meta_version, payload_kind, rest) = match
   parse_meta_header(segment.meta) {
     Ok(v) => v

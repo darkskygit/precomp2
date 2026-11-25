@@ -30,4 +30,11 @@ name  = "unityfs_roundtrip"
 path  = "fuzz_targets/unityfs_roundtrip.rs"
 test  = false
 
+[[bin]]
+bench = false
+doc   = false
+name  = "decode_untrusted"
+path  = "fuzz_targets/decode_untrusted.rs"
+test  = false
+
 [workspace]

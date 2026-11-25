@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use crate::error::{Error, Result};
 
 #[derive(Default)]
@@ -31,12 +33,57 @@ impl DecodeBudget {
     self.check(0, config)
   }
 
+  /// Output bytes still available under `config.max_total_output`.
+  pub(super) fn remaining(&self, config: &super::DecodeConfig) -> u64 {
+    config.max_total_output.saturating_sub(self.total_output)
+  }
+
   /// Fails before allocating when `len` more output bytes would exceed the
   /// budget.
   pub(super) fn check(&self, len: u64, config: &super::DecodeConfig) -> Result<()> {
     if self.total_output.saturating_add(len) > config.max_total_output {
       return Err(Error::Other("decode output exceeds budget".to_string()));
     }
+    Ok(())
+  }
+}
+
+/// Sink `Vec<u8>` writer that refuses to grow past `limit` bytes.
+pub(super) struct BoundedWriter {
+  buf: Vec<u8>,
+  limit: u64,
+  exceeded: bool,
+}
+
+impl BoundedWriter {
+  pub(super) fn new(limit: u64) -> Self {
+    Self {
+      buf: Vec::new(),
+      limit,
+      exceeded: false,
+    }
+  }
+
+  pub(super) fn is_exceeded(&self) -> bool {
+    self.exceeded
+  }
+
+  pub(super) fn into_vec(self) -> Vec<u8> {
+    self.buf
+  }
+}
+
+impl Write for BoundedWriter {
+  fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+    if (self.buf.len() as u64).saturating_add(data.len() as u64) > self.limit {
+      self.exceeded = true;
+      return Err(io::Error::new(io::ErrorKind::FileTooLarge, "decode output exceeds budget"));
+    }
+    self.buf.extend_from_slice(data);
+    Ok(data.len())
+  }
+
+  fn flush(&mut self) -> io::Result<()> {
     Ok(())
   }
 }

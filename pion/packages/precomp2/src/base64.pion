@@ -90,6 +90,9 @@ fn encode_base64(
     Some(b) => b
     None => return Ok(None)
   }
+  if block.decoded.length().to_int64().to_uint64() > budget.remaining(config) {
+    return Ok(None)
+  }
   let (payload_kind, payload) = match
   choose_payload(block.decoded, input.length(), config, depth, budget) {
     Ok(v) => v

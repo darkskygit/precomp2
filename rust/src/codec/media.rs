@@ -1,6 +1,9 @@
 use std::io::Cursor;
 
-use super::{DecodeConfig, budget::DecodeBudget};
+use super::{
+  DecodeConfig,
+  budget::{BoundedWriter, DecodeBudget},
+};
 use crate::{
   error::{Error, Result},
   pcf2::{Pcf2Segment, SegmentKind},
@@ -199,15 +202,24 @@ fn encode_lepton(jpeg: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn decode_lepton(data: &[u8]) -> Result<Vec<u8>> {
+  decode_lepton_limited(data, u64::MAX)
+}
+
+fn decode_lepton_limited(data: &[u8], limit: u64) -> Result<Vec<u8>> {
   let mut reader = Cursor::new(data);
-  let mut out = Vec::new();
+  let mut out = BoundedWriter::new(limit);
   let features = lepton_jpeg::EnabledFeatures::compat_lepton_vector_read();
-  lepton_jpeg::decode_lepton(&mut reader, &mut out, &features, &lepton_jpeg::DEFAULT_THREAD_POOL)
-    .map_err(|err| Error::Other(format!("lepton decode failed: {err}")))?;
-  Ok(out)
+  if let Err(err) = lepton_jpeg::decode_lepton(&mut reader, &mut out, &features, &lepton_jpeg::DEFAULT_THREAD_POOL) {
+    if out.is_exceeded() {
+      return Err(Error::Other("decode output exceeds budget".to_string()));
+    }
+    return Err(Error::Other(format!("lepton decode failed: {err}")));
+  }
+  Ok(out.into_vec())
 }
 
 pub(super) fn decode_jpg_segment(segment: &Pcf2Segment, budget: &mut DecodeBudget, config: &DecodeConfig) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   if segment.meta.len() < 2 {
     return Err(Error::InvalidSegment("jpg meta"));
   }
@@ -216,7 +228,12 @@ pub(super) fn decode_jpg_segment(segment: &Pcf2Segment, budget: &mut DecodeBudge
     return Err(Error::InvalidSegment("jpg meta_version"));
   }
   let mjpg_used = segment.meta[1] != 0;
-  let mut jpeg = decode_lepton(&segment.data)?;
+  let limit = if mjpg_used {
+    budget.remaining(config).saturating_add(MJPGDHT_LEN as u64)
+  } else {
+    budget.remaining(config)
+  };
+  let mut jpeg = decode_lepton_limited(&segment.data, limit)?;
   if mjpg_used && !remove_mjpg_dht(&mut jpeg) {
     return Err(Error::InvalidSegment("jpg mjpg dht"));
   }

@@ -1,4 +1,7 @@
-use std::{borrow::Cow, io::Cursor};
+use std::{
+  borrow::Cow,
+  io::{Cursor, Read, Write},
+};
 
 use ::base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -26,9 +29,6 @@ mod varint;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-use std::io::Write;
 
 #[cfg(test)]
 use ::base64::Engine;
@@ -143,6 +143,17 @@ pub fn decode_bytes(input: &[u8], config: &DecodeConfig) -> Result<Vec<u8>> {
   stream::decode_stream(Cursor::new(input), config, 0, &mut budget)
 }
 
+/// Streams a PCF2 container from `reader` directly into `writer` while
+/// enforcing `config.max_total_output`. Literal segments are copied in bounded
+/// chunks without buffering the whole container or decoded output in memory.
+pub fn decode_reader<R: Read, W: Write>(reader: R, writer: W, config: &DecodeConfig) -> Result<u64> {
+  if config.recover {
+    return Err(Error::Other("recover mode requires decode_bytes".to_string()));
+  }
+  let mut budget = DecodeBudget::default();
+  stream::decode_stream_to_writer(reader, writer, config, 0, &mut budget)
+}
+
 /// Extracts image bytes for a fast preview without reconstructing PNG IDAT.
 /// Transformed PNG returns its WebP carrier, JPEG is restored as JPEG, and
 /// literal images retain their bytes. PNG previews may omit animation,
@@ -170,6 +181,7 @@ pub fn decode_image_for_display(input: &[u8], config: &DecodeConfig) -> Result<O
   }
   let mut image = Vec::new();
   let mut budget = DecodeBudget::default();
+  budget.check(file.header.original_size, config)?;
   for segment in &file.segments {
     image.extend_from_slice(&decode_segment_checked(segment, config, 0, &mut budget)?);
   }
@@ -228,6 +240,8 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
   let mut out = Vec::new();
   let mut remaining = header.original_size;
   let mut budget = DecodeBudget::default();
+  budget.check(header.original_size, config)?;
+  let seg_cap = stream::segment_input_limit(config);
 
   loop {
     let mut kind_buf = [0u8; 1];
@@ -258,6 +272,18 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
     if orig_len > remaining {
       return Err(Error::InvalidSegment("orig_len exceeds original_size"));
     }
+    budget.check(orig_len, config)?;
+    if kind == SegmentKind::Lit as u8 {
+      if meta_len != 0 {
+        return Err(Error::InvalidSegment("lit meta must be empty"));
+      }
+      if orig_len != data_len {
+        return Err(Error::InvalidSegment("lit orig_len must match data_len"));
+      }
+    }
+    if meta_len > seg_cap || data_len > seg_cap {
+      return Err(Error::Other("decode output exceeds budget".to_string()));
+    }
     remaining -= orig_len;
 
     let mut meta = Vec::new();
@@ -284,6 +310,7 @@ pub async fn decode_async<R: AsyncRead + Unpin>(mut reader: R, config: &DecodeCo
       meta,
       data,
     };
+    segment.validate()?;
     out.extend_from_slice(&decode_segment_checked(&segment, config, 0, &mut budget)?);
   }
 

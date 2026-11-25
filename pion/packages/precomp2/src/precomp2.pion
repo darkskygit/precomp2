@@ -135,6 +135,10 @@ pub fn decode_image_for_display(
   }
   let image_buf : Array[Byte] = []
   let budget = DecodeBudget::new()
+  match budget.check(file.header.original_size, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let mut k = 0
   while k < n {
     let seg = segs[k]

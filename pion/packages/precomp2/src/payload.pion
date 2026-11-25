@@ -7,13 +7,13 @@ fn choose_payload(
   depth : Int,
   budget : EncodeBudget,
 ) -> Result[(Byte, Bytes), Error] {
+  match budget.consume(plain.length(), config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   if depth < config.max_depth && orig_len > 0 {
     let ratio = plain.length().to_double() / orig_len.to_double()
-    let next_total = u64_saturating_add(
-      budget.total_output,
-      plain.length().to_int64().to_uint64(),
-    )
-    if ratio <= config.max_expand_ratio && next_total <= config.max_total_output {
+    if ratio <= config.max_expand_ratio {
       let nested_segments = match
       encode_segments(plain, config, depth + 1, budget) {
         Ok(segs) => segs
@@ -23,10 +23,6 @@ fn choose_payload(
       let nested_bytes = match nested_file.encode() {
         Ok(b) => b
         Err(e) => return Err(e)
-      }
-      match budget.consume(plain.length(), config) {
-        Err(e) => return Err(e)
-        Ok(_) => ()
       }
       return Ok(((1).to_byte(), nested_bytes))
     }

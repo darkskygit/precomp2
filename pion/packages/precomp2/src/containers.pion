@@ -19,6 +19,7 @@ fn encode_zip(
   if ilen < 4 || !bytes_starts_with(input, zip_local_magic) {
     return Ok(None)
   }
+  let before = budget.total_output
   let segments : Array[Pcf2Segment] = []
   let mut cursor = 0
   let mut offset = 0
@@ -28,6 +29,7 @@ fn encode_zip(
     }
     let flags = read_u16_le(input, offset + 6)
     if (flags & 0x0008) != 0 {
+      budget.total_output = before
       return Ok(None)
     }
     let compression = read_u16_le(input, offset + 8)
@@ -64,7 +66,10 @@ fn encode_zip(
     if compression == 8 {
       match encode_deflate(slice, config, depth, budget) {
         Ok(Some(seg)) => segments.push(seg)
-        Ok(None) => return Ok(None)
+        Ok(None) => {
+          budget.total_output = before
+          return Ok(None)
+        }
         Err(e) => return Err(e)
       }
     } else {
@@ -74,6 +79,7 @@ fn encode_zip(
     offset = data_end
   }
   if segments.length() == 0 {
+    budget.total_output = before
     return Ok(None)
   }
   if cursor < ilen {
@@ -92,13 +98,17 @@ fn encode_swf(
   if ilen < 8 || !bytes_starts_with(input, swf_cws_magic) {
     return Ok(None)
   }
+  let before = budget.total_output
   let header = bytes_slice(input, 0, 8)
   let body = bytes_slice(input, 8, ilen)
   let segments : Array[Pcf2Segment] = []
   segments.push(Pcf2Segment::lit(header))
   match encode_zlib(body, config, depth, budget) {
     Ok(Some(seg)) => segments.push(seg)
-    Ok(None) => return Ok(None)
+    Ok(None) => {
+      budget.total_output = before
+      return Ok(None)
+    }
     Err(e) => return Err(e)
   }
   Ok(Some(segments))

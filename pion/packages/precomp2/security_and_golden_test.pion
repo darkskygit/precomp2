@@ -735,3 +735,138 @@ test "golden_lz4_byte_exact_matches_rust_and_c_liblz4" {
     ci += 1
   }
 }
+
+test "adversarial_short_inputs_and_bomb_budgets" {
+  let tight_dec = DecodeConfig::{ max_depth: 4, max_total_output: 1048576UL, recover: false }
+  let tight_rec = DecodeConfig::{ max_depth: 4, max_total_output: 1048576UL, recover: true }
+  let tight_enc = EncodeConfig::{
+    max_depth: 4,
+    max_expand_ratio: 16.0,
+    max_total_output: 1048576UL,
+    enable_png_webp: true,
+    enable_pdf_predictor: true,
+    enable_pdf_dct: true,
+    enable_pdf_ascii: true,
+    enable_pdf_images: true,
+    max_pdf_filters: 16,
+  }
+
+  // 1. Exact 6-byte malformed input from AFFiNE/T3 + truncated gzip header.
+  let bad_six = make_test_bytes([0x00, 0x05, 0x00, 0x00, 0x00, 0x00])
+  let bad_gzip = make_test_bytes([
+    0x1F, 0x8B, 8, 0x04, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0,
+  ])
+  let samples : Array[Bytes] = [bad_six, Bytes::new(0), "PCF2".to_bytes(), bad_gzip]
+  let mut si = 0
+  while si < samples.length() {
+    let inp = samples[si]
+    match decode_bytes(inp, tight_dec) {
+      Err(_) => ()
+      Ok(_) => debug_assert(false, "malformed input must return Err on decode_bytes")
+    }
+    match decode_bytes(inp, tight_rec) {
+      Err(_) => ()
+      Ok(_) => debug_assert(false, "malformed input must return Err on recover")
+    }
+    match decode_image_for_display(inp, tight_dec) {
+      Err(_) => ()
+      Ok(_) => debug_assert(false, "malformed input must return Err on display")
+    }
+    let enc = match encode_bytes(inp, tight_enc) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "malformed input must encode as lit: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    match decode_bytes(enc, tight_dec) {
+      Ok(dec) => debug_assert(bytes_eq(dec, inp), "malformed input roundtrip mismatch")
+      Err(e) => debug_assert(false, "malformed input roundtrip failed: " + e.to_string())
+    }
+    si += 1
+  }
+
+  // 2. Zlib 2 MiB zero bomb stays literal under 1 MiB encode budget and roundtrips.
+  let zeros_2m = Bytes::new(2097152)
+  let zlib_bomb = flate::zlib_compress_default(zeros_2m)
+  let enc_bomb = match encode_bytes(zlib_bomb, tight_enc) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "zlib bomb encode failed: " + e.to_string())
+      Bytes::new(0)
+    }
+  }
+  let pf_bomb = match Pcf2File::decode(enc_bomb) {
+    Ok(f) => f
+    Err(_) => Pcf2File::from_segments([])
+  }
+  debug_assert(pf_bomb.segments.length() == 1 && pf_bomb.segments[0].kind == SegmentKind::Lit.to_u8(), "zlib bomb must stay literal")
+  match decode_bytes(enc_bomb, DecodeConfig::default()) {
+    Ok(dec) => debug_assert(bytes_eq(dec, zlib_bomb), "zlib bomb roundtrip mismatch")
+    Err(_) => debug_assert(false, "zlib bomb decode failed")
+  }
+
+  // 3. Forged header claiming 1 TiB original_size fails immediately under 1 MiB budget.
+  let forged_hdr = match Pcf2Header::new(1099511627776UL).encode() {
+    Ok(b) => b
+    Err(_) => Bytes::new(0)
+  }
+  match decode_bytes(forged_hdr, tight_dec) {
+    Err(Error::Other(_)) => ()
+    _ => debug_assert(false, "forged 1TiB header must fail decode budget")
+  }
+
+  // 4. Forged PngIdat WebP 16383x16383 RGBA fails budget before WebP decode.
+  let wm : Array[Byte] = [
+    (1).to_byte(), (0).to_byte(), (1).to_byte(),
+    (0x78).to_byte(), (0x9C).to_byte(),
+    (0).to_byte(), (0).to_byte(), (0).to_byte(), (1).to_byte(),
+  ]
+  write_varint(1UL, wm)
+  write_varint(6UL, wm)
+  wm.push((0).to_byte())
+  wm.push((6).to_byte())
+  write_varint(16383UL, wm)
+  write_varint(16383UL, wm)
+  let mut fi = 0
+  while fi < 16383 {
+    wm.push((0).to_byte())
+    fi += 1
+  }
+  let webp_bomb = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::PngIdat.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 18UL,
+    meta: arr_to_bytes(wm),
+    data: make_test_bytes([0, 0]),
+  })
+  match decode_bytes(webp_bomb, tight_dec) {
+    Err(Error::Other(_)) => ()
+    _ => debug_assert(false, "16383x16383 WebP PngIdat must fail budget before WebP decode")
+  }
+
+  // 5. Pcf2File::encode rejects overflowing UInt64 orig_len sums cleanly.
+  let overflow_file = Pcf2File::{
+    header: Pcf2Header::new(0UL),
+    segments: [
+      Pcf2Segment::{
+        kind: SegmentKind::Dflt.to_u8(),
+        flags: (0).to_byte(),
+        orig_len: 0xFFFFFFFFFFFFFFFFUL,
+        meta: Bytes::new(0),
+        data: Bytes::new(0),
+      },
+      Pcf2Segment::{
+        kind: SegmentKind::Dflt.to_u8(),
+        flags: (0).to_byte(),
+        orig_len: 1UL,
+        meta: Bytes::new(0),
+        data: Bytes::new(0),
+      },
+    ],
+  }
+  match overflow_file.encode() {
+    Err(Error::LengthOverflow) => ()
+    _ => debug_assert(false, "Pcf2File::encode must return LengthOverflow on u64 sum overflow")
+  }
+}

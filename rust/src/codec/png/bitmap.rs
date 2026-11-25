@@ -64,7 +64,7 @@ pub(super) fn png_bytes_per_pixel(color_type: u8) -> Result<usize> {
   }
 }
 
-fn png_row_bytes(width: u32, bpp: usize) -> Result<usize> {
+pub(super) fn png_row_bytes(width: u32, bpp: usize) -> Result<usize> {
   let width = usize::try_from(width).map_err(|_| Error::InvalidSegment("png width"))?;
   width.checked_mul(bpp).ok_or(Error::InvalidSegment("png row overflow"))
 }
@@ -104,7 +104,11 @@ pub(super) fn apply_png_filters_with_types(bitmap: &[u8], width: u32, height: u3
     return Err(Error::InvalidSegment("png bitmap size"));
   }
 
-  let mut out = vec![0u8; (row_bytes + 1) * height_usize];
+  let out_len = row_bytes
+    .checked_add(1)
+    .and_then(|v| v.checked_mul(height_usize))
+    .ok_or(Error::InvalidSegment("png size overflow"))?;
+  let mut out = vec![0u8; out_len];
   let zeros = vec![0u8; row_bytes.min(bitmap.len())];
   let mut prev = zeros.as_slice();
   for ((row, scanline), &filter) in bitmap.chunks_exact(row_bytes).zip(out.chunks_exact_mut(row_bytes + 1)).zip(filters) {
