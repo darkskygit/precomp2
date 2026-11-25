@@ -134,7 +134,9 @@ impl<'a> Parser<'a> {
 
   fn word(&mut self, word: &[u8]) -> bool {
     self.skip();
-    let end = self.pos + word.len();
+    let Some(end) = self.pos.checked_add(word.len()) else {
+      return false;
+    };
     if self.data.get(self.pos..end) == Some(word) && self.data.get(end).is_none_or(|b| delimiter(*b)) {
       self.pos = end;
       true
@@ -170,9 +172,11 @@ impl<'a> Parser<'a> {
             break;
           }
           if b == b'#' {
-            let h = self.data.get(self.pos + 1..self.pos + 3)?;
+            let h_start = self.pos.checked_add(1)?;
+            let h_end = self.pos.checked_add(3)?;
+            let h = self.data.get(h_start..h_end)?;
             name.push(u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?);
-            self.pos += 3;
+            self.pos = h_end;
           } else {
             name.push(b);
             self.pos += 1;
@@ -193,12 +197,12 @@ impl<'a> Parser<'a> {
         }
         Some(Value::Array(items))
       }
-      b'<' if self.data.get(self.pos + 1) == Some(&b'<') => {
+      b'<' if self.pos.checked_add(1).and_then(|p| self.data.get(p)) == Some(&b'<') => {
         self.pos += 2;
         let mut items = BTreeMap::new();
         loop {
           self.skip();
-          if self.data.get(self.pos..self.pos + 2) == Some(b">>") {
+          if self.pos.checked_add(2).and_then(|end| self.data.get(self.pos..end)) == Some(b">>") {
             self.pos += 2;
             break;
           }

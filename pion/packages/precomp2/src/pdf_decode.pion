@@ -6,6 +6,10 @@ fn decode_pdf_stream(
   depth : Int,
   budget : DecodeBudget,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   if depth > config.max_depth ||
   segment.meta.length() == 0 ||
   segment.meta[0] != (0).to_byte() {
@@ -110,7 +114,8 @@ fn decode_pdf_stream(
         meta: st.meta,
         data: bytes,
       }
-      match decode_jpg_segment(jpeg_seg, DecodeBudget::new(), config) {
+      let step_budget = DecodeBudget::{ total_output: budget.total_output }
+      match decode_jpg_segment(jpeg_seg, step_budget, config) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
@@ -148,6 +153,9 @@ fn pdf_count_steps(
   let mut pos = p1
   let mut i = 0
   while i < count {
+    if pos >= segment.meta.length() {
+      return Err(Error::InvalidSegment("pdf step"))
+    }
     let kind = segment.meta[pos]
     pos += 1
     let (_, np1) = match pdf_read_num(segment.meta, pos) {

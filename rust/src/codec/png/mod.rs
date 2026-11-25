@@ -3,7 +3,7 @@ mod display;
 
 use std::borrow::Cow;
 
-use bitmap::{PngIhdr, PngWebpMeta, apply_png_filters_with_types, png_bytes_per_pixel, undo_png_filters};
+use bitmap::{PngIhdr, PngWebpMeta, apply_png_filters_with_types, png_bytes_per_pixel, png_row_bytes, undo_png_filters};
 pub(super) use bitmap::{decode_webp_bitmap, encode_webp_lossless};
 use crc32fast::Hasher;
 pub(super) use display::extract_png_display;
@@ -14,7 +14,7 @@ use super::{
   budget::{DecodeBudget, EncodeBudget},
   deflate::adler32,
   payload::{choose_payload, decode_payload},
-  preflate::{PreflateAnalysis, build_preflate_data, parse_preflate_data, preflate_analyze, preflate_reencode},
+  preflate::{PreflateAnalysis, build_preflate_data, parse_preflate_data, preflate_analyze_limited, preflate_reencode},
   varint::{read_varint_slice, write_varint_vec},
 };
 use crate::{
@@ -41,13 +41,17 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
   let mut first_idat_start = None;
   let mut last_idat_end = None;
 
-  while offset + 12 <= input.len() {
+  while input.len().saturating_sub(offset) >= 12 {
     let len = u32::from_be_bytes([input[offset], input[offset + 1], input[offset + 2], input[offset + 3]]) as usize;
     let chunk_type = &input[offset + 4..offset + 8];
     let data_start = offset + 8;
-    let data_end = data_start + len;
+    let Some(data_end) = data_start.checked_add(len) else {
+      break;
+    };
     let crc_start = data_end;
-    let crc_end = crc_start + 4;
+    let Some(crc_end) = crc_start.checked_add(4) else {
+      break;
+    };
     if crc_end > input.len() {
       break;
     }
@@ -102,15 +106,17 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
     return Ok(None);
   }
 
+  let remaining = budget.remaining(config);
+  let limit = usize::try_from(remaining).unwrap_or(usize::MAX);
   let Ok(PreflateAnalysis {
     deflate_len,
     corrections,
     plain,
-  }) = preflate_analyze(deflate)
+  }) = preflate_analyze_limited(deflate, limit)
   else {
     return Ok(None);
   };
-  if deflate_len != deflate.len() as u64 {
+  if deflate_len != deflate.len() as u64 || (plain.len() as u64) > remaining {
     return Ok(None);
   }
   let adler = adler32(&plain);
@@ -127,6 +133,7 @@ pub(super) fn encode_png(input: &[u8], config: &EncodeConfig, depth: u32, budget
     let bpp = ihdr.bytes_per_pixel()?;
     if let Ok((bitmap, filters)) = undo_png_filters(&payload_bytes, ihdr.width, ihdr.height, bpp)
       && let Ok(webp_bytes) = encode_webp_lossless(&bitmap, ihdr.width, ihdr.height, ihdr.color_type)
+      && (webp_bytes.len() as u64) <= remaining
     {
       png_payload_kind = 1;
       payload_bytes = webp_bytes;
@@ -282,6 +289,7 @@ fn parse_png_meta(segment: &Pcf2Segment) -> Result<ParsedPngMeta> {
 }
 
 pub(super) fn decode_png_segment(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   let ParsedPngMeta {
     payload_kind,
     png_payload_kind,
@@ -293,30 +301,54 @@ pub(super) fn decode_png_segment(segment: &Pcf2Segment, config: &DecodeConfig, d
     webp_meta,
   } = parse_png_meta(segment)?;
 
+  let total_len = idat_lengths
+    .iter()
+    .try_fold(0usize, |sum, &len| sum.checked_add(len))
+    .ok_or(Error::InvalidSegment("png idat length mismatch"))?;
+  let framed_len = idat_lengths
+    .iter()
+    .try_fold(0u64, |sum, &len| {
+      u32::try_from(len).ok()?;
+      sum.checked_add(len as u64)?.checked_add(12)
+    })
+    .ok_or(Error::InvalidSegment("png idat length mismatch"))?;
+  budget.check(framed_len, config)?;
+
   let (corrections, payload) = parse_preflate_data(&segment.data)?;
   let payload = decode_payload(payload_kind, payload, config, depth, budget)?;
   let plain = if png_payload_kind == 0 {
     payload
   } else {
     let meta = webp_meta.ok_or(Error::InvalidSegment("png webp meta"))?;
-    let bitmap = decode_webp_bitmap(&payload, meta.width, meta.height, meta.color_type)?;
     let bpp = png_bytes_per_pixel(meta.color_type)?;
+    let row_bytes = png_row_bytes(meta.width, bpp)?;
+    let height_usize = usize::try_from(meta.height).map_err(|_| Error::InvalidSegment("png height"))?;
+    let bitmap_len = row_bytes
+      .checked_mul(height_usize)
+      .ok_or(Error::InvalidSegment("png size overflow"))?;
+    let filtered_len = row_bytes
+      .checked_add(1)
+      .and_then(|v| v.checked_mul(height_usize))
+      .ok_or(Error::InvalidSegment("png size overflow"))?;
+    budget.check(bitmap_len as u64, config)?;
+    budget.check(filtered_len as u64, config)?;
+    let bitmap = decode_webp_bitmap(&payload, meta.width, meta.height, meta.color_type)?;
     Cow::Owned(apply_png_filters_with_types(&bitmap, meta.width, meta.height, bpp, &meta.filters)?)
   };
   let idat_data = preflate_reencode(corrections, &plain)?;
-  let mut full_idat = Vec::with_capacity(idat_data.len() + 6);
+  let full_len = idat_data.len().checked_add(6).ok_or(Error::LengthOverflow)?;
+  if total_len != full_len {
+    return Err(Error::InvalidSegment("png idat length mismatch"));
+  }
+  let mut full_idat = Vec::with_capacity(full_len);
   full_idat.extend_from_slice(&zlib_header);
   full_idat.extend_from_slice(&idat_data);
   full_idat.extend_from_slice(&zlib_footer);
-  let total_len = idat_lengths.iter().try_fold(0usize, |sum, &len| sum.checked_add(len));
-  if total_len != Some(full_idat.len()) {
-    return Err(Error::InvalidSegment("png idat length mismatch"));
-  }
 
   let mut out = Vec::new();
   let mut cursor = 0usize;
-  for (idx, len) in idat_lengths.iter().enumerate() {
-    let len_u32 = *len as u32;
+  for (idx, &len) in idat_lengths.iter().enumerate() {
+    let len_u32 = u32::try_from(len).map_err(|_| Error::InvalidSegment("png idat length mismatch"))?;
     out.extend_from_slice(&len_u32.to_be_bytes());
     out.extend_from_slice(b"IDAT");
     out.extend_from_slice(&full_idat[cursor..cursor + len]);

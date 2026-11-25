@@ -32,6 +32,7 @@ pub(super) fn parse_preflate_data(data: &[u8]) -> Result<(&[u8], &[u8])> {
   Ok((corrections, payload))
 }
 
+#[cfg(test)]
 pub(super) fn preflate_analyze(deflate: &[u8]) -> Result<PreflateAnalysis> {
   preflate_analyze_limited(deflate, PREFLATE_PLAIN_TEXT_LIMIT)
 }

@@ -73,6 +73,9 @@ pub(super) fn encode_base64(input: &[u8], config: &EncodeConfig, depth: u32, bud
   let Some(block) = parse_base64_block(input) else {
     return Ok(None);
   };
+  if (block.decoded.len() as u64) > budget.remaining(config) {
+    return Ok(None);
+  }
   let (payload_kind, payload) = choose_payload(block.decoded, input.len(), config, depth, budget)?;
 
   let mut meta = Vec::new();

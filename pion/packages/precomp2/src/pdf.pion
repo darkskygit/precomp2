@@ -299,11 +299,17 @@ fn pdf_encode_stream(
       }
       (n, pdf_op_a85, m)
     } else if is_flate {
-      let remaining = u64_saturating_sub(
-        config.max_total_output,
-        budget.total_output,
-      )
-      let ratio_cap = (bytes.length().to_double() * config.max_expand_ratio).to_int64().to_uint64()
+      let remaining = budget.remaining(config)
+      let ratio_cap = if config.max_expand_ratio <= 0.0 {
+        0UL
+      } else {
+        let scaled = bytes.length().to_double() * config.max_expand_ratio
+        if scaled >= 2147483647.0 {
+          2147483647UL
+        } else {
+          scaled.to_int64().to_uint64()
+        }
+      }
       let lim_u = if remaining < ratio_cap { remaining } else { ratio_cap }
       let lim = if lim_u > 2147483647UL { 2147483647 } else { lim_u.to_int() }
       let (n, m) = match pdf_unpack_flate(bytes, lim) {

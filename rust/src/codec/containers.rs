@@ -9,24 +9,34 @@ pub(super) fn encode_zip(input: &[u8], config: &EncodeConfig, depth: u32, budget
   if input.len() < 4 || &input[..4] != b"PK\x03\x04" {
     return Ok(None);
   }
+  let before = budget.total_output;
   let mut segments = Vec::new();
   let mut cursor = 0usize;
   let mut offset = 0usize;
 
-  while offset + 30 <= input.len() {
+  while input.len().saturating_sub(offset) >= 30 {
     if &input[offset..offset + 4] != b"PK\x03\x04" {
       break;
     }
     let flags = u16::from_le_bytes([input[offset + 6], input[offset + 7]]);
     if flags & 0x0008 != 0 {
+      budget.total_output = before;
       return Ok(None);
     }
     let compression = u16::from_le_bytes([input[offset + 8], input[offset + 9]]);
     let compressed_size = u32::from_le_bytes([input[offset + 18], input[offset + 19], input[offset + 20], input[offset + 21]]) as usize;
     let name_len = u16::from_le_bytes([input[offset + 26], input[offset + 27]]) as usize;
     let extra_len = u16::from_le_bytes([input[offset + 28], input[offset + 29]]) as usize;
-    let data_start = offset + 30 + name_len + extra_len;
-    let data_end = data_start + compressed_size;
+    let Some(data_start) = offset
+      .checked_add(30)
+      .and_then(|v| v.checked_add(name_len))
+      .and_then(|v| v.checked_add(extra_len))
+    else {
+      break;
+    };
+    let Some(data_end) = data_start.checked_add(compressed_size) else {
+      break;
+    };
     if data_end > input.len() {
       break;
     }
@@ -39,6 +49,7 @@ pub(super) fn encode_zip(input: &[u8], config: &EncodeConfig, depth: u32, budget
       if let Some(segment) = encode_deflate(&input[data_start..data_end], config, depth, budget)? {
         segments.push(segment);
       } else {
+        budget.total_output = before;
         return Ok(None);
       }
     } else {
@@ -50,6 +61,7 @@ pub(super) fn encode_zip(input: &[u8], config: &EncodeConfig, depth: u32, budget
   }
 
   if segments.is_empty() {
+    budget.total_output = before;
     return Ok(None);
   }
 
@@ -67,6 +79,7 @@ pub(super) fn encode_swf(input: &[u8], config: &EncodeConfig, depth: u32, budget
   if &input[..3] != b"CWS" {
     return Ok(None);
   }
+  let before = budget.total_output;
   let header = &input[..8];
   let body = &input[8..];
   let mut segments = Vec::new();
@@ -74,6 +87,7 @@ pub(super) fn encode_swf(input: &[u8], config: &EncodeConfig, depth: u32, budget
   if let Some(segment) = encode_zlib(body, config, depth, budget)? {
     segments.push(segment);
   } else {
+    budget.total_output = before;
     return Ok(None);
   }
   Ok(Some(segments))

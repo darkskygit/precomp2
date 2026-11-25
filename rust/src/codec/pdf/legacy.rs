@@ -24,6 +24,7 @@ pub(crate) fn decode_pdf_flate_segment(
   depth: u32,
   budget: &mut DecodeBudget,
 ) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   if segment.meta.len() < 4 {
     return Err(Error::InvalidSegment("pdf meta"));
   }
@@ -63,7 +64,7 @@ pub(crate) fn decode_pdf_flate_segment(
     let colors = segment.meta[offset + 1];
     let bpc = segment.meta[offset + 2];
     offset += 3;
-    let columns = read_varint_slice(&segment.meta, &mut offset)? as u32;
+    let columns = u32::try_from(read_varint_slice(&segment.meta, &mut offset)?).map_err(|_| Error::LengthOverflow)?;
     Some(PdfDecodeParms {
       predictor,
       colors,
@@ -80,8 +81,8 @@ pub(crate) fn decode_pdf_flate_segment(
     }
     let mode = segment.meta[offset];
     offset += 1;
-    let width = read_varint_slice(&segment.meta, &mut offset)? as u32;
-    let height = read_varint_slice(&segment.meta, &mut offset)? as u32;
+    let width = u32::try_from(read_varint_slice(&segment.meta, &mut offset)?).map_err(|_| Error::LengthOverflow)?;
+    let height = u32::try_from(read_varint_slice(&segment.meta, &mut offset)?).map_err(|_| Error::LengthOverflow)?;
     Some(PdfBmpMeta { mode, width, height })
   } else {
     None

@@ -148,6 +148,10 @@ fn decode_pdf_flate_segment(
   depth : Int,
   budget : DecodeBudget,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let mlen = segment.meta.length()
   if mlen < 4 {
     return Err(Error::InvalidSegment("pdf meta"))
@@ -186,6 +190,9 @@ fn decode_pdf_flate_segment(
       Ok(v) => v
       Err(e) => return Err(e)
     }
+    if cols_u > 0xFFFFFFFFUL {
+      return Err(Error::LengthOverflow)
+    }
     offset = np
     predictor_meta = Some(PdfDecodeParms::{
       predictor,
@@ -208,6 +215,9 @@ fn decode_pdf_flate_segment(
     let (h_u, p2) = match read_varint_slice(segment.meta, p1) {
       Ok(v) => v
       Err(e) => return Err(e)
+    }
+    if w_u > 0xFFFFFFFFUL || h_u > 0xFFFFFFFFUL {
+      return Err(Error::LengthOverflow)
     }
     offset = p2
     bmp_meta = Some(PdfBmpMeta::{

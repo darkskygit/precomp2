@@ -20,6 +20,13 @@ fn EncodeBudget::consume(
   Ok(())
 }
 
+fn EncodeBudget::remaining(
+  self : EncodeBudget,
+  config : EncodeConfig,
+) -> UInt64 {
+  u64_saturating_sub(config.max_total_output, self.total_output)
+}
+
 struct DecodeBudget {
   mut total_output : UInt64
 }
@@ -28,14 +35,29 @@ fn DecodeBudget::new() -> DecodeBudget {
   DecodeBudget::{ total_output: 0UL }
 }
 
+fn DecodeBudget::remaining(
+  self : DecodeBudget,
+  config : DecodeConfig,
+) -> UInt64 {
+  u64_saturating_sub(config.max_total_output, self.total_output)
+}
+
+fn DecodeBudget::check(
+  self : DecodeBudget,
+  len : UInt64,
+  config : DecodeConfig,
+) -> Result[Unit, Error] {
+  if u64_saturating_add(self.total_output, len) > config.max_total_output {
+    return Err(Error::Other("decode output exceeds budget"))
+  }
+  Ok(())
+}
+
 fn DecodeBudget::consume(
   self : DecodeBudget,
   len : Int,
   config : DecodeConfig,
 ) -> Result[Unit, Error] {
   self.total_output = u64_saturating_add(self.total_output, len.to_int64().to_uint64())
-  if self.total_output > config.max_total_output {
-    return Err(Error::Other("decode output exceeds budget"))
-  }
-  Ok(())
+  self.check(0UL, config)
 }

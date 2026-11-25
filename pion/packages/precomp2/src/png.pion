@@ -99,7 +99,9 @@ fn encode_png(
     return Ok(None)
   }
   let deflate = bytes_slice(idat_bytes, 2, zlen - 4)
-  let pf = match preflate_analyze(deflate) {
+  let rem = budget.remaining(config)
+  let lim = if rem > 2147483647UL { 2147483647 } else { rem.to_int() }
+  let pf = match preflate_analyze_limited(deflate, lim) {
     Ok(v) => v
     Err(_) => return Ok(None)
   }
@@ -107,7 +109,8 @@ fn encode_png(
     Ok(v) => v
     Err(_) => return Ok(None)
   }
-  if deflate_len != deflate.length().to_int64().to_uint64() {
+  if deflate_len != deflate.length().to_int64().to_uint64() ||
+  plain.length().to_int64().to_uint64() > rem {
     return Ok(None)
   }
   if adler32(plain) != read_u32_be(idat_bytes, zlen - 4) {
@@ -127,7 +130,8 @@ fn encode_png(
         Ok((bitmap, filters)) =>
         match
         encode_webp_lossless(bitmap, ihdr.width, ihdr.height, ihdr.color_type) {
-          Ok(webp_bytes) => {
+          Ok(webp_bytes) =>
+          if webp_bytes.length().to_int64().to_uint64() <= rem {
             png_payload_kind = (1).to_byte()
             payload_bytes = webp_bytes
             webp_meta = Some(PngWebpMeta::{
@@ -325,6 +329,10 @@ fn decode_png_segment(
   depth : Int,
   budget : DecodeBudget,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let meta = match parse_png_meta(segment) {
     Ok(m) => m
     Err(e) => return Err(e)
@@ -334,13 +342,24 @@ fn decode_png_segment(
     Err(e) => return Err(e)
   }
   let mut total_len = 0
+  let mut framed_len : UInt64 = 0UL
   let mut li = 0
   while li < meta.idat_lengths.length() {
-    total_len = match int_checked_add(total_len, meta.idat_lengths[li]) {
+    let clen = meta.idat_lengths[li]
+    total_len = match int_checked_add(total_len, clen) {
       Some(v) => v
       None => return Err(Error::LengthOverflow)
     }
+    let chunk_total = clen.to_int64().to_uint64() + 12UL
+    if chunk_total > 0xFFFFFFFFFFFFFFFFUL - framed_len {
+      return Err(Error::LengthOverflow)
+    }
+    framed_len = framed_len + chunk_total
     li += 1
+  }
+  match budget.check(framed_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
   }
   let payload = match
   decode_payload(meta.payload_kind, raw_payload, config, depth, budget) {
@@ -354,12 +373,40 @@ fn decode_png_segment(
       Some(m) => m
       None => return Err(Error::InvalidSegment("png webp meta"))
     }
-    let bitmap = match
-    decode_webp_bitmap(payload, wm.width, wm.height, wm.color_type) {
+    let bpp = match png_bytes_per_pixel(wm.color_type) {
       Ok(b) => b
       Err(e) => return Err(e)
     }
-    let bpp = match png_bytes_per_pixel(wm.color_type) {
+    let row_bytes = match png_row_bytes(wm.width, bpp) {
+      Ok(v) => v
+      Err(e) => return Err(e)
+    }
+    if wm.height > 0x7FFFFFFFU {
+      return Err(Error::InvalidSegment("png height"))
+    }
+    let h = wm.height.to_int()
+    let bitmap_len = match int_checked_mul(row_bytes, h) {
+      Some(v) => v
+      None => return Err(Error::InvalidSegment("png size overflow"))
+    }
+    let stride = match int_checked_add(row_bytes, 1) {
+      Some(v) => v
+      None => return Err(Error::InvalidSegment("png size overflow"))
+    }
+    let filtered_len = match int_checked_mul(stride, h) {
+      Some(v) => v
+      None => return Err(Error::InvalidSegment("png size overflow"))
+    }
+    match budget.check(bitmap_len.to_int64().to_uint64(), config) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    match budget.check(filtered_len.to_int64().to_uint64(), config) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    let bitmap = match
+    decode_webp_bitmap(payload, wm.width, wm.height, wm.color_type) {
       Ok(b) => b
       Err(e) => return Err(e)
     }

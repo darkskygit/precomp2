@@ -279,7 +279,8 @@ fn unpack_flate(bytes: &[u8], limit: usize) -> Result<(Vec<u8>, Vec<u8>)> {
     .ok()
     .and_then(|n| n.checked_add(2))
     .ok_or(Error::LengthOverflow)?;
-  let checksum = bytes.get(end..end + 4).ok_or(Error::InvalidSegment("pdf zlib checksum"))?;
+  let checksum_end = end.checked_add(4).ok_or(Error::LengthOverflow)?;
+  let checksum = bytes.get(end..checksum_end).ok_or(Error::InvalidSegment("pdf zlib checksum"))?;
   if checksum != adler32(&plain).to_be_bytes() {
     return Err(Error::InvalidSegment("pdf zlib checksum"));
   }
@@ -291,6 +292,7 @@ fn unpack_flate(bytes: &[u8], limit: usize) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 pub(super) fn decode_pdf_stream(segment: &Pcf2Segment, config: &DecodeConfig, depth: u32, budget: &mut DecodeBudget) -> Result<Vec<u8>> {
+  budget.check(segment.orig_len, config)?;
   if depth > config.max_depth || segment.meta.first() != Some(&0) {
     return Err(Error::InvalidSegment("pdf stream version"));
   }
@@ -344,7 +346,10 @@ pub(super) fn decode_pdf_stream(segment: &Pcf2Segment, config: &DecodeConfig, de
           meta: meta.to_vec(),
           data: bytes.into_owned(),
         };
-        decode_jpg_segment(&jpeg, &mut DecodeBudget::default(), config)?
+        let mut step_budget = DecodeBudget {
+          total_output: budget.total_output,
+        };
+        decode_jpg_segment(&jpeg, &mut step_budget, config)?
       }
       WEBP => image::decode(&bytes, meta, len)?,
       _ => return Err(Error::InvalidSegment("pdf operation")),
@@ -365,7 +370,7 @@ fn count_steps(segment: &Pcf2Segment, stats: &mut PdfStats) -> Result<()> {
   let mut pos = 1;
   let count = read_num(&segment.meta, &mut pos)?;
   for _ in 0..count {
-    let kind = segment.meta[pos];
+    let kind = *segment.meta.get(pos).ok_or(Error::InvalidSegment("pdf step"))?;
     pos += 1;
     read_num(&segment.meta, &mut pos)?;
     read_blob(&segment.meta, &mut pos)?;

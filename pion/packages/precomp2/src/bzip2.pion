@@ -40,19 +40,14 @@ fn encode_bzip2(
     return Ok(None)
   }
   let level_num = level_b - 0x30
-  let rem_u64 = u64_saturating_sub(
-    config.max_total_output,
-    budget.total_output,
-  )
+  let rem_u64 = budget.remaining(config)
   let max_out = if rem_u64 > 2147483647UL { 2147483647 } else { rem_u64.to_int() }
   let plain = match bzip2::decompress_limited(input, max_out) {
     Ok(v) => v
     Err(_) => return Ok(None)
   }
-  let (payload_kind, payload) = match
-  choose_payload(plain, input.length(), config, depth, budget) {
-    Ok(v) => v
-    Err(e) => return Err(e)
+  if plain.length().to_int64().to_uint64() > rem_u64 {
+    return Ok(None)
   }
   let recompressed = match bzip2::compress(plain, level_num) {
     Ok(v) => v
@@ -62,6 +57,12 @@ fn encode_bzip2(
     return Ok(None)
   }
   let penalty = compute_penalty(input, recompressed)
+  let plain_len = plain.length()
+  let (payload_kind, payload) = match
+  choose_payload(plain, input.length(), config, depth, budget) {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
   let meta : Array[Byte] = []
   meta.push((0).to_byte())
   meta.push(payload_kind)
@@ -73,7 +74,7 @@ fn encode_bzip2(
     meta.push(penalty[i].value)
     i += 1
   }
-  write_varint(plain.length().to_int64().to_uint64(), meta)
+  write_varint(plain_len.to_int64().to_uint64(), meta)
   Ok(
     Some(Pcf2Segment::{
       kind: SegmentKind::Bzip2.to_u8(),
@@ -91,6 +92,10 @@ fn decode_bzip2_segment(
   depth : Int,
   budget : DecodeBudget,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let mlen = segment.meta.length()
   if mlen < 3 {
     return Err(Error::InvalidSegment("bzip2 meta"))

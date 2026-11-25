@@ -201,6 +201,8 @@ fn extract_png_display(
   let metadata_buf : Array[Byte] = []
   let mut carrier : Option[Bytes] = None
   let mut parsed : Option[PngWebpMeta] = None
+  let mut carrier_charged = false
+  let budget = DecodeBudget::new()
   let mut i = 0
   while i < segments.length() {
     let seg = segments[i]
@@ -222,18 +224,32 @@ fn extract_png_display(
       if meta.png_payload_kind == (0).to_byte() {
         return Ok(None)
       }
+      let mut framed : UInt64 = 0UL
+      let mut li = 0
+      while li < meta.idat_lengths.length() {
+        let chunk_total = meta.idat_lengths[li].to_int64().to_uint64() + 12UL
+        if chunk_total > 0xFFFFFFFFFFFFFFFFUL - framed {
+          return Err(Error::InvalidSegment("png idat original length"))
+        }
+        framed = framed + chunk_total
+        li += 1
+      }
+      if framed != seg.orig_len {
+        return Err(Error::InvalidSegment("png idat original length"))
+      }
       let dec = match
       decode_payload(
         meta.payload_kind,
         payload,
         config,
         0,
-        DecodeBudget::new(),
+        budget,
       ) {
         Ok(v) => v
         Err(e) => return Err(e)
       }
       carrier = Some(dec)
+      carrier_charged = meta.payload_kind != (0).to_byte()
       parsed = meta.webp_meta
     } else {
       return Err(Error::InvalidSegment("png display segment layout"))
@@ -309,14 +325,15 @@ fn extract_png_display(
     }
     offset = next
   }
-  let budget = DecodeBudget::new()
-  match budget.consume(clen, config) {
-    Err(e) => return Err(e)
-    Ok(_) => ()
+  if !carrier_charged {
+    match budget.consume(clen, config) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
   }
   let icc = match plan.icc {
     Some(compressed) =>
-    match decode_png_icc(compressed, config.max_total_output) {
+    match decode_png_icc(compressed, budget.remaining(config)) {
       Ok(v) => v
       Err(e) => return Err(e)
     }

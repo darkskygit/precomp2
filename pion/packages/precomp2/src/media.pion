@@ -185,6 +185,10 @@ fn decode_jpg_segment(
   budget : DecodeBudget,
   config : DecodeConfig,
 ) -> Result[Bytes, Error] {
+  match budget.check(segment.orig_len, config) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   if segment.meta.length() < 2 {
     return Err(Error::InvalidSegment("jpg meta"))
   }

@@ -16,14 +16,14 @@ pub(super) fn choose_payload(
   depth: u32,
   budget: &mut EncodeBudget,
 ) -> Result<(u8, Vec<u8>)> {
+  budget.consume(plain.len(), config)?;
   if depth < config.max_depth && orig_len > 0 {
     let ratio = plain.len() as f64 / orig_len as f64;
-    if ratio <= config.max_expand_ratio && budget.total_output + plain.len() as u64 <= config.max_total_output {
+    if ratio <= config.max_expand_ratio {
       let nested_segments = super::encode_segments(&plain, config, depth + 1, budget)?;
       let nested_file = Pcf2File::from_segments(nested_segments);
       let mut nested_bytes = Vec::new();
       nested_file.encode(&mut nested_bytes)?;
-      budget.consume(plain.len(), config)?;
       return Ok((1, nested_bytes));
     }
   }

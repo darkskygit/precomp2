@@ -203,7 +203,7 @@ pub struct Pcf2File {
 
 impl Pcf2File {
   pub fn from_segments(segments: Vec<Pcf2Segment>) -> Self {
-    let original_size = segments.iter().map(|segment| segment.orig_len).sum();
+    let original_size = segments.iter().fold(0u64, |sum, segment| sum.saturating_add(segment.orig_len));
     Self {
       header: Pcf2Header::new(original_size),
       segments,
@@ -211,7 +211,11 @@ impl Pcf2File {
   }
 
   pub fn encode<W: Write>(&self, mut writer: W) -> Result<()> {
-    let total: u64 = self.segments.iter().map(|segment| segment.orig_len).sum();
+    let total: u64 = self
+      .segments
+      .iter()
+      .try_fold(0u64, |sum, segment| sum.checked_add(segment.orig_len))
+      .ok_or(Error::LengthOverflow)?;
     if total != self.header.original_size {
       return Err(Error::InvalidHeader("original_size mismatch"));
     }
@@ -263,6 +267,10 @@ impl<R: Read> Pcf2Decoder<R> {
   }
 
   pub fn next_segment(&mut self) -> Result<Option<Pcf2SegmentReader<'_, R>>> {
+    self.next_segment_limited(u64::MAX, u64::MAX)
+  }
+
+  pub(crate) fn next_segment_limited(&mut self, max_meta_len: u64, max_data_len: u64) -> Result<Option<Pcf2SegmentReader<'_, R>>> {
     if self.finished {
       return Ok(None);
     }
@@ -300,6 +308,23 @@ impl<R: Read> Pcf2Decoder<R> {
       return Err(Error::InvalidSegment("flags must be 0 for v1"));
     }
 
+    if orig_len > self.remaining_orig {
+      return Err(Error::InvalidSegment("orig_len exceeds original_size"));
+    }
+
+    if kind == SegmentKind::Lit as u8 {
+      if meta_len != 0 {
+        return Err(Error::InvalidSegment("lit meta must be empty"));
+      }
+      if orig_len != data_len {
+        return Err(Error::InvalidSegment("lit orig_len must match data_len"));
+      }
+    }
+
+    if meta_len > max_meta_len || data_len > max_data_len {
+      return Err(Error::Other("decode output exceeds budget".to_string()));
+    }
+
     let meta_len_usize: usize = meta_len.try_into().map_err(|_| Error::LengthOverflow)?;
     let mut meta = Vec::new();
     self.reader.by_ref().take(meta_len).read_to_end(&mut meta)?;
@@ -310,19 +335,7 @@ impl<R: Read> Pcf2Decoder<R> {
       });
     }
 
-    if orig_len > self.remaining_orig {
-      return Err(Error::InvalidSegment("orig_len exceeds original_size"));
-    }
     self.remaining_orig -= orig_len;
-
-    if kind == SegmentKind::Lit as u8 {
-      if meta_len != 0 {
-        return Err(Error::InvalidSegment("lit meta must be empty"));
-      }
-      if orig_len != data_len {
-        return Err(Error::InvalidSegment("lit orig_len must match data_len"));
-      }
-    }
 
     let mut prefix = Vec::new();
     if kind == SegmentKind::Nested as u8 {
@@ -390,6 +403,11 @@ impl<'a, R: Read> Pcf2SegmentReader<'a, R> {
     segment.validate()?;
     Ok(segment)
   }
+
+  /// Drops this segment without draining the underlying stream.
+  pub(crate) fn abandon(mut self) {
+    self.data.discard_without_draining();
+  }
 }
 
 pub struct LimitedReader<'a, R: Read> {
@@ -407,6 +425,11 @@ impl<'a, R: Read> LimitedReader<'a, R> {
       prefix,
       prefix_pos: 0,
     }
+  }
+
+  pub(crate) fn discard_without_draining(&mut self) {
+    self.remaining = 0;
+    self.prefix_pos = self.prefix.len();
   }
 
   /// Remaining bytes, saturated to `usize` so that a segment of 4 GiB or

@@ -1159,3 +1159,267 @@ fn single_idat_len(segment: &Pcf2Segment) -> u64 {
   assert_eq!(read_varint_slice(&segment.meta, &mut offset).expect("count"), 1);
   read_varint_slice(&segment.meta, &mut offset).expect("length")
 }
+
+#[tokio::test]
+async fn malformed_short_and_truncated_inputs_never_panic() {
+  let bad_six: &[u8] = b"\x00\x05\x00\x00\x00\x00";
+  let bad_gzip_fextra: Vec<u8> = vec![0x1f, 0x8b, 8, 0x04, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0];
+  let bad_gzip_fname: Vec<u8> = vec![
+    0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h',
+  ];
+  let mut bad_zip = vec![0u8; 40];
+  bad_zip[..4].copy_from_slice(b"PK\x03\x04");
+  bad_zip[8..10].copy_from_slice(&8u16.to_le_bytes());
+  bad_zip[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+  let mut bad_png = b"\x89PNG\r\n\x1a\n".to_vec();
+  bad_png.extend_from_slice(&u32::MAX.to_be_bytes());
+  bad_png.extend_from_slice(b"IDAT");
+  bad_png.extend_from_slice(&[0u8; 8]);
+
+  let decode_cfg = DecodeConfig {
+    max_total_output: 1 << 20,
+    ..DecodeConfig::default()
+  };
+  let recover_cfg = DecodeConfig {
+    recover: true,
+    ..decode_cfg.clone()
+  };
+  let encode_cfg = EncodeConfig {
+    max_total_output: 1 << 20,
+    enable_png_webp: true,
+    enable_pdf_predictor: true,
+    ..EncodeConfig::default()
+  };
+
+  for input in [
+    bad_six,
+    b"".as_slice(),
+    b"PCF2".as_slice(),
+    b"PCF2\x02\x00".as_slice(),
+    &bad_gzip_fextra,
+    &bad_gzip_fname,
+    &bad_zip,
+    &bad_png,
+  ] {
+    assert!(decode_bytes(input, &decode_cfg).is_err());
+    assert!(decode_bytes(input, &recover_cfg).is_err());
+    assert!(decode_reader(Cursor::new(input), std::io::sink(), &decode_cfg).is_err());
+    assert!(decode_async(AsyncCursor::new(input.to_vec()), &decode_cfg).await.is_err());
+    assert!(decode_image_for_display(input, &decode_cfg).is_err());
+
+    let encoded = encode_bytes(input, &encode_cfg).expect("malformed input must encode cleanly as lit");
+    assert_eq!(decode_bytes(&encoded, &decode_cfg).expect("roundtrip"), input);
+  }
+
+  // Every byte-prefix truncation of a valid PCF2 container returns Err cleanly.
+  let valid = encode_bytes(PNG_FIXTURE, &encode_cfg).expect("encode png");
+  for len in 0..valid.len() {
+    let prefix = &valid[..len];
+    assert!(decode_bytes(prefix, &decode_cfg).is_err(), "prefix {len}");
+    assert!(
+      decode_reader(Cursor::new(prefix), std::io::sink(), &decode_cfg).is_err(),
+      "prefix {len}"
+    );
+  }
+}
+
+#[test]
+fn deflate_zlib_gzip_zip_and_png_bombs_respect_encode_budget() {
+  let zeros = vec![0u8; 2 << 20];
+  let mut dflt_enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+  dflt_enc.write_all(&zeros).unwrap();
+  let dflt_bomb = dflt_enc.finish().unwrap();
+
+  let mut zlib_enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+  zlib_enc.write_all(&zeros).unwrap();
+  let zlib_bomb = zlib_enc.finish().unwrap();
+
+  let mut gzip_enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+  gzip_enc.write_all(&zeros).unwrap();
+  let gzip_bomb = gzip_enc.finish().unwrap();
+
+  // Multi-entry ZIP: two entries of 700 KiB zeros each (1.4 MiB total > 1 MiB
+  // budget).
+  let part = vec![0u8; 700 * 1024];
+  let mut part_enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+  part_enc.write_all(&part).unwrap();
+  let part_dflt = part_enc.finish().unwrap();
+  let part_crc = crc32fast::hash(&part);
+  let mut multi_zip = Vec::new();
+  for name in [b"a.bin", b"b.bin"] {
+    multi_zip.extend_from_slice(b"PK\x03\x04");
+    multi_zip.extend_from_slice(&20u16.to_le_bytes());
+    multi_zip.extend_from_slice(&0u16.to_le_bytes());
+    multi_zip.extend_from_slice(&8u16.to_le_bytes());
+    multi_zip.extend_from_slice(&0u16.to_le_bytes());
+    multi_zip.extend_from_slice(&0u16.to_le_bytes());
+    multi_zip.extend_from_slice(&part_crc.to_le_bytes());
+    multi_zip.extend_from_slice(&(part_dflt.len() as u32).to_le_bytes());
+    multi_zip.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    multi_zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    multi_zip.extend_from_slice(&0u16.to_le_bytes());
+    multi_zip.extend_from_slice(name);
+    multi_zip.extend_from_slice(&part_dflt);
+  }
+
+  let png_pixels = vec![0u8; 512 * 512 * 4]; // 1 MiB + 512 filter bytes > 1 MiB budget
+  let png_bomb = build_png_rgba(512, 512, &png_pixels);
+
+  let tight = EncodeConfig {
+    max_total_output: 1 << 20,
+    enable_png_webp: true,
+    ..EncodeConfig::default()
+  };
+  for (name, bomb) in [
+    ("deflate", dflt_bomb.as_slice()),
+    ("zlib", zlib_bomb.as_slice()),
+    ("gzip", gzip_bomb.as_slice()),
+    ("multi_zip", multi_zip.as_slice()),
+    ("png", png_bomb.as_slice()),
+  ] {
+    let encoded = encode_bytes(bomb, &tight).expect(name);
+    let segments = decode_segments(&encoded);
+    assert!(
+      segments.iter().all(|s| s.kind == SegmentKind::Lit as u8),
+      "{name} bomb must remain literal under tight budget"
+    );
+    assert_eq!(decode_bytes(&encoded, &DecodeConfig::default()).expect(name), bomb);
+  }
+}
+
+#[tokio::test]
+async fn decode_reader_streams_and_enforces_budgets_before_allocating() {
+  // 1. Streaming roundtrip parity across transformed and literal payloads.
+  let pdf = build_pdf_sample();
+  let zip = build_zip_sample();
+  for sample in [
+    PNG_FIXTURE,
+    JPG_FIXTURE,
+    pdf.as_slice(),
+    zip.as_slice(),
+    b"literal bytes".as_slice(),
+  ] {
+    let encoded = encode_bytes(sample, &EncodeConfig::default()).expect("encode");
+    let mut streamed = Vec::new();
+    let written = decode_reader(Cursor::new(&encoded), &mut streamed, &DecodeConfig::default()).expect("decode_reader");
+    assert_eq!(written as usize, sample.len());
+    assert_eq!(streamed, sample);
+  }
+
+  // 2. Forged header claiming 1 TiB original_size fails immediately on all
+  //    decoders.
+  let mut forged_hdr = Vec::new();
+  Pcf2Header::new(1 << 40).encode(&mut forged_hdr).unwrap();
+  let tight = DecodeConfig {
+    max_total_output: 1 << 20,
+    ..DecodeConfig::default()
+  };
+  for err in [
+    decode_bytes(&forged_hdr, &tight).unwrap_err(),
+    decode_reader(Cursor::new(&forged_hdr), std::io::sink(), &tight).unwrap_err(),
+    decode_async(AsyncCursor::new(forged_hdr.clone()), &tight).await.unwrap_err(),
+  ] {
+    assert!(matches!(err, Error::Other(ref m) if m == "decode output exceeds budget"), "{err:?}");
+  }
+
+  // 3. Forged segment claiming 1 TiB meta_len or data_len backed by infinite
+  //    zeros
+  // fails before reading the payload.
+  for (meta_len, data_len) in [(1u64 << 40, 0u64), (0u64, 1u64 << 40)] {
+    let mut prefix = Vec::new();
+    Pcf2Header::new(64).encode(&mut prefix).unwrap();
+    prefix.push(SegmentKind::Dflt as u8);
+    prefix.push(0);
+    write_varint_vec(64, &mut prefix);
+    write_varint_vec(meta_len, &mut prefix);
+    write_varint_vec(data_len, &mut prefix);
+    let stream = std::io::Read::chain(Cursor::new(prefix), std::io::repeat(0));
+    let err = decode_reader(stream, std::io::sink(), &tight).unwrap_err();
+    assert!(matches!(err, Error::Other(ref m) if m == "decode output exceeds budget"), "{err:?}");
+  }
+
+  // 4. Streaming Lit segment aborts on bounded Write without draining the rest of
+  //    the stream.
+  struct CountingReader<R> {
+    inner: R,
+    read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+  }
+  impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      let n = self.inner.read(buf)?;
+      self.read.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+      Ok(n)
+    }
+  }
+  struct CappedWriter {
+    limit: usize,
+    written: usize,
+  }
+  impl Write for CappedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      if self.written + buf.len() > self.limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::FileTooLarge, "cap reached"));
+      }
+      self.written += buf.len();
+      Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  let big_lit = encode_bytes(&vec![0x55u8; 512 * 1024], &EncodeConfig::default()).unwrap();
+  let bytes_read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+  let reader = CountingReader {
+    inner: Cursor::new(&big_lit),
+    read: bytes_read.clone(),
+  };
+  let err = decode_reader(reader, CappedWriter { limit: 64, written: 0 }, &DecodeConfig::default()).unwrap_err();
+  assert!(matches!(err, Error::Io(_)), "{err:?}");
+  assert!(
+    bytes_read.load(std::sync::atomic::Ordering::Relaxed) <= 128 * 1024,
+    "decode_reader drained too much after write failure"
+  );
+
+  // 5. Forged PngIdat WebP segment with 16383x16383 RGBA fails budget before WebP
+  //    decode.
+  let mut webp_meta = vec![1, 0, 1, 0x78, 0x9c, 0, 0, 0, 1];
+  write_varint_vec(1, &mut webp_meta);
+  write_varint_vec(6, &mut webp_meta);
+  webp_meta.push(0); // no crc
+  webp_meta.push(6); // RGBA
+  write_varint_vec(16383, &mut webp_meta);
+  write_varint_vec(16383, &mut webp_meta);
+  webp_meta.resize(webp_meta.len() + 16383, 0);
+  let webp_seg = Pcf2Segment {
+    kind: SegmentKind::PngIdat as u8,
+    flags: 0,
+    orig_len: 18,
+    meta: webp_meta,
+    data: vec![0, 0],
+  };
+  let err = decode_segment(&webp_seg, &tight, 0, &mut DecodeBudget::default()).unwrap_err();
+  assert!(matches!(err, Error::Other(ref m) if m == "decode output exceeds budget"), "{err:?}");
+
+  // 6. Pcf2File::encode rejects overflowing u64 orig_len sums cleanly.
+  let overflow_file = Pcf2File {
+    header: Pcf2Header::new(0),
+    segments: vec![
+      Pcf2Segment {
+        kind: SegmentKind::Dflt as u8,
+        flags: 0,
+        orig_len: u64::MAX,
+        meta: Vec::new(),
+        data: Vec::new(),
+      },
+      Pcf2Segment {
+        kind: SegmentKind::Dflt as u8,
+        flags: 0,
+        orig_len: 1,
+        meta: Vec::new(),
+        data: Vec::new(),
+      },
+    ],
+  };
+  assert!(matches!(overflow_file.encode(&mut Vec::new()), Err(Error::LengthOverflow)));
+}
