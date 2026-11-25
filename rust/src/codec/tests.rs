@@ -1338,8 +1338,8 @@ async fn decode_reader_streams_and_enforces_budgets_before_allocating() {
     assert!(matches!(err, Error::Other(ref m) if m == "decode output exceeds budget"), "{err:?}");
   }
 
-  // 4. Streaming Lit segment aborts on bounded Write without draining the rest of
-  //    the stream.
+  // 4. Streaming Lit segment aborts on bounded Write without draining the rest
+  //    of the stream.
   struct CountingReader<R> {
     inner: R,
     read: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1381,8 +1381,8 @@ async fn decode_reader_streams_and_enforces_budgets_before_allocating() {
     "decode_reader drained too much after write failure"
   );
 
-  // 5. Forged PngIdat WebP segment with 16383x16383 RGBA fails budget before WebP
-  //    decode.
+  // 5. Forged PngIdat WebP segment with 16383x16383 RGBA fails budget before
+  //    WebP decode.
   let mut webp_meta = vec![1, 0, 1, 0x78, 0x9c, 0, 0, 0, 1];
   write_varint_vec(1, &mut webp_meta);
   write_varint_vec(6, &mut webp_meta);
