@@ -56,6 +56,7 @@ fn make_encode_config(
     max_expand_ratio: d.max_expand_ratio,
     max_total_output: d.max_total_output,
     enable_png_webp,
+    max_webp_pixels: d.max_webp_pixels,
     enable_pdf_predictor,
     enable_pdf_dct: d.enable_pdf_dct,
     enable_pdf_ascii: d.enable_pdf_ascii,

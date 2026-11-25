@@ -24,7 +24,7 @@ fn encode_png(
   if ilen < 8 || !bytes_starts_with(input, png_signature) {
     return Ok(None)
   }
-  let metadata = if config.enable_png_webp {
+  let metadata = if config.enable_png_webp && config.max_webp_pixels > 0UL {
     match parse_png_metadata(input) {
       Ok(plan) => plan
       Err(_) => return Ok(Some([Pcf2Segment::lit(input)]))
@@ -122,28 +122,31 @@ fn encode_png(
   match metadata {
     Some(plan) => {
       let ihdr = plan.ihdr
-      let bpp = match ihdr.bytes_per_pixel() {
-        Ok(b) => b
-        Err(e) => return Err(e)
-      }
-      match undo_png_filters(payload_bytes, ihdr.width, ihdr.height, bpp) {
-        Ok((bitmap, filters)) =>
-        match
-        encode_webp_lossless(bitmap, ihdr.width, ihdr.height, ihdr.color_type) {
-          Ok(webp_bytes) =>
-          if webp_bytes.length().to_int64().to_uint64() <= rem {
-            png_payload_kind = (1).to_byte()
-            payload_bytes = webp_bytes
-            webp_meta = Some(PngWebpMeta::{
-              color_type: ihdr.color_type,
-              width: ihdr.width,
-              height: ihdr.height,
-              filters,
-            })
+      let pixels = ihdr.width.to_uint64() * ihdr.height.to_uint64()
+      if pixels <= config.max_webp_pixels {
+        let bpp = match ihdr.bytes_per_pixel() {
+          Ok(b) => b
+          Err(e) => return Err(e)
+        }
+        match undo_png_filters(payload_bytes, ihdr.width, ihdr.height, bpp) {
+          Ok((bitmap, filters)) =>
+          match
+          encode_webp_lossless(bitmap, ihdr.width, ihdr.height, ihdr.color_type) {
+            Ok(webp_bytes) =>
+            if webp_bytes.length().to_int64().to_uint64() <= rem {
+              png_payload_kind = (1).to_byte()
+              payload_bytes = webp_bytes
+              webp_meta = Some(PngWebpMeta::{
+                color_type: ihdr.color_type,
+                width: ihdr.width,
+                height: ihdr.height,
+                filters,
+              })
+            }
+            Err(_) => ()
           }
           Err(_) => ()
         }
-        Err(_) => ()
       }
     }
     None => ()

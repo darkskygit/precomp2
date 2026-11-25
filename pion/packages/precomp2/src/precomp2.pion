@@ -6,6 +6,7 @@ pub struct EncodeConfig {
   pub max_expand_ratio : Double
   pub max_total_output : UInt64
   pub enable_png_webp : Bool
+  pub max_webp_pixels : UInt64
   pub enable_pdf_predictor : Bool
   pub enable_pdf_dct : Bool
   pub enable_pdf_ascii : Bool
@@ -20,6 +21,7 @@ pub fn EncodeConfig::default() -> EncodeConfig {
     max_expand_ratio: 16.0,
     max_total_output: 4294967296UL,
     enable_png_webp: false,
+    max_webp_pixels: 16777216UL,
     enable_pdf_predictor: false,
     enable_pdf_dct: true,
     enable_pdf_ascii: true,

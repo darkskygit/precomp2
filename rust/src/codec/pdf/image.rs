@@ -9,7 +9,7 @@
 
 use super::{Error, Result, Value, decode_webp_bitmap, encode_webp_lossless, read_num, write_num};
 
-pub(super) fn encode(bytes: &[u8], dict: &Value) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+pub(super) fn encode(bytes: &[u8], dict: &Value, max_webp_pixels: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
   if dict.get(b"Subtype").and_then(Value::name) != Some(b"Image".as_slice()) {
     return Ok(None);
   }
@@ -56,7 +56,10 @@ pub(super) fn encode(bytes: &[u8], dict: &Value) -> Result<Option<(Vec<u8>, Vec<
   }
   let rgb = colors == 3 && bits == 8;
   let encoded_width = if rgb { width } else { row };
-  if encoded_width > 16383 || height > 16383 {
+  let pixels = u64::try_from(encoded_width)
+    .ok()
+    .and_then(|w| u64::try_from(height).ok().and_then(|h| w.checked_mul(h)));
+  if encoded_width > 16383 || height > 16383 || pixels.is_none_or(|px| px > max_webp_pixels) {
     return Ok(None);
   }
   let expanded;

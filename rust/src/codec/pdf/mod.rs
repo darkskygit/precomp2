@@ -230,7 +230,7 @@ fn encode_stream(input: &[u8], dict: &Value, config: &EncodeConfig, depth: u32, 
   }
   if samples
     && config.enable_pdf_images
-    && let Some((encoded, meta)) = image::encode(&bytes, dict)?
+    && let Some((encoded, meta)) = image::encode(&bytes, dict, config.max_webp_pixels)?
     && encoded.len() + meta.len() < bytes.len().min(input.len())
   {
     steps.push(Step {

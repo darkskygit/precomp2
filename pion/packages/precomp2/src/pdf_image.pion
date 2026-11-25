@@ -3,6 +3,7 @@
 fn pdf_image_encode(
   bytes : Bytes,
   dict : PdfValue,
+  max_webp_pixels : UInt64,
 ) -> Result[Option[(Bytes, Bytes)], Error] {
   match dict.get("Subtype".to_bytes()) {
     Some(PdfValue::Name(n)) =>
@@ -89,6 +90,10 @@ fn pdf_image_encode(
   let rgb = colors == 3 && bits == 8
   let encoded_width = if rgb { width } else { row }
   if encoded_width > 16383 || height > 16383 {
+    return Ok(None)
+  }
+  let pixels_count = encoded_width.to_int64().to_uint64() * height.to_int64().to_uint64()
+  if pixels_count > max_webp_pixels {
     return Ok(None)
   }
   let pixels = if rgb {

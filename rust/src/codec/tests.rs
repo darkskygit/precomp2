@@ -1423,3 +1423,92 @@ async fn decode_reader_streams_and_enforces_budgets_before_allocating() {
   };
   assert!(matches!(overflow_file.encode(&mut Vec::new()), Err(Error::LengthOverflow)));
 }
+
+#[test]
+fn max_webp_pixels_falls_back_cleanly_for_png_and_pdf_images() {
+  // 1. PNG 4x4 (16 pixels): WebP carrier used at cap=16, skipped to preflate
+  //    PngIdat at cap=8 and cap=0.
+  let pixels = (0..4 * 4 * 4).map(|i| (i * 13 % 251) as u8).collect::<Vec<_>>();
+  let png = build_png_rgba(4, 4, &pixels);
+  for (cap, expect_webp) in [(16u64, true), (8u64, false), (0u64, false)] {
+    let cfg = EncodeConfig {
+      enable_png_webp: true,
+      max_webp_pixels: cap,
+      ..EncodeConfig::default()
+    };
+    let encoded = encode_bytes(&png, &cfg).expect("encode png");
+    let segments = decode_segments(&encoded);
+    let png_seg = segments.iter().find(|s| s.kind == SegmentKind::PngIdat as u8).expect("png segment");
+    assert_eq!(png_seg.meta[2], u8::from(expect_webp), "png max_webp_pixels={cap}");
+    assert_eq!(decode_bytes(&encoded, &DecodeConfig::default()).expect("decode png"), png);
+  }
+
+  // 2. PDF RGB image 32x32 (1024 pixels): WebP image step used at cap=1024,
+  //    skipped at cap=512 and cap=0.
+  let raw_rgb = vec![42u8; 32 * 32 * 3];
+  let mut pdf = format!(
+    "%PDF-1.7\n1 0 obj << /Subtype /Image /Width 32 /Height 32 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >> stream\n",
+    raw_rgb.len()
+  )
+  .into_bytes();
+  pdf.extend_from_slice(&raw_rgb);
+  pdf.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
+  for (cap, expect_images) in [(1024u64, 1usize), (512u64, 0usize), (0u64, 0usize)] {
+    let cfg = EncodeConfig {
+      enable_pdf_images: true,
+      max_webp_pixels: cap,
+      ..EncodeConfig::default()
+    };
+    let (encoded, stats) = encode_bytes_with_stats(&pdf, &cfg).expect("encode pdf");
+    assert_eq!(stats.images, expect_images, "pdf max_webp_pixels={cap}");
+    assert_eq!(decode_bytes(&encoded, &DecodeConfig::default()).expect("decode pdf"), pdf);
+  }
+}
+
+#[tokio::test]
+async fn per_segment_limits_reject_segbomb_under_default_budget_without_reading_body() {
+  // Even under the default 4 GiB global DecodeConfig budget, a forged segment
+  // claiming orig_len=64 with data_len=64 MiB (or meta_len=4 MiB) must fail at
+  // the segment header before reading or allocating the segment body.
+  let default_cfg = DecodeConfig::default();
+  for (meta_len, data_len) in [(0u64, 64 << 20), (4 << 20, 0u64)] {
+    let mut prefix = Vec::new();
+    Pcf2Header::new(64).encode(&mut prefix).unwrap();
+    prefix.push(SegmentKind::Dflt as u8);
+    prefix.push(0);
+    write_varint_vec(64, &mut prefix);
+    write_varint_vec(meta_len, &mut prefix);
+    write_varint_vec(data_len, &mut prefix);
+
+    let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    struct TrackReader<R> {
+      inner: R,
+      read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl<R: std::io::Read> std::io::Read for TrackReader<R> {
+      fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+      }
+    }
+
+    let prefix_len = prefix.len() as u64;
+    let stream = TrackReader {
+      inner: std::io::Read::chain(Cursor::new(prefix.clone()), std::io::repeat(0)),
+      read: read_bytes.clone(),
+    };
+    let err = decode_reader(stream, std::io::sink(), &default_cfg).unwrap_err();
+    assert!(matches!(err, Error::Other(ref m) if m == "decode output exceeds budget"), "{err:?}");
+    assert!(
+      read_bytes.load(std::sync::atomic::Ordering::Relaxed) <= prefix_len,
+      "segment body must not be read when header exceeds per-segment limit"
+    );
+
+    let async_err = decode_async(AsyncCursor::new(prefix), &default_cfg).await.unwrap_err();
+    assert!(
+      matches!(async_err, Error::Other(ref m) if m == "decode output exceeds budget"),
+      "{async_err:?}"
+    );
+  }
+}

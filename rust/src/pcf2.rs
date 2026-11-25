@@ -10,6 +10,26 @@ pub const PCF2_MAGIC: &[u8; 4] = b"PCF2";
 /// through PdfFlate are unchanged; the PdfStream and UnityFs tags require v2.
 pub const PCF2_VERSION: u16 = 2;
 
+const SEGMENT_META_OVERHEAD: u64 = 2 * 1024 * 1024;
+const SEGMENT_DATA_OVERHEAD: u64 = 2 * 1024 * 1024;
+const SEGMENT_DATA_EXPAND_FACTOR: u64 = 32;
+
+/// Maximum `meta_len` permitted for a single segment claiming `orig_len` bytes
+/// under an overall segment input cap `cap`.
+pub(crate) fn segment_meta_limit(orig_len: u64, cap: u64) -> u64 {
+  cap.min(orig_len.saturating_add(SEGMENT_META_OVERHEAD))
+}
+
+/// Maximum `data_len` permitted for a single segment claiming `orig_len` bytes
+/// under an overall segment input cap `cap`.
+pub(crate) fn segment_data_limit(orig_len: u64, cap: u64) -> u64 {
+  cap.min(
+    orig_len
+      .saturating_mul(SEGMENT_DATA_EXPAND_FACTOR)
+      .saturating_add(SEGMENT_DATA_OVERHEAD),
+  )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SegmentKind {
@@ -267,10 +287,16 @@ impl<R: Read> Pcf2Decoder<R> {
   }
 
   pub fn next_segment(&mut self) -> Result<Option<Pcf2SegmentReader<'_, R>>> {
-    self.next_segment_limited(u64::MAX, u64::MAX)
+    self.next_segment_inner(None)
   }
 
-  pub(crate) fn next_segment_limited(&mut self, max_meta_len: u64, max_data_len: u64) -> Result<Option<Pcf2SegmentReader<'_, R>>> {
+  /// Reads the next segment while bounding `meta_len` and `data_len` both by
+  /// `cap` and by `orig_len` before allocating or reading the segment body.
+  pub(crate) fn next_segment_bounded(&mut self, cap: u64) -> Result<Option<Pcf2SegmentReader<'_, R>>> {
+    self.next_segment_inner(Some(cap))
+  }
+
+  fn next_segment_inner(&mut self, cap: Option<u64>) -> Result<Option<Pcf2SegmentReader<'_, R>>> {
     if self.finished {
       return Ok(None);
     }
@@ -321,7 +347,9 @@ impl<R: Read> Pcf2Decoder<R> {
       }
     }
 
-    if meta_len > max_meta_len || data_len > max_data_len {
+    if let Some(cap) = cap
+      && (meta_len > segment_meta_limit(orig_len, cap) || data_len > segment_data_limit(orig_len, cap))
+    {
       return Err(Error::Other("decode output exceeds budget".to_string()));
     }
 

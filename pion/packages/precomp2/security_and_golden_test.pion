@@ -509,7 +509,7 @@ test "p2_parity_stream_len_pdf_bits_unityfs_utf8_and_iccp_trailing" {
     ("ColorSpace".to_bytes(), PdfValue::Name("DeviceRGB".to_bytes())),
     ("BitsPerComponent".to_bytes(), PdfValue::Int(0x100000008UL)),
   ])
-  match pdf_image_encode(make_test_bytes([1, 2, 3]), fake_dict) {
+  match pdf_image_encode(make_test_bytes([1, 2, 3]), fake_dict, 16777216UL) {
     Ok(None) => ()
     _ => debug_assert(false, "BitsPerComponent=2^32+8 must be rejected")
   }
@@ -744,6 +744,7 @@ test "adversarial_short_inputs_and_bomb_budgets" {
     max_expand_ratio: 16.0,
     max_total_output: 1048576UL,
     enable_png_webp: true,
+    max_webp_pixels: 16777216UL,
     enable_pdf_predictor: true,
     enable_pdf_dct: true,
     enable_pdf_ascii: true,
@@ -868,5 +869,124 @@ test "adversarial_short_inputs_and_bomb_budgets" {
   match overflow_file.encode() {
     Err(Error::LengthOverflow) => ()
     _ => debug_assert(false, "Pcf2File::encode must return LengthOverflow on u64 sum overflow")
+  }
+}
+
+test "max_webp_pixels_and_per_segment_data_budget" {
+  // 1. PNG 4x4 (16 pixels): WebP carrier used at cap=16, skipped to preflate PngIdat at cap=8 and cap=0.
+  let pixels = Bytes::new(4 * 4 * 4)
+  let mut pi = 0
+  while pi < pixels.length() {
+    pixels[pi] = ((pi * 13) % 251).to_byte()
+    pi += 1
+  }
+  let png = e2e_build_png(4, 4, 6, pixels, [])
+  let caps : Array[(UInt64, Byte)] = [
+    (16UL, (1).to_byte()),
+    (8UL, (0).to_byte()),
+    (0UL, (0).to_byte()),
+  ]
+  let mut ci = 0
+  while ci < caps.length() {
+    let (cap, expected_kind) = caps[ci]
+    let d = EncodeConfig::default()
+    let cfg = EncodeConfig::{
+      max_depth: d.max_depth,
+      max_expand_ratio: d.max_expand_ratio,
+      max_total_output: d.max_total_output,
+      enable_png_webp: true,
+      max_webp_pixels: cap,
+      enable_pdf_predictor: d.enable_pdf_predictor,
+      enable_pdf_dct: d.enable_pdf_dct,
+      enable_pdf_ascii: d.enable_pdf_ascii,
+      enable_pdf_images: d.enable_pdf_images,
+      max_pdf_filters: d.max_pdf_filters,
+    }
+    let enc = match encode_bytes(png, cfg) {
+      Ok(b) => b
+      Err(e) => {
+        debug_assert(false, "png encode failed: " + e.to_string())
+        Bytes::new(0)
+      }
+    }
+    let pf = match Pcf2File::decode(enc) {
+      Ok(f) => f
+      Err(_) => Pcf2File::from_segments([])
+    }
+    let mut found = false
+    let mut si = 0
+    while si < pf.segments.length() {
+      if pf.segments[si].kind == SegmentKind::PngIdat.to_u8() {
+        debug_assert(pf.segments[si].meta[2] == expected_kind, "png webp cap kind mismatch")
+        found = true
+      }
+      si += 1
+    }
+    debug_assert(found, "missing PngIdat segment")
+    match decode_bytes(enc, DecodeConfig::default()) {
+      Ok(dec) => debug_assert(bytes_eq(dec, png), "png roundtrip mismatch")
+      Err(e) => debug_assert(false, "png decode failed: " + e.to_string())
+    }
+    ci += 1
+  }
+
+  // 2. PDF RGB image 32x32 (1024 pixels): WebP image step used at cap=1024, skipped at cap=512 and cap=0.
+  let raw_rgb = Bytes::new(32 * 32 * 3)
+  let mut ri = 0
+  while ri < raw_rgb.length() {
+    raw_rgb[ri] = (42).to_byte()
+    ri += 1
+  }
+  let pdf_buf : Array[Byte] = []
+  e2e_append(
+    pdf_buf,
+    "%PDF-1.7\n1 0 obj << /Subtype /Image /Width 32 /Height 32 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3072 >> stream\n".to_bytes(),
+  )
+  e2e_append(pdf_buf, raw_rgb)
+  e2e_append(pdf_buf, "\nendstream\nendobj\n%%EOF\n".to_bytes())
+  let pdf = arr_to_bytes(pdf_buf)
+  let pdf_caps : Array[(UInt64, Int)] = [(1024UL, 1), (512UL, 0), (0UL, 0)]
+  let mut pci = 0
+  while pci < pdf_caps.length() {
+    let (cap, expected_imgs) = pdf_caps[pci]
+    let d = EncodeConfig::default()
+    let cfg = EncodeConfig::{
+      max_depth: d.max_depth,
+      max_expand_ratio: d.max_expand_ratio,
+      max_total_output: d.max_total_output,
+      enable_png_webp: d.enable_png_webp,
+      max_webp_pixels: cap,
+      enable_pdf_predictor: d.enable_pdf_predictor,
+      enable_pdf_dct: d.enable_pdf_dct,
+      enable_pdf_ascii: d.enable_pdf_ascii,
+      enable_pdf_images: true,
+      max_pdf_filters: d.max_pdf_filters,
+    }
+    let (enc, stats) = match encode_bytes_with_stats(pdf, cfg) {
+      Ok(v) => v
+      Err(e) => {
+        debug_assert(false, "pdf encode failed: " + e.to_string())
+        (Bytes::new(0), PdfStats::default())
+      }
+    }
+    debug_assert(stats.images == expected_imgs, "pdf max_webp_pixels images mismatch")
+    match decode_bytes(enc, DecodeConfig::default()) {
+      Ok(dec) => debug_assert(bytes_eq(dec, pdf), "pdf roundtrip mismatch")
+      Err(e) => debug_assert(false, "pdf decode failed: " + e.to_string())
+    }
+    pci += 1
+  }
+
+  // 3. Per-segment data_len limit rejects orig_len=64 with 3 MiB Dflt body even under default 4 GiB budget.
+  let segbomb = wrap_single_segment_pcf2(Pcf2Segment::{
+    kind: SegmentKind::Dflt.to_u8(),
+    flags: (0).to_byte(),
+    orig_len: 64UL,
+    meta: make_test_bytes([0, 0]),
+    data: Bytes::new(3145728),
+  })
+  match decode_bytes(segbomb, DecodeConfig::default()) {
+    Err(Error::Other(_)) => ()
+    _ => debug_assert(false, "segbomb with 3 MiB data_len for orig_len=64 must fail budget")
   }
 }
